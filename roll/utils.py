@@ -19,9 +19,9 @@ from loguru import logger
 DEFAULT_ENCODING = "utf-8"
 DEFAULT_TIMEOUT = (10, 30)  # (连接超时, 读取超时)
 GITHUB_ASSETS_PATTERN = re.compile(r"expanded_assets")
-# MLflow 路径修复正则：使用命名组提高可读性
+# MLflow 路径修复正则：使用命名组提高可读性，兼容 Linux (/home/) 和 macOS (/Users/)
 MLFLOW_PATH_PATTERN = re.compile(
-    r"^(?P<key>artifact_(location|uri)):\s+file:///home/[^/]+/(?P<suffix>.*)"
+    r"^(?P<key>artifact_(location|uri)):\s+file:///(home|Users)/[^/]+/(?P<suffix>.*)"
 )
 
 def check_match(str_a: str, pattern: str) -> bool:

@@ -41,7 +41,7 @@ class RollingTrader:
         self._model = None
 
         # 6. 环境修复
-        fix_mlflow_paths(self.params.get("mlruns_dir"))
+        fix_mlflow_paths(self.params.get("uri_folder"))
 
     @property
     def train(self) -> TrainCLI:

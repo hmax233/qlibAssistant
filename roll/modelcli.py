@@ -59,7 +59,7 @@ class ModelCLI:
         uri_folder = self.kwargs.get("uri_folder")
         provider_uri = self.kwargs.get("provider_uri")
         exp_manager = C["exp_manager"]
-        exp_manager["kwargs"]["uri"] = "file:" + str(Path(uri_folder).expanduser())
+        exp_manager["kwargs"]["uri"] = "file:" + str(Path(uri_folder).expanduser().resolve())
         logger.info(f"Experiment uri: {exp_manager['kwargs']['uri']}")
         qlib.init(provider_uri=provider_uri, region=region, exp_manager=exp_manager)
 

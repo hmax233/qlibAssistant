@@ -1,8 +1,8 @@
 # 该文件可被命令行输入覆盖
 
 # 文件夹路径配置
-uri_folder: "~/.qlibAssistant/mlruns/"
-analysis_folder: "~/.qlibAssistant/analysis/"
+uri_folder: "../.qlibAssistant/mlruns/"
+analysis_folder: "../.qlibAssistant/analysis/"
 provider_uri: "~/.qlib/qlib_data/cn_data/"
 
 # 实验命名配置
