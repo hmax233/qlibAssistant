@@ -188,10 +188,52 @@ def _stock_list_from_exchanges() -> Optional[pd.DataFrame]:
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["code"])
 
 
+def _stock_list_from_tushare() -> Optional[pd.DataFrame]:
+    """tushare 代理(curl)获取 A 股代码+名称，最可靠（不受 TLS 指纹/网络波动影响）。
+    token 从 ~/.config/tushare_token 或 TUSHARE 环境变量读。"""
+    import gzip, json
+    token_file = Path.home() / ".config/tushare_token"
+    token = token_file.read_text().strip() if token_file.exists() else os.environ.get("TUSHARE", "")
+    if not token:
+        return None
+    payload = json.dumps({"api_name": "stock_basic", "token": token, "params": {"list_status": "L"}})
+    try:
+        r = subprocess.run(
+            ["curl", "-sS", "--max-time", "30", "-X", "POST", "https://fastapic.stockai888.top",
+             "-H", "Content-Type: application/json", "-H", "Accept-Encoding: gzip",
+             "--data", payload],
+            capture_output=True, check=True,
+        )
+        raw = r.stdout
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        data = json.loads(raw)
+        if data.get("code") != 0:
+            logger.warning(f"tushare stock_basic 失败: {data.get('msg')}")
+            return None
+        df = pd.DataFrame(data["data"]["items"], columns=data["data"]["fields"])
+        # ts_code '000001.SZ' -> 'SZ000001'
+        df["code"] = df["ts_code"].apply(
+            lambda tc: f"{tc.split('.')[1]}{tc.split('.')[0]}" if "." in tc else tc
+        )
+        return df[["code", "name"]]
+    except Exception as e:
+        logger.warning(f"tushare stock_basic 获取失败: {e}")
+        return None
+
+
 def get_normalized_stock_list() -> Optional[pd.DataFrame]:
     """获取并标准化 A 股股票列表，多源 fallback 避免东方财富在 GitHub Actions 失败"""
     for env_key in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
         os.environ.pop(env_key, None)
+
+    # 0. 优先 tushare 代理（curl，最可靠，有 15000 积分 token）
+    try:
+        df = _stock_list_from_tushare()
+        if df is not None and len(df) > 1000:
+            return df
+    except Exception as e:
+        logger.warning(f"tushare 股票列表获取失败: {e}")
 
     # 1. 优先沪深京交易所官网（非东方财富，海外/国内 IP 通常可访问）
     try:
