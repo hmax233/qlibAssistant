@@ -19,6 +19,8 @@ from loguru import logger
 DEFAULT_ENCODING = "utf-8"
 DEFAULT_TIMEOUT = (10, 30)  # (连接超时, 读取超时)
 GITHUB_ASSETS_PATTERN = re.compile(r"expanded_assets")
+STOCK_LIST_CACHE = Path(__file__).resolve().parents[1] / ".qlibAssistant/cache/stock_basic.csv"
+STOCK_LIST_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 # MLflow 路径修复正则：使用命名组提高可读性，兼容 Linux (/home/) 和 macOS (/Users/)
 MLFLOW_PATH_PATTERN = re.compile(
     r"^(?P<key>artifact_(location|uri)):\s+file:///(home|Users)/[^/]+/(?P<suffix>.*)"
@@ -188,52 +190,105 @@ def _stock_list_from_exchanges() -> Optional[pd.DataFrame]:
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["code"])
 
 
+def _read_stock_list_cache() -> Optional[pd.DataFrame]:
+    """读取股票名称缓存；缓存损坏时返回 None。"""
+    try:
+        if not STOCK_LIST_CACHE.exists():
+            return None
+        df = pd.read_csv(STOCK_LIST_CACHE, dtype={"code": str, "name": str})
+        if len(df) <= 1000 or not {"code", "name"}.issubset(df.columns):
+            return None
+        return df[["code", "name"]]
+    except Exception as e:
+        logger.warning(f"股票名称缓存读取失败: {e}")
+        return None
+
+
+def _write_stock_list_cache(df: pd.DataFrame) -> None:
+    """原子写入股票名称缓存，避免中断时留下半个 CSV。"""
+    try:
+        STOCK_LIST_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = STOCK_LIST_CACHE.with_suffix(".tmp")
+        df[["code", "name"]].to_csv(temp_path, index=False)
+        temp_path.replace(STOCK_LIST_CACHE)
+    except Exception as e:
+        logger.warning(f"股票名称缓存写入失败: {e}")
+
+
 def _stock_list_from_tushare() -> Optional[pd.DataFrame]:
-    """tushare 代理(curl)获取 A 股代码+名称，最可靠（不受 TLS 指纹/网络波动影响）。
-    token 从 ~/.config/tushare_token 或 TUSHARE 环境变量读。"""
-    import gzip, json
+    """tushare 代理(curl)获取 A 股代码+名称。
+
+    代理偶发连接超时，因此仅做两次短重试；失败后由调用方使用本地缓存。
+    token 从 ~/.config/tushare_token 或 TUSHARE 环境变量读取。
+    """
+    import gzip, json, time
     token_file = Path.home() / ".config/tushare_token"
     token = token_file.read_text().strip() if token_file.exists() else os.environ.get("TUSHARE", "")
     if not token:
         return None
     payload = json.dumps({"api_name": "stock_basic", "token": token, "params": {"list_status": "L"}})
-    try:
-        r = subprocess.run(
-            ["curl", "-sS", "--max-time", "30", "-X", "POST", "https://fastapic.stockai888.top",
-             "-H", "Content-Type: application/json", "-H", "Accept-Encoding: gzip",
-             "--data", payload],
-            capture_output=True, check=True,
-        )
-        raw = r.stdout
-        if raw[:2] == b"\x1f\x8b":
-            raw = gzip.decompress(raw)
-        data = json.loads(raw)
-        if data.get("code") != 0:
-            logger.warning(f"tushare stock_basic 失败: {data.get('msg')}")
-            return None
-        df = pd.DataFrame(data["data"]["items"], columns=data["data"]["fields"])
-        # ts_code '000001.SZ' -> 'SZ000001'
-        df["code"] = df["ts_code"].apply(
-            lambda tc: f"{tc.split('.')[1]}{tc.split('.')[0]}" if "." in tc else tc
-        )
-        return df[["code", "name"]]
-    except Exception as e:
-        logger.warning(f"tushare stock_basic 获取失败: {e}")
-        return None
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "--http1.1", "--connect-timeout", "5", "--max-time", "15",
+                 "-X", "POST", "https://fastapic.stockai888.top",
+                 "-H", "Content-Type: application/json", "-H", "Accept-Encoding: gzip",
+                 "--data", payload],
+                capture_output=True, check=True,
+            )
+            raw = r.stdout
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            data = json.loads(raw)
+            if data.get("code") != 0:
+                logger.warning(f"tushare stock_basic 失败: {data.get('msg')}")
+                return None
+            df = pd.DataFrame(data["data"]["items"], columns=data["data"]["fields"])
+            # ts_code '000001.SZ' -> 'SZ000001'
+            df["code"] = df["ts_code"].apply(
+                lambda tc: f"{tc.split('.')[1]}{tc.split('.')[0]}" if "." in tc else tc
+            )
+            result = df[["code", "name"]]
+            _write_stock_list_cache(result)
+            return result
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    logger.warning(f"tushare stock_basic 2 次重试均失败: {last_err}")
+    return None
 
 
 def get_normalized_stock_list() -> Optional[pd.DataFrame]:
-    """获取并标准化 A 股股票列表，多源 fallback 避免东方财富在 GitHub Actions 失败"""
+    """获取并标准化 A 股股票列表。
+
+    一周内的本地缓存优先；缓存过期后尝试用 tushare 刷新。tushare 临时失败时
+    继续使用旧缓存，避免预测因股票名称这一非关键字段等待数分钟。
+    """
     for env_key in ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']:
         os.environ.pop(env_key, None)
 
-    # 0. 优先 tushare 代理（curl，最可靠，有 15000 积分 token）
+    cached = _read_stock_list_cache()
+    if cached is not None:
+        cache_age = datetime.now().timestamp() - STOCK_LIST_CACHE.stat().st_mtime
+        if cache_age <= STOCK_LIST_CACHE_TTL_SECONDS:
+            return cached
+
+    # 缓存不存在或已过期时，用 tushare 代理刷新。
+    token_file = Path.home() / ".config/tushare_token"
+    has_token = token_file.exists() or bool(os.environ.get("TUSHARE"))
     try:
         df = _stock_list_from_tushare()
         if df is not None and len(df) > 1000:
             return df
     except Exception as e:
         logger.warning(f"tushare 股票列表获取失败: {e}")
+    if has_token:
+        if cached is not None:
+            logger.warning("tushare 刷新失败，继续使用过期的股票名称缓存")
+            return cached
+        logger.warning("tushare 获取失败且无本地缓存，本次预测将不带股票名称")
+        return None
 
     # 1. 优先沪深京交易所官网（非东方财富，海外/国内 IP 通常可访问）
     try:

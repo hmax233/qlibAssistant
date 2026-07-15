@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""每日数据更新 + 预测一键脚本（VPN-resilient，~0 token）。
+"""每日数据更新 + 预测一键脚本（Tushare 代理容错，~0 token）。
 
 流程：查 dolt 最新日期 → 算待补交易日 → curl 探测可用性 → 增量更新 → dump
 → 替换 qlib 数据 → 重生成 csi 成分股 → 跑预测 → 打印 Top10。
@@ -40,21 +40,30 @@ def get_token():
 
 
 def tushare_curl(api_name, params, token):
-    """curl 调用 tushare 代理（绕过 VPN 下 Python TLS 失败），返回 data 字段。"""
+    """curl 调用 tushare 代理，使用 HTTP/1.1 并对瞬时连接错误重试。"""
     payload = json.dumps({"api_name": api_name, "token": token, "params": params})
-    r = subprocess.run(
-        ["curl", "-sS", "--max-time", "60", "-X", "POST", TUSHARE_URL,
-         "-H", "Content-Type: application/json", "-H", "Accept-Encoding: gzip",
-         "--data", payload],
-        capture_output=True, check=True,
-    )
-    raw = r.stdout
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
-    data = json.loads(raw)
-    if data.get("code") != 0:
-        raise Exception(f"tushare {api_name} error: {data.get('msg')}")
-    return data["data"]
+    last_error = None
+    for attempt in range(3):
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "--http1.1", "--connect-timeout", "5", "--max-time", "30",
+                 "-X", "POST", TUSHARE_URL,
+                 "-H", "Content-Type: application/json", "-H", "Accept-Encoding: gzip",
+                 "--data", payload],
+                capture_output=True, check=True,
+            )
+            raw = r.stdout
+            if raw[:2] == b"\x1f\x8b":
+                raw = gzip.decompress(raw)
+            data = json.loads(raw)
+            if data.get("code") != 0:
+                raise RuntimeError(f"tushare {api_name} error: {data.get('msg')}")
+            return data["data"]
+        except (subprocess.CalledProcessError, OSError, ValueError, RuntimeError) as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(2)
+    raise RuntimeError(f"tushare {api_name} 三次请求均失败: {last_error}")
 
 
 def dolt_sql(query):

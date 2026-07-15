@@ -26,7 +26,7 @@ CATBOOST_MODEL = {
         "subsample": 0.8789,
         "max_depth": 6,
         "num_leaves": 100,
-        "thread_count": 20, 
+        "thread_count": 14, # 匹配 M5 Pro 15 核，留 1 核给系统
         "grow_policy": "Lossguide",
         "bootstrap_type": "MVS"
     }
@@ -137,7 +137,7 @@ DOUBLE_ENSEMBLE_MODEL = {
         "lambda_l2": 580.9768,
         "max_depth": 8,
         "num_leaves": 210,
-        "num_threads": 20, # 建议改为 16，匹配你的硬件
+        "num_threads": 14, # 匹配 M5 Pro 15 核，留 1 核给系统
         "verbosity": -1
     }
 }
@@ -154,7 +154,7 @@ GBDT_MODEL = {
         "lambda_l2": 580.9768,
         "max_depth": 8,
         "num_leaves": 210,
-        "num_threads": 20,
+        "num_threads": 14, # 匹配 M5 Pro 15 核，留 1 核给系统
     },
 }
 

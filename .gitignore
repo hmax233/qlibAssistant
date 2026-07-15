@@ -13,3 +13,4 @@ page/docs/index.md
 page/docs/score/
 /.idea
 .DS_Store
+.qlibAssistant/cache/
