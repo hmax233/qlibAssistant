@@ -240,7 +240,7 @@ def get_model_list(self):
             if self._is_valid_recorder(recorder):
                 mc.rid.append(rid)
     
-    # 2. 根据 Rank ICIR 计算模型权重
+    # 2. 根据 validation Rank ICIR 计算模型权重
     total_rank_icir = sum(self.rid_rank_icir[rid] for mc in ret for rid in mc.rid)
     for mc in ret:
         for rid in mc.rid:
@@ -391,10 +391,10 @@ def get_real_label(self, dates=None, instruments='csi300'):
 
 ### 4.3 模型集成策略
 
-系统采用 **Rank ICIR 加权平均**策略：
+系统采用 **validation Rank ICIR 加权平均**策略。validation 用于选模和定权，test 只用于最终泛化评估，避免利用测试集信息挑模型：
 
-1. **收集所有有效模型**：过滤掉 IC/ICIR 低于阈值的模型
-2. **计算模型权重**：`weight = rank_icir / sum(all_rank_icir)`
+1. **收集所有有效模型**：根据 validation 的 IC/ICIR/Rank IC/Rank ICIR 阈值过滤
+2. **计算模型权重**：`weight = valid_rank_icir / sum(all_valid_rank_icir)`
 3. **加权集成预测**：`avg_score = sum(score_i * weight_i) / sum(weight_i)`
 4. **看多比例**：`pos_ratio = (score > 0).mean()`
 
@@ -742,9 +742,30 @@ MLFLOW_ALLOW_FILE_STORE=true /Users/hmax/miniconda3/envs/qlibAssistant/bin/pytho
 
 `predict_dates` 自动取数据最新日期。流程：加载 mlruns 所有通过筛选的模型 → 各自预测 → 按 Rank ICIR 加权集成 → 稳健性过滤（STD/ROC）→ 输出。
 
-当前约 28 个有效模型时，预测约需 5-6 分钟。主要耗时是每个 recorder 都重新构建一次 Alpha158 数据集（约 10-11 秒/模型），不是股票名称网络请求；名称表使用本地缓存，读取通常低于 0.01 秒。
+当前 validation 筛选得到 26 个 recorder 时，预测约需数分钟。主要耗时是每个 recorder 都重新构建一次 Alpha158 数据集，不是股票名称网络请求；名称表使用本地缓存。
 
 **输出**：`.qlibAssistant/analysis/selection_<时间戳>/`
+
+### 11.4 Validation 选模与 recorder
+
+`recorder` 是一次完整训练实例，而不是一种算法。它绑定了“模型算法 + train/valid/test 时间窗口 + 超参数 + 拟合参数 + 预测和评价产物”。因此，同一个 LightGBM 在 5 个时间窗口、2 次训练批次中会产生 10 个 recorder。
+
+每个 recorder 的核心产物包括：
+
+- `task`：模型、数据处理器和 train/valid/test 划分。
+- `params.pkl`：训练完成的模型参数。
+- `sig_analysis/`：原有 test 预测及 IC 指标，只用于最终评估。
+- `valid_sig_analysis/`：validation 的预测、标签、IC、Rank IC 和汇总指标，用于筛选及加权。
+
+历史 recorder 可补算 validation 指标：
+
+```bash
+conda run -n qlibAssistant python script/backfill_validation_metrics.py
+```
+
+脚本默认跳过已经生成的结果，可以安全地中断后续跑。新训练完成后会自动生成 `valid_sig_analysis`。
+
+截至 2026-07-18，本地共有 50 个 recorder（5 种算法 × 5 个窗口 × 2 个训练批次）。旧 test 选模得到 28 个（5 月批次 17、7 月批次 11）；validation 选模得到 26 个（5 月批次 13、7 月批次 13）。最新预测目录为 `selection_20260718_22_35_06`，包含 26 × 300 = 7800 行逐 recorder 预测和 300 行集成结果。
 - `_<日期>_ret.csv`：全量 csi300 预测（300 只，含 avg_score / pos_ratio）
 - `_<日期>_filter_ret.csv`：过滤后推荐（几十只）
 - `total.md`：参与模型及 IC/ICIR/权重

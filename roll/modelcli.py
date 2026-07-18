@@ -25,6 +25,7 @@ from model_backup import (
     decompress_mlruns as _decompress_mlruns,
 )
 from model_review import ModelReviewHelper
+from validation_analysis import ensure_validation_analysis, metrics_from_ic
 
 # --- 常量定义：解决 Magic Strings 问题 ---
 PARAMS_FILE = "params.pkl"
@@ -64,7 +65,7 @@ class ModelCLI:
         qlib.init(provider_uri=provider_uri, region=region, exp_manager=exp_manager)
 
     def filter_rec(self, rec):
-        _, ic_list = self.get_ic_info(rec)
+        _, ic_list = self.get_ic_info(rec, split="valid")
         ic_filter = self.kwargs.get('rec_filter')
         if not ic_filter:
             return True
@@ -79,7 +80,11 @@ class ModelCLI:
         # 使用 all() 检查所有必要产物是否存在，消除硬编码字符串
         if not artifacts or not all(f in artifacts for f in REQUIRED_ARTIFACTS):
             return False
-        return self.filter_rec(recorder)
+        try:
+            return self.filter_rec(recorder)
+        except Exception as exc:
+            logger.warning(f"Recorder {recorder.id} validation 指标生成/读取失败，跳过: {exc}")
+            return False
 
     def get_model_list(self):
         """
@@ -88,6 +93,7 @@ class ModelCLI:
         uri_folder = self.kwargs.get('uri_folder')
         model_filter = self.kwargs.get('model_filter')
         logger.info(f"get all model in the uri_folder: {uri_folder}")
+        self.rid_rank_icir = {}
 
         exps = R.list_experiments()
         ret = []
@@ -105,7 +111,7 @@ class ModelCLI:
                 recorder = exp.get_recorder(recorder_id=rid)
                 if self._is_valid_recorder(recorder):
                     mc.rid.append(rid)
-                    _, ic_list = self.get_ic_info(recorder)
+                    _, ic_list = self.get_ic_info(recorder, split="valid")
                     self.rid_rank_icir[rid] = self._round3(ic_list[3])
 
             # 只有当这个实验下有符合条件的记录时才添加
@@ -131,19 +137,22 @@ class ModelCLI:
         logger.info(f"model_filter {model_filter}, rec_filter {rec_filter}")
         logger.info(f"experiment num: {len(ret)}, rid num: {total_rids}")
 
-    def get_ic_info(self, rec):
-        ic_pkl = rec.load_object(f"{SIG_ANALYSIS_DIR}/ic.pkl")
-        ric_pkl = rec.load_object(f"{SIG_ANALYSIS_DIR}/ric.pkl")
-        ic, rank_ic = ic_pkl.mean(), ric_pkl.mean()
-        icir, rank_icir = ic / ic_pkl.std(), rank_ic / ric_pkl.std()
+    def get_ic_info(self, rec, split="test"):
+        """读取指定数据段的信号指标；选模必须显式使用 valid。"""
+        if split == "valid":
+            metrics, values = ensure_validation_analysis(rec)
+        elif split == "test":
+            ic_pkl = rec.load_object(f"{SIG_ANALYSIS_DIR}/ic.pkl")
+            ric_pkl = rec.load_object(f"{SIG_ANALYSIS_DIR}/ric.pkl")
+            metrics, values = metrics_from_ic(ic_pkl, ric_pkl)
+        else:
+            raise ValueError(f"Unsupported metric split: {split}")
 
-        ic_info = {
-            "IC": float(np.around(ic, 3)),
-            "ICIR": float(np.around(icir, 3)),
-            "Rank IC": float(np.around(rank_ic, 3)),
-            "Rank ICIR": float(np.around(rank_icir, 3)),
+        rounded = {
+            key: (int(value) if key == "Date Count" else float(np.around(value, 3)))
+            for key, value in metrics.items()
         }
-        return ic_info, [ic, icir, rank_ic, rank_icir]
+        return rounded, values
 
     def get_train_time(self, rec):
         task = rec.load_object("task")
@@ -154,16 +163,18 @@ class ModelCLI:
 
     def print_rec(self, rec):
         task = rec.load_object("task")
-        ic_info, _ = self.get_ic_info(rec)
+        valid_ic_info, _ = self.get_ic_info(rec, split="valid")
+        test_ic_info, _ = self.get_ic_info(rec, split="test")
         data_train_vec, train_time_vec = self.get_train_time(rec)
         info = {
             "id": rec.id,
             "model": task["model"]['class'],
             "dataset": task['dataset']['kwargs']['handler']['class'],
-            "ic_info": ic_info,
+            "valid_ic_info": valid_ic_info,
+            "test_ic_info": test_ic_info,
             "data_train_vec": data_train_vec,
             "train_time_vec": train_time_vec,
-            "rank_icir": f"{self.rid_rank_icir[rec.id]:.3f}",
+            "selection_rank_icir": f"{self.rid_rank_icir[rec.id]:.3f}",
             "weight": f"{self.rid_weight[rec.id]:.3f}",
         }
         print(info)

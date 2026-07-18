@@ -20,6 +20,7 @@ import multiprocessing
 from tqdm import tqdm
 from functools import partialmethod
 from utils import generate_qlib_segments, get_mlruns_dates, get_local_data_date
+from validation_analysis import ensure_validation_analysis
 
 tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
 
@@ -44,7 +45,9 @@ def _train_worker(task, exp_name, region=REG_CN, **kwargs):
 
         # 实例化 Trainer 并开始训练
         trainer = TrainerR(experiment_name=exp_name)
-        trainer.train(task)
+        recorders = trainer.train(task)
+        for recorder in recorders:
+            ensure_validation_analysis(recorder)
 
         logger.info(f"🟢 [子进程 PID: {os.getpid()}] 训练完成，准备释放内存。", flush=True)
         os._exit(0)  # 确保子进程正常退出，exitcode 0
@@ -216,5 +219,4 @@ class TrainCLI:
         max_mlruns_date = max(mlruns_dates)
         
         return max_mlruns_date < local_data_date
-
 
