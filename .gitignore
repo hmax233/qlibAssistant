@@ -13,4 +13,6 @@ page/docs/index.md
 page/docs/score/
 /.idea
 .DS_Store
-.qlibAssistant/cache/
+# 本地 MLflow、预测结果和模型运行产物
+.qlibAssistant/
+roll/catboost_info/

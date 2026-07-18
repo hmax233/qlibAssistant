@@ -421,6 +421,10 @@ def get_real_label(self, dates=None, instruments='csi300'):
 | `instrument` | str | 股票代码（如 SH600000） |
 | `avg_score` | float | 加权平均预测分数（越高越看好） |
 | `pos_ratio` | float | 看多模型比例（0~1） |
+| `rank` | int | 按 `avg_score` 从高到低的当日排名 |
+| `model_count` | int | 参与该股票集成的模型记录数 |
+| `valid_model_count` | int | 实际给出非空预测分数的模型数 |
+| `positive_model_count` | int | 给出正预测分数的模型数 |
 | `real_label` | float | 真实次日收益率（未收盘时为 NaN） |
 | `error` | float | 预测误差（score - real_label） |
 | `abs_error` | float | 绝对误差 |
@@ -428,6 +432,9 @@ def get_real_label(self, dates=None, instruments='csi300'):
 | `name` | str | 股票名称 |
 | `datetime` | datetime | 预测基准日 |
 | 其他字段 | float | Alpha158 因子特征值 |
+
+CSV 使用 `index=False` 保存，不再生成无业务含义的 `Unnamed: 0` 列。
+如果 `valid_model_count < model_count`，说明部分模型对该股票产生了 NaN，需检查模型数值稳定性。
 
 #### `total.md`
 

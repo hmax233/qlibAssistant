@@ -295,13 +295,20 @@ class ModelCLI:
                             if g['weight'].sum() != 0
                             else g['score'].mean(),
                             "pos_ratio": (g['score'] > 0).mean(),
+                            "model_count": int(len(g)),
+                            "valid_model_count": int(g['score'].notna().sum()),
+                            "positive_model_count": int((g['score'] > 0).sum()),
                         }
                     )
                 )
                 .reset_index()
             )
+            count_cols = ['model_count', 'valid_model_count', 'positive_model_count']
+            ret_df[count_cols] = ret_df[count_cols].astype(int)
 
-            cols_to_restore = ['instrument', 'real_label', 'error', 'abs_error']
+            # error/abs_error 在逐模型层面基于 score 计算，不能直接复制到
+            # 聚合后的股票结果；这里只恢复真实标签，并在集成完成后重新计算。
+            cols_to_restore = ['instrument', 'real_label']
             existing_cols = [c for c in cols_to_restore if c in group_df.columns]
             restore_df = group_df[existing_cols].drop_duplicates('instrument')
             ret_df = pd.merge(
@@ -312,16 +319,19 @@ class ModelCLI:
                 validate='one_to_one'
             )
             ret_df = ret_df.sort_values(by='avg_score', ascending=False)
+            ret_df.insert(1, 'rank', range(1, len(ret_df) + 1))
+            ret_df['error'] = ret_df['avg_score'] - ret_df['real_label']
+            ret_df['abs_error'] = ret_df['error'].abs()
             if latest_stock_list is not None:
                 ret_df = pd.merge(ret_df, latest_stock_list, left_on='instrument', right_on='code', how='left', validate='one_to_one')
 
             ret_df = pd.merge(ret_df, alpha158_df[alpha158_df['datetime'] == date], on='instrument', how='left', validate='one_to_one')
             ret_filter_df = self.filter_ret_df(ret_df)
-            ret_df.to_csv(save_dir / f"{date_str}_ret.csv", index=True, encoding="utf-8-sig")
+            ret_df.to_csv(save_dir / f"{date_str}_ret.csv", index=False, encoding="utf-8-sig")
             ret_filter_df = ret_filter_df.reset_index(drop=True)
-            ret_filter_df.to_csv(save_dir / f"{date_str}_filter_ret.csv", index=True, encoding="utf-8-sig")
+            ret_filter_df.to_csv(save_dir / f"{date_str}_filter_ret.csv", index=False, encoding="utf-8-sig")
 
-        df_final.to_csv(save_dir / "total.csv", index=True, encoding="utf-8-sig")
+        df_final.to_csv(save_dir / "total.csv", index=False, encoding="utf-8-sig")
 
     def filter_ret_df(self, df):
         # 稳健性过滤逻辑
