@@ -387,7 +387,7 @@ def get_mlruns_dates(backup_dir="../model_pkl"):
     return dates
 
 
-def generate_qlib_segments(months_total=12, end_date_str=None):
+def generate_qlib_segments(months_total=12, end_date_str=None, split_selection_valid=False):
     """
     根据给定的总月数，按 9:2:1 比例动态生成 train, valid, test 范围
     :param months_total: 总共回溯的月数
@@ -404,14 +404,16 @@ def generate_qlib_segments(months_total=12, end_date_str=None):
 
     # 2. 计算各段长度（月数）
     test_months = unit * 1  # 占 1 份
-    valid_months = unit * 2 # 占 2 份
+    valid_months = unit * (1 if split_selection_valid else 2)
+    selection_valid_months = unit * 1 if split_selection_valid else 0
     train_months = unit * 9 # 占 9 份
 
     # 3. 倒推各个时间节点
     # t0(起点) ----[train]---- t1 ----[valid]---- t2 ----[test]---- t3(终点)
     t3 = t_end
     t2 = t3 - relativedelta(months=int(test_months))
-    t1 = t2 - relativedelta(months=int(valid_months))
+    t_selection = t2 - relativedelta(months=int(selection_valid_months))
+    t1 = t_selection - relativedelta(months=int(valid_months))
     t0 = t1 - relativedelta(months=int(train_months))
 
     def to_s(dt): return dt.strftime("%Y-%m-%d")
@@ -419,9 +421,14 @@ def generate_qlib_segments(months_total=12, end_date_str=None):
     # 4. 组装结果 (减去 1 天确保区间不重叠)
     segments = {
         "train": (to_s(t0), to_s(t1 - relativedelta(days=1))),
-        "valid": (to_s(t1), to_s(t2 - relativedelta(days=1))),
-        "test":  (to_s(t2), to_s(t3))
+        "valid": (to_s(t1), to_s(t_selection - relativedelta(days=1))),
     }
+    if split_selection_valid:
+        segments["selection_valid"] = (
+            to_s(t_selection),
+            to_s(t2 - relativedelta(days=1)),
+        )
+    segments["test"] = (to_s(t2), to_s(t3))
 
     return segments
 

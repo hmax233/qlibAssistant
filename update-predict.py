@@ -191,7 +191,15 @@ def report():
 def main():
     parser = argparse.ArgumentParser(description="每日数据更新 + 预测")
     parser.add_argument("--predict-only", action="store_true", help="跳过数据更新，只跑预测")
+    parser.add_argument(
+        "--update-only",
+        action="store_true",
+        help="只更新并替换Qlib数据，不跑默认全模型selection",
+    )
     args = parser.parse_args()
+
+    if args.predict_only and args.update_only:
+        parser.error("--predict-only 和 --update-only 不能同时使用")
 
     # 清空日志
     open(LOG_FILE, "w").close()
@@ -209,6 +217,10 @@ def main():
         log(f"将更新: {','.join(dates)}")
         update_data(token, dates)
         dump_and_replace()
+
+    if args.update_only:
+        log("数据更新完成；--update-only 跳过默认全模型预测。")
+        return
 
     run_predict()
     report()

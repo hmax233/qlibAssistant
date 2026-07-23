@@ -700,7 +700,7 @@ MLFLOW_ALLOW_FILE_STORE=true /Users/hmax/miniconda3/envs/qlibAssistant/bin/pytho
   --pfx_name="EXP" --model_name="Linear" --dataset_name="Alpha158" \
   --stock_pool="csi300" --rolling_type="custom" train start_custom
 ```
-全量 5 模型（XGBoost/Linear/DoubleEnsemble/LightGBM/CatBoost，约 40 分钟）：
+默认 4 模型（XGBoost/Linear/LightGBM/CatBoost，不含耗时较长的 DoubleEnsemble）：
 ```bash
 MLFLOW_ALLOW_FILE_STORE=true PATH="/Users/hmax/miniconda3/envs/qlibAssistant/bin:$PATH" \
   /Users/hmax/miniconda3/envs/qlibAssistant/bin/python ../script/run.py
@@ -766,6 +766,20 @@ conda run -n qlibAssistant python script/backfill_validation_metrics.py
 脚本默认跳过已经生成的结果，可以安全地中断后续跑。新训练完成后会自动生成 `valid_sig_analysis`。
 
 截至 2026-07-18，本地共有 50 个 recorder（5 种算法 × 5 个窗口 × 2 个训练批次）。旧 test 选模得到 28 个（5 月批次 17、7 月批次 11）；validation 选模得到 26 个（5 月批次 13、7 月批次 13）。最新预测目录为 `selection_20260718_22_35_06`，包含 26 × 300 = 7800 行逐 recorder 预测和 300 行集成结果。
+
+批量训练脚本支持明确标记股票池和训练批次：
+
+```bash
+/Users/hmax/miniconda3/envs/qlibAssistant/bin/python script/run.py \
+  --pool csi1000 --run-tag retrain260718
+```
+
+不要依赖 MLflow 自动生成的数字 `experiment_id` 识别业务批次；应使用包含股票池和 `run-tag` 的 `experiment_name`。统一测试报告使用：
+
+```bash
+/Users/hmax/miniconda3/envs/qlibAssistant/bin/python script/evaluate_batch.py \
+  --experiment-pattern csi1000_custom_step0_retrain260718
+```
 - `_<日期>_ret.csv`：全量 csi300 预测（300 只，含 avg_score / pos_ratio）
 - `_<日期>_filter_ret.csv`：过滤后推荐（几十只）
 - `total.md`：参与模型及 IC/ICIR/权重
@@ -809,3 +823,1130 @@ MLFLOW_ALLOW_FILE_STORE=true /Users/hmax/miniconda3/envs/qlibAssistant/bin/pytho
 - **dump 后最新日期缺失** → `/Users/hmax/qlib` 不在 `local/hmax-fixes` 分支（format_data bug）
 - **预测 real_label 全 NaN** → 正常，次日数据没出
 - **训练太慢** → 主要是 DoubleEnsemble；可先跳过它，或减 `n_estimators`（降质量换速度）
+
+---
+
+## 12. 自助研究流程：训练、滚动 Fold、统一评估与画图
+
+本节用于自己完成一轮可复现的量化实验。所有命令都从项目根目录执行：
+
+```bash
+cd /Users/hmax/qlibAssistant
+export MLFLOW_ALLOW_FILE_STORE=true
+export XDG_CACHE_HOME=/tmp/qlibAssistant-cache
+export MPLCONFIGDIR=/tmp/qlibAssistant-mpl
+PY=/Users/hmax/miniconda3/envs/qlibAssistant/bin/python
+```
+
+其中 `MLFLOW_ALLOW_FILE_STORE=true` 允许当前 MLflow 版本读取本地文件型实验仓库；另外两个变量把 Matplotlib 缓存放到可写目录，避免字体缓存警告。
+
+### 12.1 给实验取一个可识别的名称
+
+每次训练都应设置唯一 `run-tag`，建议格式为：
+
+```text
+研究目的_YYMMDD
+```
+
+例如：
+
+- `retrain260718`：2026-07-18 常规重训。
+- `splitval260719`：拆分选模验证集实验。
+- `fold1_260719`：第一个滚动时间 Fold。
+
+最终实验名类似：
+
+```text
+EXP_LinearModel_Alpha158_csi1000_custom_step0_splitval260719_20260719_16
+```
+
+定位实验时使用 `experiment_name/run-tag`，不要依赖无业务含义的数字 `experiment_id`。
+
+### 12.2 训练一个或多个模型
+
+只训练 Linear，生成默认 12/24/36/48/60 月五个 recorder：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag my_linear_260719 \
+  --models Linear
+```
+
+训练 Linear 和 LightGBM：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag linear_lgb_260719 \
+  --models Linear LightGBM
+```
+
+显式训练五种模型（包含耗时较长、默认已排除的 DoubleEnsemble）：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag full_260719 \
+  --models XGBoost Linear DoubleEnsemble LightGBM CatBoost
+```
+
+只训练60个月窗口，并拆分训练监控验证集和选模验证集：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag linear60_split_260719 \
+  --models Linear \
+  --window-months 60 \
+  --split-selection-valid
+```
+
+先查看将执行什么而不训练：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag dryrun \
+  --models Linear \
+  --window-months 60 \
+  --split-selection-valid \
+  --dry-run
+```
+
+主要参数：
+
+| 参数 | 含义 |
+|---|---|
+| `--pool` | 股票池，例如 `csi300`、`csi1000`、`all` |
+| `--run-tag` | 本批次业务标识，用于检索实验 |
+| `--models` | 一个或多个模型名称 |
+| `--window-months` | 指定总窗口月数；不传时默认五个窗口 |
+| `--end-date` | 模拟当时只能看到该日期之前数据，用于历史 Fold |
+| `--split-selection-valid` | 使用 `9:1:1:1` 的独立选模验证集 |
+| `--dry-run` | 只打印命令，不训练 |
+
+未传 `--models` 时默认训练 `XGBoost Linear LightGBM CatBoost`。DoubleEnsemble 的配置和历史 recorder 都会保留；需要专项实验时显式写入 `--models DoubleEnsemble` 即可。
+
+### 12.3 理解 Validation 拆分
+
+旧任务使用：
+
+```text
+train : valid : test = 9 : 2 : 1
+```
+
+其中 `valid` 既可能参与模型训练监控，又用于筛选 recorder。新实验推荐：
+
+```text
+train : valid : selection_valid : test = 9 : 1 : 1 : 1
+```
+
+- `train`：拟合模型参数。
+- `valid`：模型训练监控和 early stopping。
+- `selection_valid`：比较、筛选和加权 recorder。
+- `test`：只用于最终报告，不能反过来选模型或调参数。
+
+旧 recorder 没有 `selection_valid` 时，代码自动回退到 `valid`，所以历史实验仍可读取。
+
+### 12.4 运行三个时间滚动 Folds
+
+滚动 Fold 是多次执行“只用过去训练、用随后未来测试”，不能像普通机器学习交叉验证一样随机打乱股票时序。
+
+当前现成脚本：
+
+```bash
+$PY script/run_rolling_folds.py 2>&1 | \
+  tee .qlibAssistant/logs/rolling_folds_manual.log
+```
+
+另开终端观察：
+
+```bash
+tail -f /Users/hmax/qlibAssistant/.qlibAssistant/logs/rolling_folds_manual.log
+```
+
+脚本当前固定使用 CSI1000、Linear、60个月窗口和三个严格不重叠的 Test 时段。要修改模型、股票池或日期，编辑 `script/run_rolling_folds.py` 顶部的 `FOLDS` 和训练命令参数。
+
+也可以手动运行任意历史截止日：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag my_fold_260719 \
+  --models Linear \
+  --window-months 60 \
+  --end-date 2026-02-16 \
+  --split-selection-valid
+```
+
+### 12.5 创建可读的实验文件夹和 CSV 索引
+
+MLflow 原始目录以数字 experiment ID 命名，不便浏览。运行：
+
+```bash
+$PY script/build_experiment_index.py
+```
+
+生成：
+
+- `.qlibAssistant/experiment_index.csv`：实验名、ID、模型、股票池、run-tag、recorder 数量和原始路径。
+- `.qlibAssistant/mlruns_by_name/`：以完整实验名称命名的软链接；不会复制或删除模型文件，不额外占用一份模型空间。
+
+训练批次结束后 `script/run.py` 会自动刷新索引，一般不需要手动执行。
+
+#### MLflow 两级目录分别是什么
+
+本项目的原始目录是：
+
+```text
+.qlibAssistant/mlruns/
+└── <experiment_id>/                 # 第一级：实验/训练批次
+    └── <recorder_id>/               # 第二级：该实验中的一次具体训练运行
+        ├── artifacts/
+        ├── metrics/
+        ├── params/
+        └── meta.yaml
+```
+
+- `experiment_id` 是 MLflow 自动生成的数字 ID。同一个“模型算法 + 股票池 + run-tag + 启动小时”对应一个 experiment；它只是数据库主键，本身没有业务含义。
+- `recorder_id` 是一次具体训练运行的随机十六进制 ID，绑定一个模型、一个时间窗口、拟合参数、预测结果和指标。custom 五窗口训练通常在一个 experiment 下面产生5个 recorder；指定 `--window-months 60` 时通常只有1个。
+- 真正适合人识别的是 experiment 的 `name`，例如 `EXP_LinearModel_Alpha158_csi1000_custom_step0_linear_raw_fold3_260719_20260719_23`。它依次表达：模型、因子集、股票池、滚动方式、run-tag、启动日期与小时。
+- recorder 的时间窗口要查看其 `artifacts/task`，或者优先看自动导出的 `summary.md`、`metrics.csv` 和 `.qlibAssistant/experiment_index.csv`，不能从 recorder ID 本身推断。
+
+例如：
+
+```text
+781864565834297631/efb3e64a5db74ed2ad7d40040624cbea
+```
+
+前者是 raw-label Fold3 的 experiment ID，后者是该 Fold 中 Linear 60个月窗口的 recorder ID。为了避免记数字，日常应从 `.qlibAssistant/mlruns_by_name/<完整实验名>/` 进入。
+
+### 12.6 把 pkl 指标导出成可读文件
+
+PKL 不是 MLflow 强制要求的格式，而是 Qlib 用来无损保存 DataFrame、Series、模型和配置对象的默认序列化格式。现有代码会通过 `load_object("...pkl")` 读取这些文件，因此不能把 PKL 直接删除或仅改成 CSV。
+
+从 2026-07-19 起，新 recorder 会对适合表格化的数据对象双写：
+
+```text
+artifacts/
+├── pred.pkl / pred.csv                 # Test 预测
+├── label.pkl / label.csv               # Test 真实标签
+├── sig_analysis/
+│   ├── ic.pkl、ric.pkl / daily_ic.csv
+│   └── metrics.csv
+└── valid_sig_analysis/
+    ├── pred.pkl / pred.csv
+    ├── label.pkl / label.csv
+    ├── ic.pkl、ric.pkl / daily_ic.csv
+    ├── metrics.pkl / metrics.csv
+    └── segment.pkl / segment.csv
+```
+
+PKL 供程序继续读取，CSV 供人工查看。`params.pkl` 是已拟合模型，无法等价表示成 CSV；`task` 和 `dataset` 是嵌套配置对象，也不属于二维表格，继续保留原格式并通过 `summary.md`/索引查看摘要。已有 recorder 可原地补充 CSV：
+
+```bash
+$PY script/export_validation_csv_inplace.py
+```
+
+需要重新覆盖已有 CSV 时添加 `--overwrite`。2026-07-19 已为101个 recorder 回填 validation CSV，并为102个 recorder 回填顶层 Test 与 `sig_analysis` CSV。
+
+按 run-tag 导出：
+
+```bash
+$PY script/export_readable_artifacts.py \
+  --experiment-pattern 'splitval260719' \
+  --topn 20
+```
+
+如果需要导出 Test 全量股票预测：
+
+```bash
+$PY script/export_readable_artifacts.py \
+  --experiment-pattern 'splitval260719' \
+  --topn 20 \
+  --full-predictions
+```
+
+输出目录：
+
+```text
+.qlibAssistant/readable_artifacts/
+└── <experiment_name>/
+    └── <recorder_id>/
+        ├── summary.md
+        ├── metrics.csv
+        ├── validation_daily_ic.csv
+        ├── test_daily_ic.csv
+        ├── test_top20_predictions.csv
+        └── test_all_predictions.csv  # 仅 --full-predictions
+```
+
+根目录的 `export_index.csv` 可用于一次查看所有导出 recorder 的 validation 指标。
+
+### 12.7 生成统一 Test 报告
+
+按实验名称的一部分筛选批次：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern csi1000_custom_step0_retrain260718 \
+  --topk 10
+```
+
+只集成 Selection-validation Rank ICIR 最高的6个：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern csi1000_custom_step0_retrain260718 \
+  --top-models 6 \
+  --topk 10
+```
+
+限制相同 Test 区间，以便不同方案公平比较：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern csi1000_custom_step0_retrain260718 \
+  --top-models 6 \
+  --test-start 2026-06-22 \
+  --test-end 2026-07-17 \
+  --topk 10
+```
+
+报告生成到 `.qlibAssistant/analysis/evaluation_<时间戳>/`：
+
+| 文件 | 内容 |
+|---|---|
+| `summary.csv` | Rank IC、Rank ICIR、胜率和累计收益等汇总 |
+| `daily_metrics.csv` | 每个 Test 交易日的 IC、Rank IC、TopK 收益和累计曲线 |
+| `recorders.csv` | 候选 recorder、各段日期、Validation/Test 指标和集成权重 |
+| `ensemble_test_predictions.csv` | 每个股票日的集成分数与真实标签 |
+| `test_report.png` | 累计收益与逐日 Rank IC 图 |
+
+报告中的收益为未扣手续费、滑点和冲击成本的研究指标，不能直接等同于实盘收益。
+
+对于3日或5日标签，必须传入持有周期，使用H组错峰组合避免重叠收益被每天重复复利：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern linear_h3_fold1_260719 \
+  --threshold -999 \
+  --holding-period 3 \
+  --topk 10
+```
+
+`summary.csv` 中以 `executable_*` 开头的字段是错峰组合结果；旧的 `gross_*` 字段是逐日标签直接复利，只适合1日标签，不应用于跨持有周期比较。
+
+### 绝对收益标签与截面标准化标签
+
+Alpha158 默认对训练标签执行 `CSZScoreNorm`：每天在股票池截面内减均值、除标准差。因此默认模型的 `score` 主要用于当天股票间排序，不应直接解释为“预计上涨百分比”。
+
+实验时可取消标签截面标准化：
+
+```bash
+MLFLOW_ALLOW_FILE_STORE=true /Users/hmax/miniconda3/envs/qlibAssistant/bin/python script/run.py \
+  --pool csi1000 --run-tag linear_raw_label_YYMMDD --models Linear \
+  --split-selection-valid --window-months 60 --end-date YYYY-MM-DD \
+  --label-horizon 1 --raw-label
+```
+
+`--raw-label` 不修改收益公式、特征处理或 Ridge 正则化，只把 label 的学习处理器改为 `DropnaLabel`。此时 score 具有收益率单位，但仍必须检查校准，不能仅凭单位就把它当成准确收益预报。
+
+统一评估会额外生成：
+
+- `summary.csv`：`absolute_MAE`、`absolute_RMSE`、预测偏差、预测/实际均值与标准差；
+- `absolute_return_calibration.csv`：按预测 score 十分位统计预测均值、实际均值和上涨胜率；
+- `ensemble_test_predictions.csv`：逐股票、逐交易日的 score 与实际收益。
+
+2026-07-19 的 CSI1000 Linear 三折实验中，raw label 的 Rank IC 为 `0.0044、-0.0018、-0.0066`，明显低于默认标准化标签的 `0.0391、0.0340、0.0263`；因此当前生产默认值仍保留截面标准化。绝对收益模式只作为研究开关。
+
+### 12.8 画所有 recorder 的 IC/ICIR 性能图
+
+```bash
+$PY script/plot_model_performance.py \
+  --experiment-pattern 'csi1000.*retrain260718' \
+  --output-prefix csi1000_retrain260718_performance
+```
+
+输出：
+
+- `.qlibAssistant/analysis/csi1000_retrain260718_performance.csv`
+- `.qlibAssistant/analysis/csi1000_retrain260718_performance.png`
+
+图片分为 Validation 和 Test 两个面板：
+
+- 横轴：Rank IC，越向右越好。
+- 纵轴：Rank ICIR，越向上越稳定。
+- 颜色：模型类型。
+- 点旁数字：训练总窗口月数。
+- 右上象限：该数据段内排序方向正确且相对稳定。
+
+不能根据 Test 面板反复挑选模型，否则会产生 Test 泄漏。正式选择只能看 Validation/Selection-validation，Test 面板用于一次性验收。
+
+### 12.9 用 Top-N recorder 生成最新股票排名
+
+例如使用 validation Rank ICIR 前6名预测 CSI1000：
+
+```bash
+cd /Users/hmax/qlibAssistant/roll
+$PY roll.py \
+  --stock_pool=csi1000 \
+  --model_filter='[".*csi1000.*retrain260718.*"]' \
+  --top_models=6 \
+  model selection
+```
+
+输出位于 `.qlibAssistant/analysis/selection_<时间戳>/`。股票级 CSV 开头字段依次为：
+
+```text
+instrument, code, name, datetime, rank, avg_score, pos_ratio, ...
+```
+
+- `<date>_ret.csv`：全量模型排序。
+- `<date>_filter_ret.csv`：经过现有 STD/ROC 规则过滤后的子集。
+- `total.csv`：逐 recorder 原始预测，行数约为股票数乘参与模型数。
+- `total.md`：参与模型、Validation/Test 指标和权重。
+
+### 12.10 推荐的一轮研究顺序
+
+```text
+1. 设定明确 run-tag
+2. 先用 Linear/LightGBM + 60个月窗口做低成本实验
+3. 用独立 selection_valid 选模
+4. 至少运行3个不重叠时间 Folds
+5. 比较 Rank IC、Rank ICIR、正比例、Top1/Top3/Top10 与超额收益
+6. 只有跨 Fold 稳定后，才扩展模型、窗口或股票池
+7. 最终锁定配置后再运行最新预测
+```
+
+不要一开始就混合大量模型。更多 recorder 只有在误差具有互补性时才可能改善结果；弱模型、重复模型和高度相关模型会稀释有效信号。
+
+### 12.10 选择性交易（允许空仓）实验
+
+`script/evaluate_selective_trading.py` 使用已有 Linear + LightGBM recorder，不重新训练模型。阈值只根据 `selection_valid` 的分布确定，然后原样应用到 Test，避免用 Test 收益挑阈值。
+
+当前提供三类简单条件：
+
+- `strength`：当日 Top3 集成标准分的平均强度；
+- `agreement`：Linear 与 LightGBM 对 Top3 的预测一致程度；
+- `persistence`：当日 Top3 与前一交易日 Top3 的重合比例。
+
+示例（Fold1）：
+
+```bash
+$PY script/evaluate_selective_trading.py \
+  --experiment-ids 666244200422019204 124235235455944455 \
+  --fold-name fold1 --topk 3 --cost-rate 0.0015
+```
+
+`cost-rate=0.0015` 表示每个交易日按完整换仓扣除0.15%，属于偏保守的简化成本；当前没有按照实际持仓重合比例精算换手率。
+
+2026-07-20 三折初步结果：
+
+| 规则 | 平均交易覆盖率 | 三折平均净累计 | 最差 Fold | 平均最大回撤 |
+|---|---:|---:|---:|---:|
+| 始终交易 | 100.0% | 12.5% | -18.3% | -20.7% |
+| strength Q70 | 31.3% | 4.9% | -4.0% | -15.1% |
+| persistence Q70 | 53.8% | 3.9% | -6.7% | -12.2% |
+| agreement Q70 | 34.1% | -7.4% | -18.3% | -15.6% |
+
+- 强市场 Fold1/2 中，空仓规则通常牺牲总收益；弱市场 Fold3 中，`persistence Q70` 将净累计从约 -18.3% 改善到 +13.7%，最大回撤从 -31.3% 降到 -8.2%。
+- `strength Q70` 的跨 Fold 最差结果较小，适合继续作为简易“没有足够强信号则空仓”的候选。
+- 单独使用模型一致性没有稳定改善；多个条件同时叠加会造成交易样本过少。
+- 目前只有三个时间 Fold，且交易成本和换手率仍是简化模拟，不应直接视为实盘规则。
+
+#### 指标含义和继续实验
+
+- `Q70`：在 selection-validation 中取某个信号指标的第70百分位作为门槛。例如 Top3 persistence 的门槛为1/3时，表示今天Top3至少有1只也在昨天Top3才允许交易；不是在 Test 中挑收益最好的70%。
+- `净累计收益`：交易日先用 TopK 真实收益减去0.15%简化成本，空仓日收益记0，再按时间执行复利；不是逐日收益的简单相加。
+- `三折平均净累计`：三个 Fold 各自终值收益的算术平均，用来快速比较规则；它不是年化收益，也不是把三个时段串接后的真实总收益。
+- `最差 Fold`：同一规则在三个独立历史时期中最小的终值收益，衡量市场环境变化时可能出现的最坏阶段；它不同于 Fold 内最大回撤。
+
+Fold3 Top3 Persistence Q70 的具体计算：97个测试日中触发52日，触发日毛收益算术和约22.0%，成本为 `52 × 0.15% = 7.8%`，按每日净收益复利后为13.7255%；交易胜率53.85%，最大回撤-8.16%。
+
+继续比较 Top1/Top3/Top5 后，Top1结果高度不稳定；Top3的 `strength AND persistence Q70` 三折分别约为 -1.1%、+15.3%、+16.3%，交易日为23、9、26日。三个 Fold 串接复利约32.6%，接近始终交易约33.3%，但样本很少，尤其 Fold2 只有9次触发。
+
+多日标签可添加：
+
+```bash
+$PY script/evaluate_selective_trading.py \
+  --experiment-ids <3日或5日实验ID> --fold-name my_h3_fold \
+  --topk 3 --holding-period 3 --cost-rate 0.0015
+```
+
+代码使用H组错峰资金组合，避免3/5日收益标签重叠时被逐日重复复利。初步结果中，3日规则近期仍为负；5日 Persistence Q70 三折约为+0.5%、+8.1%、+3.6%，5日 Strength AND Persistence Q70 为-3.3%、+2.0%、+6.1%。当前仍以1日 Top3 规则作为主要研究方向，5日 persistence 作为持仓更久的备选。
+
+#### 5日 Top3 Persistence Q70 的完整持仓语义
+
+当前报告模拟的是5组等资金错峰组合，而不是每天用全部资金重新买一次：
+
+1. 每天收盘后，5日收益模型用截至当天的数据为 CSI1000 排名，取当日 Top3。
+2. 比较当日 Top3 与前一交易日 Top3。三个 Fold 的 selection-validation Q70 门槛均为 `2/3`，即至少2只股票连续留在Top3才触发。
+3. 总资金理论上分成5份；每天只有一份资金到期并重新决策。
+4. 触发时，该份资金等权买入当日Top3；未触发时，该份资金未来5个交易日保持现金。
+5. 触发的子组合从下一交易日收盘价开始计收益，持有5个交易日，在第6个交易日收盘退出，对应标签 `Ref($close,-6)/Ref($close,-1)-1`。
+6. 到期后该份资金重新进入相同判断；五份资金交错运行，因此最多同时存在5个不同开仓日的持仓批次。
+7. 每个触发批次扣除0.15%简化往返成本；当前尚未按股票重合精确计算换手率，也未模拟涨跌停和成交失败。
+
+以10万元直接照搬时，每份约2万元、再分3只约每只6667元，可能受到100股整数手和高价股限制。因此这套5组错峰规则目前是研究口径；个人实盘可进一步比较“每5天只运行一个完整组合”或减少到Top1/Top2，但需要重新回测，不能直接套用本报告收益。
+
+报告目录：`selective_fold1_20260720_00_06_06`、`selective_fold2_20260720_00_06_07`、`selective_fold3_20260720_00_06_08`。
+
+### 12.11 LightGBM 超参数在哪里调整
+
+`lambda_l1`、`lambda_l2`、`num_leaves`、`max_depth`、`min_data_in_leaf` 都是 **LightGBM** 参数，不是 Linear 的参数：
+
+- `lambda_l1/lambda_l2`：叶子权重的 L1/L2 正则，越大越保守；
+- `num_leaves/max_depth`：树容量，越大越容易拟合复杂关系，也越容易过拟合；
+- `min_data_in_leaf`：每个叶子的最少样本数，增大可抑制小样本叶子；
+- `learning_rate`：每棵树的更新步长；
+- `early_stopping_rounds`：Valid 指标连续多少轮不改善后停止。
+
+原始默认参数仍在 `roll/myconfig.py` 的 `GBDT_MODEL`。日常实验建议编辑更安全的预设文件：
+
+```text
+roll/model_params.yaml
+```
+
+调用示例：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 --run-tag my_lgb_test_YYMMDD --models LightGBM \
+  --split-selection-valid --window-months 60 --end-date YYYY-MM-DD \
+  --model-preset low_regularization_v1
+```
+
+只要在 `model_params.yaml` 的 `LightGBM:` 下复制一个预设、改名并修改数字，就可以通过 `--model-preset 新名称` 运行。务必修改 `run-tag`，避免与旧实验混淆。
+
+2026-07-20 对照：默认 `lambda_l1/lambda_l2=205.7/581.0`；`low_regularization_v1=0.5/5.0`，并使用 `max_depth=6、num_leaves=63、min_data_in_leaf=200`。
+
+| Fold | 默认 Rank IC | Low-reg Rank IC | 默认 Top10累计 | Low-reg Top10累计 |
+|---|---:|---:|---:|---:|
+| 1 | 0.0438 | 0.0438 | 50.4% | 63.7% |
+| 2 | 0.0372 | 0.0378 | 51.0% | 25.3% |
+| 3 | 0.0103 | 0.0081 | -23.1% | -0.1% |
+
+Low-reg 改善了 Fold1 和最差的 Fold3，但明显损害 Fold2 收益，Rank IC 没有全面提高。因此它是值得继续验证的候选，而不是新的默认参数。优化时应同时看多 Fold Rank IC、TopK 净收益和最差回撤，不能只追求 Train loss 降得更多。
+
+### 12.12 固定三折模型比较教程（推荐入口）
+
+正式实验使用四段数据，且所有模型与训练窗口共用完全相同的 Valid、Selection-valid 和 Test。`--train-months` 只改变 Train 起点，不移动后三段：
+
+```bash
+cd /Users/hmax/qlibAssistant
+PY=/Users/hmax/miniconda3/envs/qlibAssistant/bin/python
+export MLFLOW_ALLOW_FILE_STORE=true
+
+# 先打印三折日期与命令，不训练
+$PY script/run_fixed_folds.py \
+  --models Linear LightGBM XGBoost CatBoost \
+  --train-months 45 --pool csi1000 \
+  --tag-prefix my_model_test --date-tag 260720 --dry-run
+
+# 确认后正式训练；会依次训练三个 Fold
+$PY script/run_fixed_folds.py \
+  --models Linear LightGBM XGBoost CatBoost \
+  --train-months 45 --pool csi1000 \
+  --tag-prefix my_model_test --date-tag 260720
+```
+
+当前快速模型候选为 Linear、LightGBM、XGBoost、CatBoost；默认批处理已排除 DoubleEnsemble。单个模型单个 Fold 在本机本轮约2～3分钟，其中大量时间用于加载 Alpha158 数据和生成 recorder，并非纯模型拟合时间。
+
+评估某个精确实验名：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern '<完整实验名>' --exact-experiment-name \
+  --weighting equal --threshold 0.001 --topk 10
+```
+
+报告目录位于 `.qlibAssistant/analysis/evaluation_时间/`：
+
+- `summary.csv`：Rank IC/ICIR、TopK收益、官方中证1000与沪深300收益及超额；
+- `daily_metrics.csv`：逐日指标和净值；
+- `ensemble_test_predictions.csv`：逐股票、逐日预测与标签；
+- `recorders.csv`：参与评估的 recorder、数据区间及验证指标；
+- `test_report.png`：净值和每日 Rank IC 图。
+
+评估脚本会同时写出Top1、Top3、Top5、Top10的胜率、累计收益、同期中证1000与沪深300累计收益，并提供两种相对指标：`return_diff` 是策略收益减指数收益的百分点差值；`excess` 是 `(1+策略累计)/(1+指数累计)-1` 的净值比率超额。
+
+每行汇总还包含 `model`、`train_months`、`train_start`、`train_end`、`test_start`、`test_end`，用于脱离实验文件夹名称识别模型和数据窗口。中证1000/沪深300累计收益不是数据源预先给出的区间统计：程序从Qlib中的SH000852/SH000300每日收盘价出发，按模型标签相同的交易时点计算每日收益，再用 `(1+r).cumprod()-1` 复利得到测试区间累计收益。
+
+多个报告可用 `script/compare_evaluation_reports.py` 汇总。每个 `--report` 的格式是 `模型名,Fold名,报告目录`，脚本会输出逐 Fold 表、模型均值、最差 Fold 和比较图。第一轮示例结果在：
+
+```text
+.qlibAssistant/analysis/model_selection_round1_20260720/
+```
+
+注意：当前 Top10 收益是无手续费、无滑点、允许碎股的等资金权重信号实验。它适合比较模型，不是10万元账户可直接执行的回测。A股实际等资金配置应按每只股票目标资金除以价格，再向下取整到100股；余款留作现金，因此实际权重只能近似相等。
+
+#### 12.12.1 “只改Train，其他区间不变”是如何实现的
+
+正式的模型/时间窗口对照实验应调用 `script/run_fixed_folds.py`，而不是直接使用 `script/run.py --window-months`。实际调用链是：
+
+```text
+run_fixed_folds.py --train-months N
+    ↓ 计算四段精确日期
+run.py --segments-json '{train,valid,selection_valid,test}'
+    ↓ 转为 roll.py 参数
+roll.py --fixed_segments=...
+    ↓
+TrainCLI 覆盖 Dataset segments 和 handler 起止日期
+```
+
+`script/run_fixed_folds.py` 的 `FOLDS` 常量明确保存三个Fold的后三段：
+
+| Fold | Valid | Selection-valid | Test |
+|---|---|---|---|
+| Fold1 | 2024-06-15～2024-11-14 | 2024-11-15～2025-04-14 | 2025-04-15～2025-09-15 |
+| Fold2 | 2024-11-16～2025-04-15 | 2025-04-16～2025-09-15 | 2025-09-16～2026-02-16 |
+| Fold3 | 2025-04-17～2025-09-16 | 2025-09-17～2026-02-16 | 2026-02-17～2026-07-17 |
+
+对于每个Fold，脚本只做两件事：
+
+```python
+train_start = valid_start - relativedelta(months=train_months)
+train_end = valid_start - timedelta(days=1)
+```
+
+因此将 `--train-months 60` 改为 `120` 或 `240` 时，同一Fold的Valid、Selection-valid、Test完全不动，只将Train起点向历史方向扩展。“Test不变”指的是 **不同模型和不同Train月份在同一Fold内使用相同Test**；Fold1、Fold2、Fold3本身是三个不同时期，并不共用一个Test日期。
+
+先用 `--dry-run` 查看实际四段日期，不进行训练：
+
+```bash
+$PY script/run_fixed_folds.py \
+  --models XGBoost \
+  --train-months 240 \
+  --pool csi1000 \
+  --tag-prefix windowcmp \
+  --date-tag YYMMDD \
+  --dry-run
+```
+
+终端会为每个Fold打印：
+
+```text
+[fixed-fold] foldN segments={'train': (...), 'valid': (...), 'selection_valid': (...), 'test': (...)}
+```
+
+确认日期后删除 `--dry-run` 正式训练。
+
+`script/run.py --window-months` 属于普通custom窗口入口，会由滚动生成逻辑分配时间段；它适合一般训练，不应用来声称“只改Train的严格公平对照”。如果必须直接调用 `script/run.py`，应显式传入包含全部四段的 `--segments-json`。
+
+### 12.13 第一轮四模型结论（2026-07-20）
+
+固定45个月 Train、固定三折后三段、Alpha158、CSI1000、1日标签、Top10毛收益：
+
+| 模型 | 三折平均 Rank IC | 平均 Rank ICIR | 平均Top10累计 | 平均超额/中证1000 | 最差Fold超额/中证1000 |
+|---|---:|---:|---:|---:|---:|
+| XGBoost | 0.0321 | 0.2822 | 38.3% | 20.8% | +3.3% |
+| Linear | 0.0332 | 0.2863 | 13.7% | -0.5% | -16.5% |
+| LightGBM | 0.0305 | 0.2785 | 26.1% | 9.9% | -21.9% |
+| CatBoost | 0.0338 | 0.2625 | 19.5% | 3.1% | -29.5% |
+
+第一轮推荐保留 **XGBoost + Linear + LightGBM** 进入下一步：XGBoost近期最稳且收益表现最好；Linear是稳定、快速、低复杂度基线；LightGBM便于做超参数搜索。CatBoost并非永久淘汰，但它在Fold3退化最大，先降为备选。下一步先对XGBoost和LightGBM做小规模超参搜索，再比较12/24/36/45/60个月Train；不能根据这张Test表反复挑参数，参数排序必须主要依据Selection-valid，Test只用于封存验证。
+
+### 12.11 当前项目下一步
+
+截至2026-07-19：
+
+1. 已完成 CSI1000 五类模型、25个 canonical recorder 重训。
+2. 已实现 Validation 选模、Top-N 集成、重复 recorder 去重和统一 Test 报告。
+3. 已完成 Linear 60个月窗口的三个非重叠 Test Folds，三个 Fold Rank IC/Rank ICIR 均为正，但近期 Fold3 收益转弱。
+4. 下一步在完全相同的三个 Fold 上运行 LightGBM 60个月模型。
+5. 对比 Linear、LightGBM 和二者等权/Validation加权集成。
+6. 随后比较1日、3日、5日收益标签，选择更适合个人数日持仓的预测周期。
+7. 最后修复 Linear 数值溢出、评估交易阈值和费用，再决定是否扩展全市场训练及实盘。
+
+## 13. XGBoost-240 每日更新、推理与验证完整教程
+
+本节是2026-07-20后的推荐自助入口。目标是：收盘后更新Tushare日线数据，只加载已训练的CSI1000 XGBoost-240 Fold3，生成最新排名，并在未来收盘价到齐后验证历史信号。
+
+### 13.1 环境与固定变量
+
+```bash
+cd /Users/hmax/qlibAssistant
+PY=/Users/hmax/miniconda3/envs/qlibAssistant/bin/python
+export MLFLOW_ALLOW_FILE_STORE=true
+export MPLCONFIGDIR=/Users/hmax/qlibAssistant/.qlibAssistant/matplotlib
+```
+
+日常更新和预测都使用 `qlibAssistant` 环境。`qlib_env` 只由 `update-predict.py` 内部调用，用来转换Qlib二进制。Tushare token从 `~/.config/tushare_token` 读取，不应写入Git文件。
+
+### 13.2 XGBoost-240 的训练设计和存储位置
+
+训练条件：CSI1000、Alpha158、1日标签、240个月计划Train窗口，三个固定Fold，Valid用于早停，Selection-valid用于选模，Test只用于最终比较。
+
+| Fold | Experiment ID | Recorder ID | 主要用途 |
+|---|---|---|---|
+| Fold1 | `215069146775515865` | `89f3ed736bf1497e86aa074bc074581e` | 历史Test 1 |
+| Fold2 | `174018209104878076` | `308d37421ddf4c018896de2f512f7d0e` | 历史Test 2 |
+| Fold3 | `473901139733640553` | `021853d841234c4fb397e0e919800b58` | 最新数据推理与Test 3 |
+
+Fold3实际目录：
+
+```text
+/Users/hmax/qlibAssistant/.qlibAssistant/mlruns/473901139733640553/021853d841234c4fb397e0e919800b58/
+```
+
+关键文件：
+
+- `artifacts/params.pkl`：训练好的XGBoost模型；
+- `artifacts/task`：数据集、Alpha158、日期切分配置；
+- `artifacts/pred.pkl`：原Test区间预测；
+- `artifacts/label.pkl`：原Test区间标签；
+- `artifacts/valid_sig_analysis/`：Selection-valid选模指标；
+- `artifacts/sig_analysis/`：Test信号指标。
+
+如需重新训练同样的三Fold：
+
+```bash
+$PY script/run_fixed_folds.py \
+  --models XGBoost \
+  --train-months 240 \
+  --pool csi1000 \
+  --tag-prefix windowcmp \
+  --date-tag YYMMDD
+```
+
+训练会新建三个Experiment和三个Recorder；不会覆盖上表旧结果。可用 `.qlibAssistant/experiment_index.csv` 或 `.qlibAssistant/mlruns_by_name/` 查找新ID。
+
+### 13.3 每日收盘后更新数据
+
+建议在17:00～18:00之后运行，以免Tushare当日数据尚未发布。
+
+```bash
+$PY update-predict.py --update-only
+```
+
+该命令会自动：
+
+1. 确认 `/Users/hmax/qlib` 和 `/Users/hmax/investment_data` 都在 `local/hmax-fixes` 分支；
+2. 检查Dolt本地最新交易日；
+3. 通过Tushare代理下载缺失日线；
+4. 写入Dolt、转换Qlib二进制；
+5. 替换 `~/.qlib/qlib_data/cn_data/`；
+6. 重建CSI300/500/800/1000成分股文件；
+7. 不运行旧的全模型selection。
+
+完成后验证：
+
+```bash
+tail -n 3 ~/.qlib/qlib_data/cn_data/calendars/day.txt
+ls ~/.qlib/qlib_data/cn_data/instruments/csi1000.txt
+```
+
+完整更新日志位于 `/tmp/update_predict.log`。全量转换通常需要10～20分钟，长时间无终端输出时可用 `tail -f /tmp/update_predict.log` 查看。
+
+### 13.4 用XGBoost-240推理最新日期
+
+假设Qlib已更新到 `YYYY-MM-DD`：
+
+```bash
+$PY script/predict_recorder_date.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --date YYYY-MM-DD \
+  --topk 10
+```
+
+脚本会同时修改Test segment和保存在Recorder中的handler `end_time`，这一点很重要：只改Test segment会得到空预测。240个月handler需重新加载长历史Alpha158，本机一次推理约3分钟，属正常现象。
+
+输出目录：
+
+```text
+.qlibAssistant/analysis/recorder_prediction_YYYYMMDD_HHMMSS/ranking.csv
+```
+
+CSV包含 `rank,instrument,name,datetime,score`。`score` 是模型排序分数，不是可直接解读为百分比的预测收益。
+
+### 13.5 交易日期口径
+
+当信号日为T时，当前1日标签是：
+
+```text
+Ref($close,-2) / Ref($close,-1) - 1
+```
+
+含义是T日收盘后产生排名，T+1交易日收盘附近理论买入，T+2交易日收盘附近理论卖出。例如：
+
+- 2026-07-20信号；
+- 2026-07-21收盘附近买；
+- 2026-07-22收盘附近卖。
+
+不能把此结果直接解读为“次日开盘买入”。当前交易策略网格存在过拟合，所以TopK是模型候选排名，不是自动实盘指令。
+
+### 13.6 用新收盘价验证旧信号
+
+只有T+2收盘价已经入库，T日信号才有完整标签。验证命令：
+
+```bash
+$PY script/validate_recorder_signal.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --signal-date YYYY-MM-DD
+```
+
+输出包括：
+
+- 当日横截面Rank IC；
+- Top1/Top3/Top10平均收益和胜率；
+- CSI1000股票平均收益；
+- 当日Top10的实际标签。
+
+如果T+2尚未收盘，只能检查T到T+1的盘面变化，这不是模型正式标签。临时观察可指定：
+
+```bash
+$PY script/validate_recorder_signal.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --signal-date YYYY-MM-DD \
+  --label-expression 'Ref($close,-1)/$close-1'
+```
+
+### 13.7 XGBoost-240 Fold3已知指标
+
+Fold3 Test大约为2026-02-24～2026-07-17，99个信号日。
+
+| 指标 | 结果 |
+|---|---:|
+| Top1上涨胜率 | 46.39% |
+| Top3组合上涨胜率 | 53.61% |
+| Top5组合上涨胜率 | 52.58% |
+| Top10组合上涨胜率 | 48.45% |
+| 每日Rank IC为正比例 | 59.79% |
+| Top3扣0.15%换手成本后净累计 | Fold平均68.89% |
+
+“胜率不高但累计收益高”表示历史上盈利日的幅度大于亏损日，不代表每天Top1可靠上涨。这些窗口是查看过Test后挑出的，必须用2026-07-20之后的新数据做前向记录，不应再利用同一Test反复改参数。
+
+### 13.8 2026-07-20实际示例
+
+7月20日Tushare下载5524条日线，Qlib日历成功更新到7月20日。XGBoost-240 Fold3 Top10：
+
+| Rank | 股票 |
+|---:|---|
+| 1 | 长芯博创 SZ300548 |
+| 2 | 德科立 SH688205 |
+| 3 | 安泰科技 SZ000969 |
+| 4 | 西部材料 SZ002149 |
+| 5 | 东威科技 SH688700 |
+| 6 | 大金重工 SZ002487 |
+| 7 | 三祥新材 SH603663 |
+| 8 | 华曙高科 SH688433 |
+| 9 | 高新发展 SZ000628 |
+| 10 | 福晶科技 SZ002222 |
+
+输出：`.qlibAssistant/analysis/recorder_prediction_20260720_180957/ranking.csv`。
+
+7月16日信号在7月20日已可完整验证：当日Rank IC=-0.2142，Top1=+8.71%，Top3平均=+1.68%，Top10平均=-3.59%。这是“Top1命中，整体排序失败”的典型反例，不能只截取Top1盈利宣称模型当日成功。
+
+### 13.9 最短日常操作清单
+
+```bash
+cd /Users/hmax/qlibAssistant
+PY=/Users/hmax/miniconda3/envs/qlibAssistant/bin/python
+export MLFLOW_ALLOW_FILE_STORE=true
+export MPLCONFIGDIR=/Users/hmax/qlibAssistant/.qlibAssistant/matplotlib
+
+# 1. 收盘后更新；无新数据时等待1～2小时重试
+$PY update-predict.py --update-only
+
+# 2. 把日期换成Qlib日历最后一天
+$PY script/predict_recorder_date.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --date YYYY-MM-DD --topk 10
+
+# 3. 验证两个交易日前的信号
+$PY script/validate_recorder_signal.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --signal-date YYYY-MM-DD
+```
+
+日常记录至少保存：信号日、Top10、Top1/3/10后续实际收益、当日Rank IC、CSI1000/CSI300同期收益、是否停牌/涨跌停/无法成交。
+
+---
+
+## 14. 预测文件、回测参数与评估字段完整说明
+
+### 14.1 单模型和固定集成预测的输出
+
+两个预测脚本现在每次都会同时生成完整股票池和剔除科创板两个版本，不再要求必须传入 `--exclude-star-market`：
+
+```text
+recorder_prediction_YYYYMMDD_HHMMSS/
+├── ranking_all.csv              # 完整股票池
+├── ranking_ex_star.csv          # 自动剔除SH688/SH689
+├── ranking.csv                  # 兼容旧脚本的入口
+├── prediction_config.json       # 机器可读运行配置
+└── README.md                    # 人工可读说明
+
+fixed_ensemble_YYYYMMDD_HHMMSS/
+├── ensemble_ranking_all.csv
+├── ensemble_ranking_ex_star.csv
+├── ensemble_ranking.csv         # 兼容旧脚本的入口
+├── prediction_config.json
+└── README.md
+```
+
+默认情况下兼容入口 `ranking.csv`/`ensemble_ranking.csv` 保存完整股票池；如果仍传入 `--exclude-star-market`，只会让兼容入口和终端TopK改为剔除科创板版本。无论是否传参，`*_all.csv` 和 `*_ex_star.csv` 都会生成。
+
+### 14.2 macOS永久环境变量
+
+当前Mac默认Shell是zsh，对应Linux bash的 `~/.bashrc` 文件是：
+
+```text
+~/.zshrc
+```
+
+只需执行一次：
+
+```bash
+echo 'export PY=/Users/hmax/miniconda3/envs/qlibAssistant/bin/python' >> ~/.zshrc
+echo 'export MLFLOW_ALLOW_FILE_STORE=true' >> ~/.zshrc
+echo 'export MPLCONFIGDIR=/Users/hmax/qlibAssistant/.qlibAssistant/matplotlib' >> ~/.zshrc
+source ~/.zshrc
+```
+
+以后新开终端即可直接使用 `$PY`。可以这样检查：
+
+```bash
+echo $PY
+$PY --version
+```
+
+`MLFLOW_ALLOW_FILE_STORE=true` 只是当前项目仍使用旧FileStore时的兼容开关；以后迁移SQLite后应删除这一项。若不希望污染所有终端，也可以只在项目专用启动脚本中设置。
+
+### 14.3 `evaluate_batch.py`参数解释
+
+典型命令：
+
+```bash
+$PY script/evaluate_batch.py \
+  --experiment-pattern 'EXP_XGBModel_Alpha158_csi1000_custom_step0_windowcmp_fold3_train240m_260720_20260720_16' \
+  --exact-experiment-name \
+  --model-class XGBModel \
+  --topk 3 \
+  --weighting equal \
+  --cost-rate 0.0015
+```
+
+| 参数 | 是否必需 | 默认值 | 解释 |
+|---|---:|---:|---|
+| `--experiment-pattern` | 是 | 无 | 用来匹配MLflow Experiment名称。默认是“包含匹配”，因此短字符串可能匹配多个实验 |
+| `--exact-experiment-name` | 否 | 关闭 | 开启后要求实验名称完全一致。评估单个正式实验时建议始终开启，避免误匹配其他fold或h3/h5实验 |
+| `--model-class` | 否 | 不限制 | 只保留指定模型类，例如 `XGBModel`、`LGBModel`、`CatBoostModel`、`LinearModel` |
+| `--threshold` | 否 | `0.001` | Validation选模门槛。Validation的IC、ICIR、Rank IC、Rank ICIR必须全部不低于该值。单recorder诊断时若不想过滤，可设很低的值 |
+| `--topk` | 否 | `10` | 主策略每天持有预测排名前K只股票；决定主图的 `Executable TopK Equity`。报告仍固定附带Top1/3/5/10指标 |
+| `--cost-rate` | 否 | `0.0015` | 完整换仓时的简化综合成本，0.0015即0.15%。实际扣费=`换手率 × cost_rate` |
+| `--test-start` | 否 | recorder共同Test起点 | 手工限制评估开始日期，只会在原Test范围内截取 |
+| `--test-end` | 否 | recorder共同Test终点 | 手工限制评估结束日期 |
+| `--holding-period` | 否 | `1` | 持仓交易日数。大于1时使用H组错峰资金模拟，避免把重叠的多日标签每天完整复利 |
+| `--weighting` | 否 | `validation_rank_icir` | 多recorder集成权重。`validation_rank_icir`按Validation Rank ICIR加权；`equal`等权。单recorder建议使用 `equal` |
+| `--top-models` | 否 | 全部通过者 | 通过Validation门槛后，只保留Rank ICIR最高的前N个recorder |
+
+共同Test区间指所有入选recorder都拥有预测值的日期交集。这样比较不同模型时不会因为某个模型多预测了几天而获得不公平优势。
+
+### 14.4 常见金融词汇
+
+| 词汇 | 本项目中的含义 |
+|---|---|
+| Gross / 毛收益 | 尚未扣手续费、印花税、滑点和冲击成本的理论收益 |
+| Net / 净收益 | 毛收益减去简化交易成本。本项目按每日TopK实际换手比例扣 `cost_rate` |
+| Equity / 净值 | 假设初始资金为1，收益逐期复利后的资金曲线。净值1.50表示累计赚50% |
+| Cumulative Return / 累计收益 | `当前净值 - 1`。净值1.50对应累计收益0.50，即50% |
+| Executable / 可执行口径 | 针对多日持仓，用H组等资金错峰开仓，避免同一笔资金同时被重复投入多个重叠标签。它仍是研究级模拟，不代表一定成交 |
+| Turnover / 换手率 | 今天持仓与上一交易日持仓发生替换的比例。Top3替换1只，换手率约1/3 |
+| Universe | 当天测试股票池全部股票的等权平均，不是CSI1000指数本身 |
+| Benchmark / 基准 | 用来比较的市场指数，本项目主要使用CSI1000，CSI300作为大盘风格参照 |
+| Excess / 超额 | 策略相对于基准的复合净值增幅，公式一般为 `策略净值/基准净值-1` |
+| Return Diff / 收益率差 | `策略累计收益-基准累计收益`，是百分点差值；它和复合超额不是同一个公式 |
+| IC | 某一天所有股票预测分数与实际收益的Pearson相关系数，关注线性关系 |
+| Rank IC | 某一天预测排名与实际收益排名的Spearman相关系数，更符合选股任务 |
+| ICIR / Rank ICIR | 每日IC或Rank IC的均值除以标准差，衡量信号相对波动的稳定程度 |
+
+“Executable”不等于券商级真实成交。当前仍未逐笔模拟：A股100股一手、最低5元佣金、买卖侧费率差异、涨跌停无法成交、停牌、尾盘价格偏差和大单冲击成本。
+
+### 14.5 `test_report.png`五条净值线
+
+上半图默认包含五条线，所有线初始值约为1：
+
+| 曲线 | 含义 | 是否扣简化成本 |
+|---|---|---:|
+| `Executable TopK Equity` | 主TopK策略的错峰毛净值；`holding-period=1`时就是每天TopK毛收益复利 | 否 |
+| `TopK Net Equity`，例如 `Top3 Net Equity` | 每天TopK毛收益减去“实际换手率×cost_rate”后的净值 | 是 |
+| `Executable Universe Equity` | 整个股票池等权平均收益的错峰净值，用于判断选股是否优于池内平均股票 | 否 |
+| `CSI1000 Equity` | 同期中证1000指数净值，是CSI1000选股实验的主基准 | 否 |
+| `CSI300 Equity` | 同期沪深300指数净值，用来观察大盘蓝筹风格表现 | 否 |
+
+下半图是每日 `Rank IC` 柱状图：绿色表示当日排序方向正确，红色表示方向相反；黑色虚线是整个Test期间的平均Rank IC。单日柱子波动大是正常现象，应结合平均Rank IC、Rank ICIR、正值比例、净值和最大回撤共同判断。
+
+注意：五条线里只有 `TopK Net Equity` 扣了简化成本，因此最接近当前研究级净收益；其他线主要作为毛收益和市场基准对照。
+
+### 14.6 `daily_metrics.csv`字段字典
+
+每一行代表一个信号日T；实际标签遵循当前任务的T+1收盘附近买入、T+2收盘附近卖出口径。
+
+| 字段或字段模式 | 含义 |
+|---|---|
+| `datetime` | 信号日T |
+| `IC` | 当日全股票预测score与实际label的Pearson相关系数 |
+| `Rank IC` | 当日全股票预测排名与实际收益排名的Spearman相关系数 |
+| `Universe Mean Return` | 当天股票池所有股票label的等权平均收益 |
+| `TopN Mean Return` | 当天预测排名前N只股票的实际平均收益，N会输出1/3/5/10 |
+| `Top1 Return` | 第一名股票实际收益；数值与 `Top1 Mean Return` 相同，保留用于兼容旧报告 |
+| `Long Excess Return` | 主TopK平均收益减去Universe平均收益，是当日简单收益差 |
+| `TopN Turnover` | TopN持仓相对前一日的替换比例。第一天按100%建仓处理 |
+| `TopN Net Return` | `TopN Mean Return - TopN Turnover × cost_rate` |
+| `TopN Net Equity` | TopN净收益逐日复利后的净值 |
+| `TopK Cumulative` | 主TopK毛收益逐日复利后的累计收益，已经减1，因此0.20表示20% |
+| `Universe Cumulative` | Universe平均收益逐日复利后的累计收益 |
+| `Excess Cumulative` | 主TopK每日收益减Universe每日收益后直接复利的研究值；更严谨的净值超额优先看 `Executable Excess` |
+| `Executable TopK Equity` | 按holding-period错峰计算的主TopK毛净值，未减1 |
+| `TopN Equity` | 各TopN按holding-period错峰计算的毛净值 |
+| `Executable Universe Equity` | Universe按holding-period错峰计算的毛净值 |
+| `Executable Excess` | `Executable TopK Equity / Executable Universe Equity - 1` |
+| `CSI1000 Return` / `CSI300 Return` | 与模型标签持仓时点一致的指数区间收益 |
+| `CSI1000 Equity` / `CSI300 Equity` | 指数收益复利净值 |
+| `Excess vs CSI1000/CSI300` | 主TopK毛净值除以对应指数净值再减1 |
+| `TopN Excess vs CSI1000/CSI300` | 指定TopN毛净值相对于指数的复合超额 |
+| `TopN Return Diff vs CSI1000/CSI300` | TopN累计收益与指数累计收益的直接百分点差 |
+
+### 14.7 `summary.csv`字段字典
+
+`summary.csv`通常只有一行，是整段Test的汇总。动态TopN字段会为Top1/3/5/10分别生成。
+
+#### 实验身份和日期
+
+| 字段 | 含义 |
+|---|---|
+| `experiment_pattern` | 本次匹配实验所用的字符串 |
+| `model` | 入选recorder模型类型；混合时显示 `mixed` |
+| `train_months` | 训练集月份长度 |
+| `train_start` / `train_end` | 训练集起止日期 |
+| `selected_recorders` | 通过Validation门槛并参与集成的recorder数量 |
+| `top_models` | 是否只保留Validation排名前N个模型 |
+| `weighting` | 集成权重方式 |
+| `holding_period` | 持仓交易日数 |
+| `cost_rate` | 完整换仓的简化综合成本率 |
+| `test_start` / `test_end` | 实际共同Test区间 |
+| `test_trading_days` | 实际参与评估的信号日数量 |
+
+#### 预测排序能力
+
+| 字段 | 含义 |
+|---|---|
+| `mean_IC` / `mean_Rank_IC` | Test期间每日IC/Rank IC平均值 |
+| `ICIR` / `Rank_ICIR` | 每日IC/Rank IC均值除以标准差 |
+| `Rank_IC_positive_ratio` | 每日Rank IC大于0的天数比例，不等于股票上涨胜率 |
+| `TopN_win_rate` | TopN组合实际平均收益大于0的信号日比例 |
+
+#### 收益和基准
+
+| 字段 | 含义 |
+|---|---|
+| `gross_topk_cumulative` | 主TopK未扣成本的累计毛收益 |
+| `gross_universe_cumulative` | 股票池全部股票等权累计毛收益 |
+| `gross_excess_cumulative` | 每日TopK减Universe收益差的累计研究值 |
+| `executable_topk_cumulative` | 主TopK按holding-period错峰后的毛累计收益 |
+| `executable_universe_cumulative` | Universe错峰毛累计收益 |
+| `executable_excess_cumulative` | 主TopK相对Universe的复合超额 |
+| `csi1000_cumulative` / `csi300_cumulative` | 对应指数累计收益 |
+| `csi1000_covered_days` / `csi300_covered_days` | 实际获得指数收益的日期数量 |
+| `csi1000_last_valid_date` / `csi300_last_valid_date` | 指数最后一个有完整未来标签的信号日 |
+| `excess_vs_csi1000` / `excess_vs_csi300` | 主TopK毛净值相对指数的复合超额 |
+| `TopN_cumulative` | 指定TopN错峰毛累计收益 |
+| `TopN_average_turnover` | Test期间平均换手率 |
+| `TopN_net_cumulative` | 指定TopN扣简化成本后的累计净收益 |
+| `TopN_excess_vs_csi1000/300` | 指定TopN毛净值相对指数的复合超额 |
+| `TopN_return_diff_vs_csi1000/300` | 指定TopN累计毛收益减指数累计收益的百分点差 |
+
+#### 绝对预测校准
+
+| 字段 | 含义 |
+|---|---|
+| `prediction_mean` / `prediction_std` | 所有股票score的均值和标准差 |
+| `realized_return_mean` / `realized_return_std` | 所有真实label的均值和标准差 |
+| `absolute_MAE` | `abs(score-label)`平均值，越低越好；只有raw-label模型的score是收益率单位时才有直观金融意义 |
+| `absolute_RMSE` | 均方根误差，对极端错误更敏感 |
+| `prediction_bias` | `score-label`平均值；正值表示整体高估，负值表示整体低估 |
+| `sample_correlation` | 将所有日期股票样本混合后计算的相关系数；不能替代每日横截面IC |
+
+默认Alpha158标签经过横截面标准化时，score主要表达相对排名，不是“预测上涨3%”。这时MAE、RMSE和prediction bias缺少绝对收益率含义，应主要看Rank IC和TopK表现。
+
+### 14.8 `absolute_return_calibration.csv`字段字典
+
+这张表把所有预测score从低到高分成最多10个等样本分组，用来检查“预测越高，实际收益是否总体越高”。
+
+| 字段 | 含义 |
+|---|---|
+| `score_bin` | score分组边界，例如 `(-0.0186, -0.00928]` |
+| `samples` | 该分组包含的股票-日期样本数 |
+| `predicted_mean` | 该组平均预测score |
+| `predicted_min` / `predicted_max` | 该组score最小值和最大值 |
+| `realized_mean` | 该组股票后续实际平均收益 |
+| `realized_win_rate` | 该组实际收益大于0的样本比例 |
+
+理想排序模型应大致表现为：score分组越高，`realized_mean`和`realized_win_rate`整体越高。它不要求每一档严格单调，因为市场噪声很大。对标准化标签模型，应重点看分组之间的相对单调性，而不是拿 `predicted_mean` 当百分比收益。
+
+---
+
+## 15. 原Test之后的前向评估、科创板归因与模型投票
+
+### 15.1 为什么 `evaluate_batch.py --test-end` 不能自动测试新日期
+
+`evaluate_batch.py` 默认读取 recorder 训练时保存的 `pred.pkl` 和 `label.pkl`。`--test-start/--test-end` 只能在这些历史预测的日期范围内截取，不能让模型对原Test结束后的日期重新推理。XGBoost-240 Fold3保存的Test截止2026-07-17，因此把 `--test-end` 写成2026-07-21不会产生7月20/21的新预测。
+
+对原Test之后的日期必须使用：
+
+```bash
+$PY script/evaluate_forward_recorder.py \
+  --experiment-id 473901139733640553 \
+  --recorder-id 021853d841234c4fb397e0e919800b58 \
+  --start 2026-07-15 \
+  --end 2026-07-21 \
+  --cost-rate 0.0015
+```
+
+该脚本会重新加载模型和Alpha158处理器，对指定日期重新推理，然后通过Qlib最新收盘价计算真实标签。当前1日标签需要信号日之后两个交易日收盘价，因此截至7月21只能完整评价到7月17；7月20要等7月22收盘入库，7月21要等7月23。
+
+输出目录为 `.qlibAssistant/analysis/forward_evaluation_YYYYMMDD_HH_MM_SS/`，包含 `predictions_with_labels.csv`、`board_variant_summary.csv`、`board_variant_daily.csv` 和 `evaluation_config.json`。
+
+### 15.2 自动生成含/剔除科创板评估
+
+`evaluate_batch.py` 现在每次额外生成 `board_variant_summary.csv` 和 `board_variant_daily.csv`。`universe_variant=all` 是完整股票池，`ex_star` 是先剔除SH688/SH689再重新选TopK。两种口径都输出毛累计收益、扣换手成本净累计收益、换手率、胜率、最大回撤、简单年化Sharpe和最好5天收益集中度。
+
+XGB240 Fold3的Top3结果：
+
+| 股票池 | 毛累计 | 扣0.15%换手成本净累计 | 最大回撤 |
+|---|---:|---:|---:|
+| 全池 | +63.81% | +44.68% | -26.12% |
+| 剔除科创板 | +26.27% | +11.88% | -23.63% |
+
+### 15.3 DoubleEnsemble简介与240个月三折结果
+
+当前 `DEnsembleModel` 内部使用6个LightGBM子模型。训练过程中交替进行样本重加权（后续模型更关注前面模型难以拟合的样本）和特征选择（不同阶段选择更有用的因子），最后按 `1,0.2,0.2,0.2,0.2,0.2` 合成预测。它比单一GBDT更复杂、训练更慢，也可能在不同市场状态下表现不一致。
+
+Top3扣0.15%简化成本：
+
+| Fold | Test | 全池净累计 | 剔除科创板净累计 | 结论 |
+|---|---|---:|---:|---|
+| Fold1 | 2025-04～2025-09 | +61.16% | +53.23% | 强 |
+| Fold2 | 2025-09～2026-02 | +68.14% | +76.44% | 强 |
+| Fold3 | 2026-02～2026-07 | -5.93% | -12.87% | 最新市场失效 |
+
+因此DoubleEnsemble-240暂时不应替代XGB240作为当前主模型；它可以作为集成多样性来源，但必须由Selection Validation决定权重，不能因为Fold1/2收益高就忽略最新Fold3。
+
+### 15.4 有限投票和时序持续性探索
+
+```bash
+$PY script/evaluate_consensus_strategies.py \
+  --component 473901139733640553,021853d841234c4fb397e0e919800b58,XGB240 \
+  --component 143011367364704830,cde04bab7b454f2483f71f5281bff571,DE240 \
+  --cost-rate 0.0015
+```
+
+预先定义的规则包括：两个模型都进Top10、都进Top20、平均排名Top10且排名差不超过5，以及连续两天都满足Top20。当前同一Fold3 Test上的探索中，截面一致投票表现很高，而“连续两天Top20”明显亏损。这些结果已经查看Test，属于假设生成，不是无偏证据；后续只能把少量规则冻结后放到新的历史Walk-forward Fold或未来前向数据验证，不能继续按本Test最优结果反复调阈值。

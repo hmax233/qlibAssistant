@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import tempfile
+from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
@@ -15,6 +18,52 @@ from qlib.utils import init_instance_by_config
 
 VALID_ANALYSIS_DIR = "valid_sig_analysis"
 VALID_REQUIRED_FILES = ("pred.pkl", "label.pkl", "ic.pkl", "ric.pkl", "metrics.pkl")
+
+
+def save_readable_validation_artifacts(recorder, pred, label, ic, ric, metrics, segment):
+    """在保留 Qlib PKL 的同时，将 validation 产物双写为可直接查看的 CSV。"""
+
+    with tempfile.TemporaryDirectory(prefix="qlib-valid-csv-") as temp_dir:
+        output = Path(temp_dir)
+        pred.reset_index().to_csv(output / "pred.csv", index=False)
+        label.reset_index().to_csv(output / "label.csv", index=False)
+        pd.concat(
+            [ic.rename("IC"), ric.rename("Rank IC")], axis=1
+        ).rename_axis("datetime").reset_index().to_csv(output / "daily_ic.csv", index=False)
+        pd.DataFrame([metrics]).to_csv(output / "metrics.csv", index=False)
+        pd.DataFrame(
+            [{"segment": segment["name"], "range": json.dumps(segment["range"])}]
+        ).to_csv(output / "segment.csv", index=False)
+        for csv_path in output.glob("*.csv"):
+            recorder.log_artifact(str(csv_path), artifact_path=VALID_ANALYSIS_DIR)
+
+
+def save_readable_test_artifacts(recorder):
+    """为 Qlib 默认的 test 预测和 sig_analysis 追加可读 CSV。"""
+
+    pred = recorder.load_object("pred.pkl")
+    label = recorder.load_object("label.pkl")
+    ic = recorder.load_object("sig_analysis/ic.pkl")
+    ric = recorder.load_object("sig_analysis/ric.pkl")
+    test_metrics, _ = metrics_from_ic(ic, ric)
+    if isinstance(pred, pd.Series):
+        pred = pred.to_frame("score")
+    if isinstance(label, pd.Series):
+        label = label.to_frame("label")
+
+    with tempfile.TemporaryDirectory(prefix="qlib-test-csv-") as temp_dir:
+        output = Path(temp_dir)
+        pred.reset_index().to_csv(output / "pred.csv", index=False)
+        label.reset_index().to_csv(output / "label.csv", index=False)
+        recorder.log_artifact(str(output / "pred.csv"))
+        recorder.log_artifact(str(output / "label.csv"))
+
+        pd.concat(
+            [ic.rename("IC"), ric.rename("Rank IC")], axis=1
+        ).rename_axis("datetime").reset_index().to_csv(output / "daily_ic.csv", index=False)
+        pd.DataFrame([test_metrics]).to_csv(output / "metrics.csv", index=False)
+        recorder.log_artifact(str(output / "daily_ic.csv"), artifact_path="sig_analysis")
+        recorder.log_artifact(str(output / "metrics.csv"), artifact_path="sig_analysis")
 
 
 def metrics_from_ic(ic: pd.Series, ric: pd.Series) -> Tuple[Dict[str, float], list[float]]:
@@ -52,7 +101,8 @@ def load_validation_analysis(recorder):
 def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
     """确保 recorder 存在 validation 预测和评价产物。
 
-    只使用 task 中的 ``valid`` segment。test 预测和 test 指标不会参与计算。
+    新任务优先使用独立的 ``selection_valid`` segment；旧任务回退到 ``valid``。
+    test 预测和 test 指标不会参与计算。
     """
 
     if not force:
@@ -65,17 +115,18 @@ def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
     model = recorder.load_object("params.pkl")
     dataset_config = copy.deepcopy(task["dataset"])
     segments = dataset_config["kwargs"].get("segments", {})
-    if "valid" not in segments:
-        raise ValueError(f"Recorder {recorder.id} 的 task 不包含 valid segment")
+    segment = "selection_valid" if "selection_valid" in segments else "valid"
+    if segment not in segments:
+        raise ValueError(f"Recorder {recorder.id} 的 task 不包含可用于选模的 validation segment")
 
-    logger.info(f"为 recorder {recorder.id} 计算 validation 指标: {segments['valid']}")
+    logger.info(f"为 recorder {recorder.id} 使用 {segment} 计算选模指标: {segments[segment]}")
     if dataset is None:
         dataset = init_instance_by_config(dataset_config)
-    pred = model.predict(dataset, segment="valid")
+    pred = model.predict(dataset, segment=segment)
     if isinstance(pred, pd.Series):
         pred = pred.to_frame("score")
 
-    label = dataset.prepare("valid", col_set="label", data_key=DataHandlerLP.DK_R)
+    label = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_R)
     if isinstance(label, pd.Series):
         label = label.to_frame("label")
     if pred.empty or label.empty:
@@ -89,6 +140,7 @@ def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
     if not all(np.isfinite(v) for v in values):
         raise ValueError(f"Recorder {recorder.id} validation 指标包含非有限值: {metrics}")
 
+    segment_info = {"name": segment, "range": segments[segment]}
     recorder.save_objects(
         artifact_path=VALID_ANALYSIS_DIR,
         **{
@@ -97,7 +149,11 @@ def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
             "ic.pkl": ic,
             "ric.pkl": ric,
             "metrics.pkl": metrics,
+            "segment.pkl": segment_info,
         },
+    )
+    save_readable_validation_artifacts(
+        recorder, pred, label, ic, ric, metrics, segment_info
     )
     logger.info(f"Recorder {recorder.id} validation 指标已缓存: {metrics}")
     return metrics, values

@@ -12,8 +12,8 @@ sfx_name: s
 # 模型与数据集配置
 model_name: Linear
 dataset_name: Alpha158
-stock_pool: csi300
-step: 60
+stock_pool: csi300 # Linear/XGBoost/LightGBM/CatBoost/DoubleEnsemble
+step: 60 #美60天滚动一次
 
 # 滚动类型配置
 # rolling_type: custom

@@ -107,8 +107,18 @@ class ModelCLI:
             mc = ModelContext(name)
 
             # 2. 遍历记录器（收集 rid + rank_icir）
+            recorder_pairs = []
             for rid in exp.list_recorders():
                 recorder = exp.get_recorder(recorder_id=rid)
+                start_time = recorder.info.get("start_time", "") if recorder.info else ""
+                recorder_pairs.append((start_time, rid, recorder))
+            # custom 训练按 12/24/36/48/60 月生成 5 个 canonical recorder。
+            # 若异常重复启动，保留最早完成的一组，避免重复模型污染集成。
+            if "_custom_" in name and len(recorder_pairs) > 5:
+                logger.warning(f"实验 {name} 存在 {len(recorder_pairs)} 个 recorder，仅使用最早 5 个")
+                recorder_pairs = sorted(recorder_pairs)[:5]
+
+            for _, rid, recorder in recorder_pairs:
                 if self._is_valid_recorder(recorder):
                     mc.rid.append(rid)
                     _, ic_list = self.get_ic_info(recorder, split="valid")
@@ -117,6 +127,20 @@ class ModelCLI:
             # 只有当这个实验下有符合条件的记录时才添加
             if mc.rid:
                 ret.append(mc)
+
+        top_models = self.kwargs.get("top_models")
+        if top_models is not None:
+            top_models = int(top_models)
+            keep = {
+                rid
+                for rid, _ in sorted(
+                    self.rid_rank_icir.items(), key=lambda item: item[1], reverse=True
+                )[:top_models]
+            }
+            for mc in ret:
+                mc.rid = [rid for rid in mc.rid if rid in keep]
+            ret = [mc for mc in ret if mc.rid]
+            self.rid_rank_icir = {rid: value for rid, value in self.rid_rank_icir.items() if rid in keep}
         # 通过 rank_icir 为 rid_weight 分配权重（归一化处理）
         total_rank_icir = sum(self.rid_rank_icir[rid] for mc in ret for rid in mc.rid)
         self.rid_weight = {}
@@ -352,9 +376,11 @@ class ModelCLI:
         df = df[(df['ROC10'] > 0.80) & (df['ROC20'] > 0.80) & (df['ROC60'] > 0.80)]
         return df[df['ROC20'] < 1.30]
 
-    def get_real_label(self, dates = None, instruments='csi300'):
+    def get_real_label(self, dates=None, instruments=None):
         if dates is None:
             dates = self.kwargs['predict_dates'][0]
+        if instruments is None:
+            instruments = self.kwargs.get('stock_pool', 'csi300')
         df = D.features(D.instruments(instruments), ['Ref($close, -2)/Ref($close, -1) - 1'], start_time=dates['start'], end_time=dates['end'], freq='day')
         df.columns = ['real_label']
         return df
@@ -367,9 +393,11 @@ class ModelCLI:
         return df
 
 
-    def get_orignal_data(self, dates=None, instruments='csi300'):
+    def get_orignal_data(self, dates=None, instruments=None):
         if dates is None:
             dates = self.kwargs['predict_dates'][0]
+        if instruments is None:
+            instruments = self.kwargs.get('stock_pool', 'csi300')
         fields = [
             '$close * $factor', 
             '$open * $factor', 
@@ -393,7 +421,8 @@ class ModelCLI:
 
     def get_alpha_data(self, name="Alpha158"):
         dates = self.kwargs['predict_dates'][0]
-        handler_kwargs = {"instruments": "csi300", "start_time": dates['start'], "end_time": dates['end'], "infer_processors": []}
+        instruments = self.kwargs.get('stock_pool', 'csi300')
+        handler_kwargs = {"instruments": instruments, "start_time": dates['start'], "end_time": dates['end'], "infer_processors": []}
         handler = Alpha158(**handler_kwargs) if name == "Alpha158" else Alpha360(**handler_kwargs)
         return handler.fetch(col_set="feature")
 

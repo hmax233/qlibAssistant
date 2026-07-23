@@ -1,6 +1,11 @@
 #  Copyright (c) Microsoft Corporation.
 #  Licensed under the MIT License.
 
+import copy
+from pathlib import Path
+
+import yaml
+
 CSI300_MARKET = "csi300"
 CSI100_MARKET = "csi100"
 
@@ -89,9 +94,10 @@ XGBOOST_MODEL = {
         "colsample_bytree": 0.8879,
         "eta": 0.0421,
         "max_depth": 8,
-        "n_estimators": 647,
         "subsample": 0.8789,
-        "nthread": 20  # 建议根据你的 16 核硬件改为 16
+        # Qlib XGBModel.fit 使用 num_boost_round=1000 并在 validation 上早停；
+        # n_estimators 属于 sklearn API，在这里会被 xgboost 忽略。
+        "nthread": 14
     }
 }
 
@@ -183,14 +189,37 @@ def get_data_handler_config(
     fit_start_time=None, 
     fit_end_time=None,
     instruments=CSI300_MARKET,
+    label_horizon=1,
+    normalize_features=False,
+    raw_label=False,
 ):
-    return {
+    label_horizon = int(label_horizon)
+    if label_horizon < 1:
+        raise ValueError("label_horizon must be >= 1")
+    label = (
+        [f"Ref($close, -{label_horizon + 1})/Ref($close, -1) - 1"],
+        [f"LABEL{label_horizon}D"],
+    )
+    config = {
         "start_time": start_time,
         "end_time": end_time,
         "fit_start_time": fit_start_time,
         "fit_end_time": fit_end_time,
         "instruments": instruments,
+        "label": label,
     }
+    if normalize_features:
+        config["infer_processors"] = [
+            {
+                "class": "RobustZScoreNorm",
+                "kwargs": {"fields_group": "feature", "clip_outlier": True},
+            },
+            {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
+        ]
+    if raw_label:
+        # 仅删除缺失标签，不做默认的横截面 CSZScoreNorm；模型直接学习绝对收益率。
+        config["learn_processors"] = [{"class": "DropnaLabel"}]
+    return config
 
 def get_dataset_config(
     dataset_class=DATASET_ALPHA158_CLASS,
@@ -272,29 +301,48 @@ CSI100_RECORD_LGB_TASK_CONFIG = get_record_lgb_config(handler_kwargs={"instrumen
 CSI300_RECORD_LGB_TASK_CONFIG = get_record_lgb_config(handler_kwargs={"instruments": CSI300_MARKET})
 
 
-def get_model_config(model_name: str):
-    match model_name:
-        case "XGBoost":
-            return XGBOOST_MODEL
-        case "CatBoost":
-            return CATBOOST_MODEL
-        case "KRNN":
-            return KRNN_MODEL
-        case "Sandwich":
-            return SANDWICH_MODEL
-        case "Linear":
-            return LINEAR_MODEL
-        case "DoubleEnsemble":
-            return DOUBLE_ENSEMBLE_MODEL
-        case "LightGBM":
-            return GBDT_MODEL
-        case _:
-            raise ValueError(f"Model {model_name} is not supported.")
+def get_model_config(model_name: str, model_preset: str | None = None):
+    configs = {
+        "XGBoost": XGBOOST_MODEL,
+        "CatBoost": CATBOOST_MODEL,
+        "KRNN": KRNN_MODEL,
+        "Sandwich": SANDWICH_MODEL,
+        "Linear": LINEAR_MODEL,
+        "DoubleEnsemble": DOUBLE_ENSEMBLE_MODEL,
+        "LightGBM": GBDT_MODEL,
+    }
+    if model_name not in configs:
+        raise ValueError(f"Model {model_name} is not supported.")
+    config = copy.deepcopy(configs[model_name])
+    if model_name != "LightGBM" or not model_preset:
+        return config
+    preset_path = Path(__file__).with_name("model_params.yaml")
+    presets = yaml.safe_load(preset_path.read_text(encoding="utf-8")) or {}
+    try:
+        overrides = presets["LightGBM"][model_preset]
+    except KeyError as error:
+        available = ", ".join((presets.get("LightGBM") or {}).keys())
+        raise ValueError(f"未知 LightGBM preset: {model_preset}; 可选: {available}") from error
+    config["kwargs"].update(overrides)
+    return config
 
-def get_my_config(model_name: str, dataset_name: str, stock_pool: str):
-    handler_kwargs = {"instruments": stock_pool}
+def get_my_config(
+    model_name: str,
+    dataset_name: str,
+    stock_pool: str,
+    label_horizon: int = 1,
+    normalize_features: bool = False,
+    raw_label: bool = False,
+    model_preset: str | None = None,
+):
+    handler_kwargs = {
+        "instruments": stock_pool,
+        "label_horizon": label_horizon,
+        "normalize_features": normalize_features,
+        "raw_label": raw_label,
+    }
     return {
-        "model": get_model_config(model_name),
+        "model": get_model_config(model_name, model_preset=model_preset),
         "dataset": get_dataset_config(dataset_class=dataset_name, handler_kwargs=handler_kwargs),
         "record": RECORD_CONFIG,
     }

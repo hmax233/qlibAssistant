@@ -1,4 +1,5 @@
 import copy
+import json
 from loguru import logger
 import sys
 import qlib
@@ -20,7 +21,7 @@ import multiprocessing
 from tqdm import tqdm
 from functools import partialmethod
 from utils import generate_qlib_segments, get_mlruns_dates, get_local_data_date
-from validation_analysis import ensure_validation_analysis
+from validation_analysis import ensure_validation_analysis, save_readable_test_artifacts
 
 tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
 
@@ -48,12 +49,13 @@ def _train_worker(task, exp_name, region=REG_CN, **kwargs):
         recorders = trainer.train(task)
         for recorder in recorders:
             ensure_validation_analysis(recorder)
+            save_readable_test_artifacts(recorder)
 
         logger.info(f"🟢 [子进程 PID: {os.getpid()}] 训练完成，准备释放内存。", flush=True)
         os._exit(0)  # 确保子进程正常退出，exitcode 0
     except Exception as e:
         # 捕获异常打印出来，并再次抛出以确保 exitcode 非 0
-        logger.info(f"🔴 [子进程 PID: {os.getpid()}] 训练出错: {e}", flush=True)
+        logger.error("🔴 [子进程 PID: {}] 训练出错: {}", os.getpid(), e)
         raise e
 
 def run_train_blocking(task, exp_name, region, **kwargs):
@@ -123,7 +125,16 @@ class TrainCLI:
         model_name = kwargs["model_name"]
         dataset_name = kwargs["dataset_name"]
         stock_pool = kwargs["stock_pool"]
-        self.task_config = get_my_config(model_name, dataset_name, stock_pool)
+        self.task_config = get_my_config(
+            model_name,
+            dataset_name,
+            stock_pool,
+            label_horizon=int(kwargs.get("label_horizon", 1)),
+            normalize_features=str(kwargs.get("normalize_features", "false")).lower()
+            in {"1", "true", "yes"},
+            raw_label=str(kwargs.get("raw_label", "false")).lower() in {"1", "true", "yes"},
+            model_preset=kwargs.get("model_preset"),
+        )
         rolling_type = kwargs["rolling_type"]
         self.rolling_gen = RollingGen(step=step, rtype=rolling_type, ds_extra_mod_func=my_enhanced_handler_mod)
 
@@ -197,16 +208,52 @@ class TrainCLI:
                 logger.info(f"Skipping training for segment {train_time_seg} as it already exists in the experiment.")
                 continue
 
-            run_train_blocking(task, exp_name, self.region, **self.kwargs)
+            success = run_train_blocking(task, exp_name, self.region, **self.kwargs)
+            if not success:
+                raise RuntimeError(f"训练任务失败: {train_time_seg}")
             gc.collect()
 
     def start_custom(self):
         self.kwargs["rolling_type"] = "custom"
         tasks = []
-        for i in range(1, 6):
-            segments = generate_qlib_segments(months_total=12 * i)
+        fixed_segments = self.kwargs.get("fixed_segments")
+        if fixed_segments:
+            if isinstance(fixed_segments, str):
+                fixed_segments = json.loads(fixed_segments)
+            required = {"train", "valid", "selection_valid", "test"}
+            missing = required.difference(fixed_segments)
+            if missing:
+                raise ValueError(f"fixed_segments 缺少: {sorted(missing)}")
+            _task = copy.deepcopy(self.task_config)
+            _task["dataset"]["kwargs"]["segments"] = fixed_segments
+            handler_kwargs = _task["dataset"]["kwargs"]["handler"]["kwargs"]
+            handler_kwargs["fit_start_time"] = fixed_segments["train"][0]
+            handler_kwargs["fit_end_time"] = fixed_segments["train"][1]
+            handler_kwargs["start_time"] = fixed_segments["train"][0]
+            handler_kwargs["end_time"] = fixed_segments["test"][1]
+            self.task_training([_task])
+            return
+        custom_months = self.kwargs.get("custom_months")
+        if custom_months is None:
+            month_windows = [12, 24, 36, 48, 60]
+        elif isinstance(custom_months, (list, tuple)):
+            month_windows = [int(value) for value in custom_months]
+        else:
+            month_windows = [int(value) for value in str(custom_months).split(",")]
+        custom_end_date = self.kwargs.get("custom_end_date")
+        for months_total in month_windows:
+            segments = generate_qlib_segments(
+                months_total=months_total,
+                end_date_str=custom_end_date,
+                split_selection_valid=bool(self.kwargs.get("split_selection_valid", False)),
+            )
             _task = copy.deepcopy(self.task_config)
             _task["dataset"]["kwargs"]["segments"] = segments
+            handler_kwargs = _task["dataset"]["kwargs"]["handler"]["kwargs"]
+            handler_kwargs["fit_start_time"] = segments["train"][0]
+            handler_kwargs["fit_end_time"] = segments["train"][1]
+            handler_kwargs["start_time"] = segments["train"][0]
+            handler_kwargs["end_time"] = segments["test"][1]
             tasks.append(_task)
         self.task_training(tasks)
     
@@ -219,4 +266,3 @@ class TrainCLI:
         max_mlruns_date = max(mlruns_dates)
         
         return max_mlruns_date < local_data_date
-

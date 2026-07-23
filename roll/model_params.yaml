@@ -1,0 +1,33 @@
+# 可编辑模型超参数预设。通过 script/run.py --model-preset <名称> 使用。
+# 未传 --model-preset 时继续使用 myconfig.py 中的原始参数。
+
+LightGBM:
+  balanced_v1:
+    learning_rate: 0.03
+    lambda_l1: 5.0
+    lambda_l2: 20.0
+    max_depth: 6
+    num_leaves: 63
+    min_data_in_leaf: 100
+    early_stopping_rounds: 50
+    num_boost_round: 1000
+
+  low_regularization_v1:
+    learning_rate: 0.03
+    lambda_l1: 0.5
+    lambda_l2: 5.0
+    max_depth: 6
+    num_leaves: 63
+    min_data_in_leaf: 200
+    early_stopping_rounds: 50
+    num_boost_round: 1000
+
+  medium_regularization_v1:
+    learning_rate: 0.03
+    lambda_l1: 20.0
+    lambda_l2: 100.0
+    max_depth: 7
+    num_leaves: 127
+    min_data_in_leaf: 200
+    early_stopping_rounds: 50
+    num_boost_round: 1000
