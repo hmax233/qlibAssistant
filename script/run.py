@@ -4,6 +4,7 @@
 import argparse
 import itertools
 import json
+import os
 import subprocess
 import sys
 import time
@@ -72,8 +73,15 @@ def run_batch_experiments(
         if dry_run:
             continue
 
+        env = os.environ.copy()
+        if model == "TRA":
+            # Apple Accelerate/OpenMP may over-subscribe inside the spawned
+            # Qlib worker and terminate PyTorch with native signal 11.
+            env.setdefault("OMP_NUM_THREADS", "1")
+            env.setdefault("OPENBLAS_NUM_THREADS", "1")
+            env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
         started = time.time()
-        result = subprocess.run(cmd, cwd=ROLL_DIR, check=False)
+        result = subprocess.run(cmd, cwd=ROLL_DIR, check=False, env=env)
         elapsed = time.time() - started
         if result.returncode:
             failures.append((model, result.returncode))
@@ -117,7 +125,7 @@ def main():
         "--model-preset",
         help=(
             "模型参数预设；LightGBM读取roll/model_params.yaml，"
-            "TRA可选tra_smoke或tra_official_full"
+            "TRA可选tra_smoke、tra_pilot、tra_pilot_20f或tra_official_full"
         ),
     )
     parser.add_argument("--window-months", nargs="+", type=int)

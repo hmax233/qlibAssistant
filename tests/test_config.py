@@ -97,6 +97,7 @@ def test_tra_smoke_config_matches_memory_dataset():
     assert dataset["class"] == "MTSDatasetH"
     assert dataset["kwargs"]["seq_len"] == 60
     assert dataset["kwargs"]["num_states"] == 3
+    assert dataset["kwargs"]["batch_size"] == 256
     assert dataset["kwargs"]["handler"]["kwargs"]["instruments"] == "csi1000"
 
 
@@ -105,3 +106,29 @@ def test_tra_only_accepts_supported_presets_and_alpha158():
         get_model_config("TRA", model_preset="unknown")
     with pytest.raises(ValueError, match="仅验证了Alpha158"):
         get_tra_dataset_config(dataset_class="Alpha360")
+
+
+def test_tra_pilot_limits_training_without_changing_architecture():
+    config = get_model_config("TRA", model_preset="tra_pilot")
+    kwargs = config["kwargs"]
+    assert kwargs["n_epochs"] == 10
+    assert kwargs["early_stop"] == 5
+    assert kwargs["max_steps_per_epoch"] == 20
+    assert kwargs["model_config"]["input_size"] == 158
+    assert kwargs["tra_config"]["num_states"] == 3
+
+
+def test_tra_20_feature_pilot_matches_official_small_backbone():
+    config = get_my_config(
+        "TRA",
+        "Alpha158",
+        "csi300",
+        model_preset="tra_pilot_20f",
+    )
+    model_kwargs = config["model"]["kwargs"]
+    handler_kwargs = config["dataset"]["kwargs"]["handler"]["kwargs"]
+    assert model_kwargs["model_config"]["input_size"] == 20
+    assert model_kwargs["model_config"]["hidden_size"] == 64
+    feature_filter = handler_kwargs["infer_processors"][0]
+    assert feature_filter["class"] == "FilterCol"
+    assert len(feature_filter["kwargs"]["col_list"]) == 20

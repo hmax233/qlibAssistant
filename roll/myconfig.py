@@ -14,6 +14,29 @@ CSI300_BENCH = "SH000300"
 DATASET_ALPHA158_CLASS = "Alpha158"
 DATASET_ALPHA360_CLASS = "Alpha360"
 
+TRA_ALPHA158_SELECTED_FEATURES = [
+    "RESI5",
+    "WVMA5",
+    "RSQR5",
+    "KLEN",
+    "RSQR10",
+    "CORR5",
+    "CORD5",
+    "CORR10",
+    "ROC60",
+    "RESI10",
+    "VSTD5",
+    "RSQR60",
+    "CORR60",
+    "WVMA60",
+    "STD5",
+    "RSQR20",
+    "CORD60",
+    "CORD10",
+    "CORR20",
+    "KLOW",
+]
+
 ###################################
 # config
 ###################################
@@ -325,6 +348,8 @@ def get_tra_dataset_config(
     valid=("2017-01-01", "2017-02-28"),
     test=("2017-03-01", "2026-12-31"),
     handler_kwargs=None,
+    batch_size=1024,
+    selected_features=None,
 ):
     """Build the memory-augmented time-series dataset required by TRA.
 
@@ -339,6 +364,17 @@ def get_tra_dataset_config(
     kwargs = (handler_kwargs or {"instruments": CSI300_MARKET}).copy()
     kwargs["normalize_features"] = True
     handler_config = get_data_handler_config(**kwargs)
+    if selected_features:
+        handler_config["infer_processors"].insert(
+            0,
+            {
+                "class": "FilterCol",
+                "kwargs": {
+                    "fields_group": "feature",
+                    "col_list": list(selected_features),
+                },
+            },
+        )
     # Match the official TRA Alpha158 workflow: rank-normalized labels are
     # used for routing and signal learning.
     handler_config["learn_processors"] = [
@@ -363,7 +399,7 @@ def get_tra_dataset_config(
             "horizon": int(kwargs.get("label_horizon", 1)),
             "num_states": 3,
             "memory_mode": "sample",
-            "batch_size": 1024,
+            "batch_size": int(batch_size),
             "n_samples": None,
             "shuffle": True,
             "drop_last": True,
@@ -438,9 +474,35 @@ def get_model_config(model_name: str, model_preset: str | None = None):
             # Keep the architecture and pretrain stage identical so the smoke
             # test validates routing, memory and serialization end to end.
             return config
+        if model_preset in ("pilot", "tra_pilot"):
+            config["kwargs"].update(
+                {
+                    "n_epochs": 10,
+                    "early_stop": 5,
+                    "max_steps_per_epoch": 20,
+                }
+            )
+            return config
+        if model_preset in ("pilot_20f", "tra_pilot_20f"):
+            config["kwargs"].update(
+                {
+                    "n_epochs": 10,
+                    "early_stop": 5,
+                    "max_steps_per_epoch": 20,
+                }
+            )
+            config["kwargs"]["model_config"].update(
+                {
+                    "input_size": 20,
+                    "hidden_size": 64,
+                    "dropout": 0.0,
+                }
+            )
+            return config
         raise ValueError(
             "未知TRA preset: "
-            f"{model_preset}; 可选: tra_smoke, tra_official_full"
+            f"{model_preset}; 可选: tra_smoke, tra_pilot, "
+            "tra_pilot_20f, tra_official_full"
         )
     if model_name != "LightGBM" or not model_preset:
         return config
@@ -469,13 +531,30 @@ def get_my_config(
         "normalize_features": normalize_features,
         "raw_label": raw_label,
     }
-    dataset_config_factory = (
-        get_tra_dataset_config if model_name == "TRA" else get_dataset_config
-    )
+    if model_name == "TRA":
+        # Preserve the official batch for reproducible full runs; use a
+        # smaller batch for fast smoke/pilot experiments on CPU-only Macs.
+        tra_batch_size = (
+            1024
+            if model_preset in (None, "official", "official_full", "tra_official_full")
+            else 256
+        )
+        dataset_config = get_tra_dataset_config(
+            dataset_class=dataset_name,
+            handler_kwargs=handler_kwargs,
+            batch_size=tra_batch_size,
+            selected_features=(
+                TRA_ALPHA158_SELECTED_FEATURES
+                if model_preset in ("pilot_20f", "tra_pilot_20f")
+                else None
+            ),
+        )
+    else:
+        dataset_config = get_dataset_config(
+            dataset_class=dataset_name, handler_kwargs=handler_kwargs
+        )
     return {
         "model": get_model_config(model_name, model_preset=model_preset),
-        "dataset": dataset_config_factory(
-            dataset_class=dataset_name, handler_kwargs=handler_kwargs
-        ),
+        "dataset": dataset_config,
         "record": RECORD_CONFIG,
     }

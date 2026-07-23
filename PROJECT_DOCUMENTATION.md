@@ -2006,6 +2006,12 @@ $PY script/run.py \
 
 `tra_smoke`仍然执行两个训练阶段，但每阶段仅2个epoch、每epoch最多2个batch，不能用于判断模型效果。
 
+`tra_pilot`保持相同网络结构，每阶段最多10个epoch、每epoch20个batch、早停5，用于单fold耗时测量和初步有效性检查；它仍不是正式官方训练。
+
+Apple Silicon上长窗口TRA曾在训练子进程进入首个epoch前以原生信号`-11`退出。逐段诊断证明数据准备、首批数据、LSTM前向、反向传播和优化器更新均正常；根因是spawn子进程中的BLAS/OpenMP线程过度订阅，而不是模型内存不足。`script/run.py`现在会为TRA子进程自动设置`OMP_NUM_THREADS=1`、`OPENBLAS_NUM_THREADS=1`和`VECLIB_MAXIMUM_THREADS=1`。
+
+`tra_smoke`和两个pilot使用`batch_size=256`。`tra_pilot_20f`采用Qlib官方TRA配置中使用的20个Alpha158因子、`hidden_size=64`，适合Mac CPU上快速判断链路和初步泛化；`tra_official_full`仍保留158因子、hidden 256、batch 1024的官方完整口径。若再次遇到原生崩溃，可运行`script/debug_tra_native.py`逐段检查prepare、batch、forward和backward。
+
 2026-07-23端到端验证结果：
 
 - Experiment ID：`390707062670142558`
@@ -2015,6 +2021,21 @@ $PY script/run.py \
 - Selection Validation Rank IC：约`-0.0493`
 
 指标很差是预期现象：训练集只有半年且每个epoch只更新2个batch。这个实验的结论仅为“实现链路可运行并可保存、重载和预测”，不能与XGBoost-240比较。
+
+24个月20因子pilot：
+
+- Experiment ID：`690553590774368978`
+- Recorder ID：`7ddef05be5e146a7b4618a75384352f0`
+- Train：2022-06-17～2024-06-16；Test：2025-04-17～2025-09-16
+- 训练与Recorder导出耗时：约404秒
+- Selection Validation Rank IC / Rank ICIR：`0.0661 / 0.2933`
+- Test Rank IC / Rank ICIR：`0.0140 / 0.0646`
+- Test Top3毛累计 / 扣简化成本后累计：`5.28% / -0.94%`
+- 同期CSI300 / CSI1000累计：`19.23% / 28.20%`
+
+这个pilot在Selection Validation上有较强信号，但到独立Test明显衰减；扣除高换手的简化成本后Top1、Top3均为负，因此暂时不能用于实盘，也不能替代XGBoost-240。完整报告位于`.qlibAssistant/analysis/evaluation_20260723_18_24_19/`。
+
+注意：TRA预训练日志中可能出现约`0.88`的Validation IC。该阶段使用真实标签做oracle专家分配，是训练上界，不是可交易结果。必须看第二阶段router训练结束后的Selection Validation和Test指标。
 
 ### 16.4 正式训练
 
