@@ -115,7 +115,10 @@ def main():
     )
     parser.add_argument(
         "--model-preset",
-        help="roll/model_params.yaml 中的模型参数预设，目前用于 LightGBM",
+        help=(
+            "模型参数预设；LightGBM读取roll/model_params.yaml，"
+            "TRA可选tra_smoke或tra_official_full"
+        ),
     )
     parser.add_argument("--window-months", nargs="+", type=int)
     parser.add_argument("--end-date", help="自定义窗口截止日期 YYYY-MM-DD")

@@ -58,7 +58,10 @@ def test_get_model_list(mock_get_exp, mock_list_exps, mock_cli_params):
     mock_exp.list_recorders.return_value = ["rid_1"]
     mock_get_exp.return_value = mock_exp
 
-    with patch.object(cli, '_is_valid_recorder', return_value=True):
+    with (
+        patch.object(cli, '_is_valid_recorder', return_value=True),
+        patch.object(cli, "get_ic_info", return_value=({}, [0.01, 0.1, 0.02, 0.2])),
+    ):
         model_list = cli.get_model_list()
         assert len(model_list) == 1
         assert model_list[0].exp_name == "LGBM_Task"

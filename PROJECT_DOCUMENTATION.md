@@ -1950,3 +1950,111 @@ $PY script/evaluate_consensus_strategies.py \
 ```
 
 预先定义的规则包括：两个模型都进Top10、都进Top20、平均排名Top10且排名差不超过5，以及连续两天都满足Top20。当前同一Fold3 Test上的探索中，截面一致投票表现很高，而“连续两天Top20”明显亏损。这些结果已经查看Test，属于假设生成，不是无偏证据；后续只能把少量规则冻结后放到新的历史Walk-forward Fold或未来前向数据验证，不能继续按本Test最优结果反复调阈值。
+
+## 16. TRA（Temporal Routing Adaptor）
+
+### 16.1 TRA解决什么问题
+
+TRA来自KDD 2021论文《Learning Multiple Stock Trading Patterns with Temporal Routing Adaptor and Optimal Transport》。它不是强化学习。TRA假设市场包含多个随时间切换的交易模式，用一个时序骨干提取股票表示，再由多个预测器分别学习不同模式，路由器根据当前隐表示（LR）和历史预测误差（TPE）选择预测器。最优传输约束用于避免所有预测器退化成同一个模型。
+
+本项目第一版采用Qlib官方Alpha158-full结构：
+
+```text
+最近60个交易日 × 158因子
+        ↓
+两层LSTM（hidden=256）+ 时间注意力
+        ↓
+3个潜在状态预测器
+        ↓
+LR_TPE路由器（LSTM hidden=32）
+        ↓
+最终score
+```
+
+训练分为两阶段：
+
+1. `pretrain=True`：用oracle分配预训练LSTM和多个预测头；
+2. `transport_method=router`：训练路由器学习在未知未来标签时选择市场模式。
+
+### 16.2 环境安装
+
+TRA依赖PyTorch，安装到日常使用的`qlibAssistant`环境：
+
+```bash
+conda run -n qlibAssistant python -m pip install -r requirements-tra.txt
+```
+
+当前Mac上的Qlib 0.9.7 TRA实现只自动选择CUDA或CPU，不使用Apple MPS，因此这里实际走CPU。
+
+### 16.3 Smoke测试
+
+先验证完整的数据、预训练、路由训练、Recorder、Selection Validation和重新加载预测链路：
+
+```bash
+$PY script/run.py \
+  --pool csi300 \
+  --run-tag tra_alpha158_smoke_YYMMDD \
+  --models TRA \
+  --model-preset tra_smoke \
+  --segments-json '[{
+    "train":["2024-01-02","2024-06-28"],
+    "valid":["2024-07-01","2024-08-30"],
+    "selection_valid":["2024-09-02","2024-09-30"],
+    "test":["2024-10-08","2024-10-31"]
+  }]'
+```
+
+`tra_smoke`仍然执行两个训练阶段，但每阶段仅2个epoch、每epoch最多2个batch，不能用于判断模型效果。
+
+2026-07-23端到端验证结果：
+
+- Experiment ID：`390707062670142558`
+- Recorder ID：`472e864d724b4a9f869b4acfd40027af`
+- 总耗时：约231秒
+- Test Rank IC：约`0.0030`
+- Selection Validation Rank IC：约`-0.0493`
+
+指标很差是预期现象：训练集只有半年且每个epoch只更新2个batch。这个实验的结论仅为“实现链路可运行并可保存、重载和预测”，不能与XGBoost-240比较。
+
+### 16.4 正式训练
+
+正式官方完整158因子结构使用：
+
+```bash
+$PY script/run.py \
+  --pool csi1000 \
+  --run-tag tra_alpha158_full_YYMMDD \
+  --models TRA \
+  --model-preset tra_official_full \
+  --segments-json '<与其他模型完全相同的固定分段JSON>'
+```
+
+正式preset为100个预训练epoch加最多100个TRA epoch，早停20。CPU成本很高；在运行240个月三折前，应先使用一个fold和较短窗口测量每epoch耗时。公平比较时必须与XGBoost使用完全相同的Train、Valid、Selection Validation、Test和交易成本。
+
+### 16.5 Recorder预测
+
+TRA Recorder可使用通用预测脚本：
+
+```bash
+$PY script/predict_recorder_date.py \
+  --experiment-id 390707062670142558 \
+  --recorder-id 472e864d724b4a9f869b4acfd40027af \
+  --date 2024-10-31 \
+  --topk 10
+```
+
+Qlib 0.9.7的TRAModel序列化不会保存TensorBoard `_writer` 字段，本项目已在验证、普通模型选择、指定Recorder预测和前向评测入口统一恢复该运行期字段，不修改Conda环境中的Qlib源码。
+
+### 16.6 Qlib强化学习位置
+
+Qlib强化学习代码位于安装包的`qlib/rl/`，核心模块包括：
+
+- `simulator.py`：环境/市场模拟器接口；
+- `interpreter.py`：把交易状态和策略动作转换成RL观测与动作；
+- `reward.py`：奖励定义；
+- `trainer/`：训练、回测、并行环境和callback；
+- `order_execution/`：单资产订单执行环境、策略和奖励；
+- `data/`：分钟级执行数据；
+- `strategy/base.py`中的`RLStrategy`：将RL策略接入Qlib嵌套执行框架。
+
+Qlib现有RL示例主要用于把一张大订单拆分到多个分钟执行，目标是降低价格冲击和成交偏差；它不是直接替代Alpha158选股模型。TRA虽然有“路由选择”行为，但通过监督学习、历史损失和最优传输训练，不属于强化学习。

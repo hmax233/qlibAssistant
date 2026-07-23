@@ -462,3 +462,11 @@ class TradeDate:
         if i + idx >= len(self.trade_date_list):
             return self.trade_date_list[-1]
         return self.trade_date_list[i + idx]
+def restore_model_runtime_state(model):
+    """Restore non-serialized runtime fields required by selected Qlib models."""
+
+    # Qlib 0.9.7 TRAModel.predict accesses this field after unpickling even
+    # when TensorBoard logging was disabled during training.
+    if type(model).__name__ == "TRAModel" and not hasattr(model, "_writer"):
+        model._writer = None
+    return model

@@ -220,6 +220,16 @@ class TrainCLI:
         if fixed_segments:
             if isinstance(fixed_segments, str):
                 fixed_segments = json.loads(fixed_segments)
+            # Python Fire may eagerly decode the CLI JSON argument into the
+            # one-element list accepted by script/run.py.  A single custom
+            # task needs the enclosed segment mapping.
+            if isinstance(fixed_segments, list):
+                if len(fixed_segments) != 1 or not isinstance(fixed_segments[0], dict):
+                    raise ValueError(
+                        "fixed_segments 列表必须只包含一组 train/valid/"
+                        "selection_valid/test 分段"
+                    )
+                fixed_segments = fixed_segments[0]
             required = {"train", "valid", "selection_valid", "test"}
             missing = required.difference(fixed_segments)
             if missing:

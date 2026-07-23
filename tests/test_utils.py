@@ -15,7 +15,8 @@ from utils import (
     check_match,
     check_match_in_list,
     filter_csv,
-    calculate_file_sha256
+    calculate_file_sha256,
+    restore_model_runtime_state,
 )
 
 # 1. 测试基础逻辑函数 (最容易提升覆盖率)
@@ -85,3 +86,11 @@ def test_filter_csv_exception():
     # 传入一个不存在的路径
     result = filter_csv("invalid_path.csv")
     assert result == ""
+
+
+def test_restore_tra_runtime_state():
+    TRAModel = type("TRAModel", (), {})
+    model = TRAModel()
+    restored = restore_model_runtime_state(model)
+    assert restored is model
+    assert restored._writer is None

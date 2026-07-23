@@ -14,6 +14,7 @@ from loguru import logger
 from qlib.contrib.eva.alpha import calc_ic
 from qlib.data.dataset.handler import DataHandlerLP
 from qlib.utils import init_instance_by_config
+from utils import restore_model_runtime_state
 
 
 VALID_ANALYSIS_DIR = "valid_sig_analysis"
@@ -112,7 +113,7 @@ def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
             pass
 
     task = recorder.load_object("task")
-    model = recorder.load_object("params.pkl")
+    model = restore_model_runtime_state(recorder.load_object("params.pkl"))
     dataset_config = copy.deepcopy(task["dataset"])
     segments = dataset_config["kwargs"].get("segments", {})
     segment = "selection_valid" if "selection_valid" in segments else "valid"
@@ -126,9 +127,17 @@ def ensure_validation_analysis(recorder, force: bool = False, dataset=None):
     if isinstance(pred, pd.Series):
         pred = pred.to_frame("score")
 
-    label = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_R)
-    if isinstance(label, pd.Series):
-        label = label.to_frame("label")
+    # TRAModel returns routing diagnostics together with ``score`` and embeds
+    # the matching label in its prediction frame.  Its MTSDatasetH.prepare()
+    # deliberately returns an iterable segment object, not a DataFrame, so the
+    # ordinary DatasetH label-fetching path below is not applicable.
+    if "label" in pred.columns:
+        label = pred[["label"]].copy()
+        pred = pred[["score"]].copy()
+    else:
+        label = dataset.prepare(segment, col_set="label", data_key=DataHandlerLP.DK_R)
+        if isinstance(label, pd.Series):
+            label = label.to_frame("label")
     if pred.empty or label.empty:
         raise ValueError(f"Recorder {recorder.id} 的 validation 预测或标签为空")
 

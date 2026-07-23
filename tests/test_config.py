@@ -23,6 +23,7 @@ from myconfig import (
     get_model_config,
     get_dataset_config,
     get_my_config,
+    get_tra_dataset_config,
     CSI300_MARKET,
     XGBOOST_MODEL
 )
@@ -77,3 +78,30 @@ def test_model_params_consistency():
     # 验证 sample_ratios 和 sub_weights 的数量匹配逻辑
     assert len(de_config["kwargs"]["sample_ratios"]) == 5
     assert len(de_config["kwargs"]["sub_weights"]) == 6
+
+
+def test_tra_smoke_config_matches_memory_dataset():
+    config = get_my_config(
+        "TRA",
+        "Alpha158",
+        "csi1000",
+        model_preset="tra_smoke",
+    )
+
+    model = config["model"]
+    dataset = config["dataset"]
+    assert model["class"] == "TRAModel"
+    assert model["kwargs"]["tra_config"]["num_states"] == 3
+    assert model["kwargs"]["n_epochs"] == 2
+    assert model["kwargs"]["max_steps_per_epoch"] == 2
+    assert dataset["class"] == "MTSDatasetH"
+    assert dataset["kwargs"]["seq_len"] == 60
+    assert dataset["kwargs"]["num_states"] == 3
+    assert dataset["kwargs"]["handler"]["kwargs"]["instruments"] == "csi1000"
+
+
+def test_tra_only_accepts_supported_presets_and_alpha158():
+    with pytest.raises(ValueError, match="未知TRA preset"):
+        get_model_config("TRA", model_preset="unknown")
+    with pytest.raises(ValueError, match="仅验证了Alpha158"):
+        get_tra_dataset_config(dataset_class="Alpha360")

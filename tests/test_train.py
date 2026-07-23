@@ -56,10 +56,10 @@ def test_run_train_blocking_process_flow(mock_process):
     """测试多进程启动、阻塞与退出码判断"""
     instance = mock_process.return_value
     instance.exitcode = 0
-    assert run_train_blocking({"task": 1}, "exp") is True
+    assert run_train_blocking({"task": 1}, "exp", "cn") is True
 
     instance.exitcode = 1
-    assert run_train_blocking({"task": 1}, "exp") is False
+    assert run_train_blocking({"task": 1}, "exp", "cn") is False
 
 @patch('traincli.get_my_config')
 @patch('traincli.RollingGen')

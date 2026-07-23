@@ -19,7 +19,17 @@ DATASET_ALPHA360_CLASS = "Alpha360"
 ###################################
 
 # Supported Models:
-model_list = ["CatBoost", "KRNN","Sandwich","Linear","XGBoost","TFT","DoubleEnsemble","LightGBM"]
+model_list = [
+    "CatBoost",
+    "KRNN",
+    "Sandwich",
+    "Linear",
+    "XGBoost",
+    "TFT",
+    "TRA",
+    "DoubleEnsemble",
+    "LightGBM",
+]
 
 
 CATBOOST_MODEL = {
@@ -75,6 +85,52 @@ SANDWICH_MODEL = {
         "metric": "loss",
         "GPU": 0               # GPU 索引，无显卡改为 -1
     }
+}
+
+TRA_MODEL = {
+    "class": "TRAModel",
+    "module_path": "qlib.contrib.model.pytorch_tra",
+    "kwargs": {
+        # Official Alpha158-full backbone: a two-layer attentive LSTM.
+        "model_config": {
+            "input_size": 158,
+            "hidden_size": 256,
+            "num_layers": 2,
+            "rnn_arch": "LSTM",
+            "use_attn": True,
+            "dropout": 0.2,
+        },
+        # Three latent predictors represent different temporal trading patterns.
+        "tra_config": {
+            "num_states": 3,
+            "rnn_arch": "LSTM",
+            "hidden_size": 32,
+            "num_layers": 1,
+            "dropout": 0.0,
+            "tau": 1.0,
+            "src_info": "LR_TPE",
+        },
+        "model_type": "RNN",
+        "lr": 0.001,
+        "n_epochs": 100,
+        "early_stop": 20,
+        "max_steps_per_epoch": None,
+        "lamb": 1.0,
+        "rho": 0.99,
+        "alpha": 0.5,
+        "seed": 0,
+        # Keep TRA outputs inside the Qlib/MLflow recorder instead of a shared
+        # local output directory that would collide across folds.
+        "logdir": None,
+        "eval_train": False,
+        "eval_test": False,
+        "pretrain": True,
+        "init_state": None,
+        "freeze_model": False,
+        "freeze_predictors": False,
+        "transport_method": "router",
+        "memory_mode": "sample",
+    },
 }
 
 LINEAR_MODEL = {
@@ -263,6 +319,59 @@ def get_dataset_config(
     }
 
 
+def get_tra_dataset_config(
+    dataset_class=DATASET_ALPHA158_CLASS,
+    train=("2015-01-01", "2016-12-31"),
+    valid=("2017-01-01", "2017-02-28"),
+    test=("2017-03-01", "2026-12-31"),
+    handler_kwargs=None,
+):
+    """Build the memory-augmented time-series dataset required by TRA.
+
+    TRA cannot consume the project's ordinary ``DatasetH``.  The official
+    implementation uses ``MTSDatasetH`` to expose both a 60-session feature
+    sequence and the historical routing-loss memory, while keeping the same
+    Alpha158 handler and date segments used by the rest of this project.
+    """
+
+    if dataset_class != DATASET_ALPHA158_CLASS:
+        raise ValueError("当前TRA接入仅验证了Alpha158；Alpha360需使用input_size=6的独立配置")
+    kwargs = (handler_kwargs or {"instruments": CSI300_MARKET}).copy()
+    kwargs["normalize_features"] = True
+    handler_config = get_data_handler_config(**kwargs)
+    # Match the official TRA Alpha158 workflow: rank-normalized labels are
+    # used for routing and signal learning.
+    handler_config["learn_processors"] = [
+        {"class": "DropnaLabel"},
+        {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
+    ]
+    return {
+        "class": "MTSDatasetH",
+        "module_path": "qlib.contrib.data.dataset",
+        "kwargs": {
+            "handler": {
+                "class": dataset_class,
+                "module_path": "qlib.contrib.data.handler",
+                "kwargs": handler_config,
+            },
+            "segments": {
+                "train": train,
+                "valid": valid,
+                "test": test,
+            },
+            "seq_len": 60,
+            "horizon": int(kwargs.get("label_horizon", 1)),
+            "num_states": 3,
+            "memory_mode": "sample",
+            "batch_size": 1024,
+            "n_samples": None,
+            "shuffle": True,
+            "drop_last": True,
+            "input_size": None,
+        },
+    }
+
+
 def get_gbdt_task(dataset_kwargs={}, handler_kwargs={"instruments": CSI300_MARKET}):
     return {
         "model": GBDT_MODEL,
@@ -307,6 +416,7 @@ def get_model_config(model_name: str, model_preset: str | None = None):
         "CatBoost": CATBOOST_MODEL,
         "KRNN": KRNN_MODEL,
         "Sandwich": SANDWICH_MODEL,
+        "TRA": TRA_MODEL,
         "Linear": LINEAR_MODEL,
         "DoubleEnsemble": DOUBLE_ENSEMBLE_MODEL,
         "LightGBM": GBDT_MODEL,
@@ -314,6 +424,24 @@ def get_model_config(model_name: str, model_preset: str | None = None):
     if model_name not in configs:
         raise ValueError(f"Model {model_name} is not supported.")
     config = copy.deepcopy(configs[model_name])
+    if model_name == "TRA":
+        if model_preset in (None, "official", "official_full", "tra_official_full"):
+            return config
+        if model_preset in ("smoke", "tra_smoke"):
+            config["kwargs"].update(
+                {
+                    "n_epochs": 2,
+                    "early_stop": 2,
+                    "max_steps_per_epoch": 2,
+                }
+            )
+            # Keep the architecture and pretrain stage identical so the smoke
+            # test validates routing, memory and serialization end to end.
+            return config
+        raise ValueError(
+            "未知TRA preset: "
+            f"{model_preset}; 可选: tra_smoke, tra_official_full"
+        )
     if model_name != "LightGBM" or not model_preset:
         return config
     preset_path = Path(__file__).with_name("model_params.yaml")
@@ -341,8 +469,13 @@ def get_my_config(
         "normalize_features": normalize_features,
         "raw_label": raw_label,
     }
+    dataset_config_factory = (
+        get_tra_dataset_config if model_name == "TRA" else get_dataset_config
+    )
     return {
         "model": get_model_config(model_name, model_preset=model_preset),
-        "dataset": get_dataset_config(dataset_class=dataset_name, handler_kwargs=handler_kwargs),
+        "dataset": dataset_config_factory(
+            dataset_class=dataset_name, handler_kwargs=handler_kwargs
+        ),
         "record": RECORD_CONFIG,
     }

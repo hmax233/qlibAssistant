@@ -3,6 +3,7 @@ from utils import (
     check_match_in_list,
     append_to_file,
     get_normalized_stock_list,
+    restore_model_runtime_state,
 )
 import numpy as np
 import pandas as pd
@@ -240,7 +241,7 @@ class ModelCLI:
             for rid in mc.rid:
                 rec = exp.get_recorder(recorder_id=rid)
                 task = rec.load_object("task")
-                model = rec.load_object(PARAMS_FILE)
+                model = restore_model_runtime_state(rec.load_object(PARAMS_FILE))
                 self.print_rec(rec)
 
                 dataset_config = task['dataset']

@@ -1,0 +1,4 @@
+# Optional dependencies for Qlib's PyTorch TRA model.
+# Install inside the qlibAssistant Conda environment:
+#   conda run -n qlibAssistant python -m pip install -r requirements-tra.txt
+torch>=2.13,<3

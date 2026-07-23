@@ -24,7 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load(path: Path):
     with path.open("rb") as stream:
-        return pickle.load(stream)
+        value = pickle.load(stream)
+    if type(value).__name__ == "TRAModel" and not hasattr(value, "_writer"):
+        value._writer = None
+    return value
 
 
 def main():
