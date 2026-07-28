@@ -2104,3 +2104,104 @@ Qlib现有RL示例主要用于把一张大订单拆分到多个分钟执行，�
 模型家族、IC/ICIR、TopK、成交约束、A股指数、市场宽度、小盘实验、回测过拟合
 和个人10万元账户的研究边界。学习概念时优先读系统手册，复现实验时再回到本文
 和对应CSV。
+
+---
+
+## 18. 每日四路预测与决策Skill
+
+2026-07-28起，日常更新不再只运行旧的CSI300 `model selection`，而是固定为：
+
+1. 更新Tushare、Dolt和Qlib日线；
+2. 运行Mainboard20、XGBoost-240、Fixed Ensemble三路个股排名；
+3. 运行全A市场宽度Top2/4/6/8/20；
+4. 合并三路Top10票数；
+5. 对XGBoost/Fixed应用市场宽度Top2不低于40%的候选门槛；
+6. 将`event_guard`标记为“待买入日尾盘确认”，不使用前一晚不存在的行情。
+
+### 18.1 一键入口
+
+对Agent说“更新数据并生成今天的决策”，或运行`/update-predict`。对应Skill为：
+
+```text
+/Users/hmax/.agents/skills/source-command-update-predict/SKILL.md
+```
+
+本地确定性脚本：
+
+```bash
+$PY script/run_daily_decision_pipeline.py --update
+```
+
+也可以使用Shell入口：
+
+```bash
+bash script/run_daily_prediction.sh
+```
+
+只预测、不更新数据：
+
+```bash
+$PY script/run_daily_decision_pipeline.py
+```
+
+复用已有四路预测并重新生成某日汇总：
+
+```bash
+$PY script/run_daily_decision_pipeline.py \
+  --date 2026-07-28 \
+  --reuse-existing
+```
+
+市场宽度缓存已经覆盖信号日时，脚本自动跳过耗时约3～4分钟的全历史Dolt聚合；
+需要强制重建时添加`--force-breadth-rebuild`。
+
+### 18.2 输出
+
+```text
+.qlibAssistant/analysis/daily_decision_YYYYMMDD_HHMMSS/
+├── DECISION_SUMMARY.md
+├── source_actions.csv
+├── consensus_top100.csv
+├── decision_config.json
+└── 各步骤.log
+```
+
+- `source_actions.csv`：三路Top1、市场门槛和初步动作；
+- `consensus_top100.csv`：三路名次、Top10/Top20票数；
+- `DECISION_SUMMARY.md`：每天最优先阅读的清单；
+- `decision_config.json`：信号日、预计买卖日、阈值和原始预测目录。
+
+三路共识尚未单独回测；Mainboard20也尚未测试40%市场门槛。不得把这两个观察
+字段描述为已经验证的硬规则。
+
+### 18.3 event_guard不能在前一晚完成
+
+当前信号在T日收盘后产生，预计T+1尾盘买入。`event_guard`需要T+1临近收盘时
+可见的当日最低价、当前回撤和可交易状态，所以T日晚间只能标记为待确认：
+
+- 近10日跌停次数不超过1；
+- 相对20日最高收盘回撤高于-30%；
+- T+1最低价未触及跌停；
+- 当前未涨停、未停牌且能够成交。
+
+不通过就留现金，不自动购买下一名。要消除完整日线与同收盘成交的理想化，
+后续应接入14:50～14:55分钟行情做前向执行。
+
+### 18.4 Fixed Ensemble是否有未来函数
+
+当前Fixed Ensemble的四个模型在每日预测时只读取信号日及以前的数据，没有
+直接把未来价格或Test标签输入模型，因此不能简单称为“有未来函数”。
+
+它的主要问题是**事后选择偏差**：
+
+- XGBoost-60m/120m、LightGBM-84m、CatBoost-120m是在看过多轮历史实验表现后
+  冻结的；
+- 当前真正冻结的四个组件都来自Fold3；
+- Fold1、Fold2报告是事后按同一架构寻找对应Recorder重建，并非当时就冻结的
+  一套生产组合；
+- 40%市场门槛和`event_guard`也在已经查看过的Test上做过探索。
+
+因此Fixed的+39%～+40%三折平均回测更可能高估未来表现。准确表述是“没有直接
+时间泄漏，但存在较强的数据窥探、模型选择和多重比较偏差”。解决方式是在当前
+时点冻结组件、权重和交易规则，此后只看全新的前向日期，不能继续根据同一批
+Test结果修改后再引用原收益。
