@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import matplotlib
+import requests
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,6 +25,7 @@ from common import FACTORS, MODELS, RAW, REPORTS, atomic_json, ensure_dirs, fact
 
 MARKETS = ("A", "US", "HK")
 MARKET_FEATURES = [f"MARKET_{market}" for market in MARKETS]
+LIMIT_ROOT = Path("/Users/hmax/investment_data/supplemental/stk_limit")
 
 
 def available_files(market: str) -> list[Path]:
@@ -86,18 +88,34 @@ def load_period(
     max_symbols: int,
     max_rows: int,
     seed: int,
+    min_listed_days: int,
+    max_abs_label: float,
+    training_filter: bool = False,
 ) -> pd.DataFrame:
     files = select_files(market, max_symbols)
     pieces = []
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    read_end_ts = end_ts + pd.Timedelta(days=14)
     for idx, path in enumerate(files, 1):
         try:
             part = pd.read_parquet(
                 path,
-                filters=[("date", ">=", start_ts), ("date", "<=", end_ts)],
+                filters=[
+                    ("date", ">=", start_ts),
+                    ("date", "<=", read_end_ts if market == "A" else end_ts),
+                ],
             )
         except Exception:
             part = pd.read_parquet(path)
+            part = part[
+                part["date"].between(
+                    start_ts, read_end_ts if market == "A" else end_ts
+                )
+            ]
+        if market == "A" and not part.empty:
+            part = part.sort_values("date")
+            part["_next_buy_date"] = part["date"].shift(-1)
+            part["_next_sell_date"] = part["date"].shift(-2)
             part = part[part["date"].between(start_ts, end_ts)]
         if not part.empty:
             pieces.append(part)
@@ -106,14 +124,108 @@ def load_period(
     if not pieces:
         raise RuntimeError(f"no {market} data between {start} and {end}")
     frame = pd.concat(pieces, ignore_index=True)
+    del pieces
+    gc.collect()
+    raw_rows = len(frame)
     frame = frame.dropna(subset=["label_abs"])
+    missing_label_rows = raw_rows - len(frame)
+    young_rows = int((frame["listed_days"] < min_listed_days).sum())
+    frame = frame[frame["listed_days"] >= min_listed_days]
+    outlier_rows = int((frame["label_abs"].abs() > max_abs_label).sum())
+    frame = frame[frame["label_abs"].abs() <= max_abs_label]
+    # Sampling before the three exact-limit joins avoids a very large transient
+    # copy of the full 10M-row A history. The seed makes this deterministic.
     if max_rows > 0 and len(frame) > max_rows:
         frame = frame.sample(max_rows, random_state=seed)
+    if market == "A":
+        frame = enrich_a_execution(frame, start_ts, read_end_ts)
+    st_rows = int(frame["is_st_signal"].fillna(False).sum()) if market == "A" else 0
+    if market == "A":
+        frame = frame[~frame["is_st_signal"].fillna(False)]
+    blocked_train_rows = 0
+    if market == "A" and training_filter:
+        blocked = frame["buy_blocked_proxy"].fillna(False).astype(bool)
+        blocked_train_rows = int(blocked.sum())
+        frame = frame[~blocked]
     frame["date"] = pd.to_datetime(frame["date"])
     print(
         f"loaded {market}: symbols={frame['symbol'].nunique()} rows={len(frame):,} "
-        f"dates={frame['date'].min().date()}..{frame['date'].max().date()}",
+        f"dates={frame['date'].min().date()}..{frame['date'].max().date()} "
+        f"dropped(missing_label={missing_label_rows:,}, listed<{min_listed_days}="
+        f"{young_rows:,}, ST={st_rows:,}, abs_label>{max_abs_label:.3f}="
+        f"{outlier_rows:,}, "
+        f"buy_blocked_train={blocked_train_rows:,})",
         flush=True,
+    )
+    return frame
+
+
+def load_limit_prices(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    consolidated = LIMIT_ROOT / "stk_limit_all.parquet"
+    if consolidated.exists():
+        return pd.read_parquet(
+            consolidated,
+            columns=["date", "symbol", "up_return", "down_return"],
+            filters=[("date", ">=", start), ("date", "<=", end)],
+        )
+    files = [
+        path
+        for path in sorted(LIMIT_ROOT.glob("*.parquet"))
+        if len(path.stem) == 8
+        and path.stem.isdigit()
+        and start.strftime("%Y%m%d") <= path.stem <= end.strftime("%Y%m%d")
+    ]
+    if not files:
+        return pd.DataFrame(columns=["date", "symbol", "up_return", "down_return"])
+    pieces = [
+        pd.read_parquet(
+            path, columns=["date", "symbol", "up_return", "down_return"]
+        )
+        for path in files
+    ]
+    return pd.concat(pieces, ignore_index=True)
+
+
+def enrich_a_execution(
+    frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
+) -> pd.DataFrame:
+    """Attach exact known-at-date ST status and next-session limit execution."""
+    limits = load_limit_prices(start, end)
+    frame = frame.copy()
+    # Ordinary-mainboard close-return fallback remains available outside exact
+    # cache coverage. It is intentionally conservative only at the 10% limit.
+    frame["buy_blocked_proxy"] = frame["next_buy_return"] >= 0.095
+    frame["sell_blocked_proxy"] = frame["label_abs"] <= -0.095
+    frame["is_st_signal"] = False
+    frame["limit_data_available"] = False
+    if limits.empty:
+        return frame
+
+    signal = limits.rename(columns={"up_return": "signal_up_return"})[
+        ["date", "symbol", "signal_up_return"]
+    ]
+    frame = frame.merge(signal, on=["date", "symbol"], how="left")
+    frame["is_st_signal"] = frame["signal_up_return"].between(0.03, 0.08)
+    frame["limit_data_available"] = frame["signal_up_return"].notna()
+
+    buy = limits.rename(
+        columns={"date": "_next_buy_date", "up_return": "buy_up_return"}
+    )[["_next_buy_date", "symbol", "buy_up_return"]]
+    frame = frame.merge(buy, on=["_next_buy_date", "symbol"], how="left")
+    exact_buy = frame["buy_up_return"].notna()
+    frame.loc[exact_buy, "buy_blocked_proxy"] = (
+        frame.loc[exact_buy, "next_buy_return"]
+        >= frame.loc[exact_buy, "buy_up_return"] - 0.001
+    )
+
+    sell = limits.rename(
+        columns={"date": "_next_sell_date", "down_return": "sell_down_return"}
+    )[["_next_sell_date", "symbol", "sell_down_return"]]
+    frame = frame.merge(sell, on=["_next_sell_date", "symbol"], how="left")
+    exact_sell = frame["sell_down_return"].notna()
+    frame.loc[exact_sell, "sell_blocked_proxy"] = (
+        frame.loc[exact_sell, "label_abs"]
+        <= frame.loc[exact_sell, "sell_down_return"] + 0.001
     )
     return frame
 
@@ -143,14 +255,44 @@ def add_market_features(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def daily_metrics(frame: pd.DataFrame, score: np.ndarray) -> dict:
-    work = frame[["date", "symbol", "label_abs"]].copy()
+def daily_metrics(
+    frame: pd.DataFrame,
+    score: np.ndarray,
+    benchmarks: pd.DataFrame | None = None,
+) -> dict:
+    columns = ["date", "symbol", "label_abs"]
+    for column in ("buy_blocked_proxy", "sell_blocked_proxy"):
+        if column in frame:
+            columns.append(column)
+    work = frame[columns].copy()
     work["score"] = score
-    by_date = work.groupby("date", sort=True)
-    pearson = by_date.apply(
+    work["buy_blocked_proxy"] = (
+        work.get("buy_blocked_proxy", False)
+        if "buy_blocked_proxy" in work
+        else False
+    )
+    work["sell_blocked_proxy"] = (
+        work.get("sell_blocked_proxy", False)
+        if "sell_blocked_proxy" in work
+        else False
+    )
+    work["buy_blocked_proxy"] = work["buy_blocked_proxy"].fillna(False).astype(bool)
+    work["sell_blocked_proxy"] = work["sell_blocked_proxy"].fillna(False).astype(bool)
+    ideal_by_date = work.groupby("date", sort=True)
+    executable = work[~work["buy_blocked_proxy"]]
+    executable_by_date = executable.groupby("date", sort=True)
+    pearson = executable_by_date[["score", "label_abs"]].apply(
         lambda x: x["score"].corr(x["label_abs"]) if len(x) >= 10 else np.nan
     ).dropna()
-    rank = by_date.apply(
+    rank = executable_by_date[["score", "label_abs"]].apply(
+        lambda x: x["score"].corr(x["label_abs"], method="spearman")
+        if len(x) >= 10
+        else np.nan
+    ).dropna()
+    ideal_pearson = ideal_by_date[["score", "label_abs"]].apply(
+        lambda x: x["score"].corr(x["label_abs"]) if len(x) >= 10 else np.nan
+    ).dropna()
+    ideal_rank = ideal_by_date[["score", "label_abs"]].apply(
         lambda x: x["score"].corr(x["label_abs"], method="spearman")
         if len(x) >= 10
         else np.nan
@@ -167,46 +309,144 @@ def daily_metrics(frame: pd.DataFrame, score: np.ndarray) -> dict:
     result = {}
     result.update(summarize(pearson, "IC"))
     result.update(summarize(rank, "RankIC"))
+    result.update(summarize(ideal_pearson, "IdealIC"))
+    result.update(summarize(ideal_rank, "IdealRankIC"))
+    result["evaluation_rows"] = int(len(work))
+    result["buy_blocked_rows"] = int(work["buy_blocked_proxy"].sum())
+    result["buy_blocked_rate"] = float(work["buy_blocked_proxy"].mean())
+    result["sell_blocked_rows"] = int(work["sell_blocked_proxy"].sum())
+    result["sell_blocked_rate"] = float(work["sell_blocked_proxy"].mean())
+    equal_weight = ideal_by_date["label_abs"].mean().sort_index()
+    result["A_mainboard_equal_weight_cumulative"] = float(
+        (1 + equal_weight).cumprod().iloc[-1] - 1
+    )
+    if benchmarks is not None:
+        for name in benchmarks:
+            aligned = benchmarks[name].reindex(equal_weight.index).dropna()
+            if not aligned.empty:
+                result[f"{name}_cumulative"] = float((1 + aligned).cumprod().iloc[-1] - 1)
     for topk in (1, 3, 5, 10):
         selected = (
             work.sort_values(["date", "score"], ascending=[True, False])
             .groupby("date", sort=True)
             .head(topk)
         )
-        daily = selected.groupby("date")["label_abs"].mean().sort_index()
-        gross_equity = (1 + daily).cumprod()
+        # Strict execution convention: choose Top-K first. A slot whose stock is
+        # already locked at the next-day buy limit stays in cash; it is not
+        # replaced by Top-(K+1). A next-day sell-limit observation remains
+        # marked to market, but only the buy-side commission is charged because
+        # the position could not be closed on schedule.
+        selected["strict_gross_return"] = selected["label_abs"].where(
+            ~selected["buy_blocked_proxy"], 0.0
+        )
+        commission = np.where(
+            selected["buy_blocked_proxy"],
+            0.0,
+            np.where(selected["sell_blocked_proxy"], 0.000235, 0.00047),
+        )
+        selected["strict_net_return"] = selected["strict_gross_return"] - commission
+        strict_daily = (
+            selected.groupby("date")["strict_gross_return"].mean().sort_index()
+        )
+        net_daily = (
+            selected.groupby("date")["strict_net_return"].mean().sort_index()
+        )
+        ideal_daily = selected.groupby("date")["label_abs"].mean().sort_index()
+        gross_equity = (1 + strict_daily).cumprod()
         # User's current commission is 0.0235% each side; stamp duty is excluded
         # here at the user's request. Minimum CNY 5 depends on position size.
-        net_daily = daily - 0.00047
         net_equity = (1 + net_daily).cumprod()
+        ideal_equity = (1 + ideal_daily - 0.00047).cumprod()
         running_max = net_equity.cummax()
         result.update(
             {
                 f"Top{topk}_gross_cumulative": float(gross_equity.iloc[-1] - 1),
                 f"Top{topk}_net_cumulative": float(net_equity.iloc[-1] - 1),
-                f"Top{topk}_day_win_rate": float((daily > 0).mean()),
-                f"Top{topk}_stock_win_rate": float((selected["label_abs"] > 0).mean()),
+                f"Top{topk}_ideal_net_cumulative": float(ideal_equity.iloc[-1] - 1),
+                f"Top{topk}_day_win_rate": float((strict_daily > 0).mean()),
+                f"Top{topk}_stock_win_rate": float(
+                    (selected["strict_gross_return"] > 0).mean()
+                ),
                 f"Top{topk}_net_max_drawdown": float(
                     (net_equity / running_max - 1).min()
                 ),
-                f"Top{topk}_days": int(len(daily)),
+                f"Top{topk}_buy_blocked_slots": int(
+                    selected["buy_blocked_proxy"].sum()
+                ),
+                f"Top{topk}_sell_blocked_slots": int(
+                    selected["sell_blocked_proxy"].sum()
+                ),
+                f"Top{topk}_days": int(len(strict_daily)),
             }
         )
+        if benchmarks is not None:
+            for name in benchmarks:
+                aligned = benchmarks[name].reindex(net_daily.index).dropna()
+                if aligned.empty:
+                    continue
+                common = net_daily.index.intersection(aligned.index)
+                strategy_value = float((1 + net_daily.loc[common]).prod() - 1)
+                benchmark_value = float((1 + aligned.loc[common]).prod() - 1)
+                result[f"Top{topk}_net_diff_vs_{name}"] = strategy_value - benchmark_value
+    return result
+
+
+def fetch_index_benchmarks(start: str, end: str, run_dir: Path) -> pd.DataFrame | None:
+    token_file = Path.home() / ".config" / "tushare_token"
+    if not token_file.exists():
+        return None
+    token = token_file.read_text(encoding="utf-8").strip()
+    returns = {}
+    for name, code in {"CSI300": "000300.SH", "CSI1000": "000852.SH"}.items():
+        payload = {
+            "api_name": "index_daily",
+            "token": token,
+            "params": {
+                "ts_code": code,
+                "start_date": pd.Timestamp(start).strftime("%Y%m%d"),
+                "end_date": (pd.Timestamp(end) + pd.Timedelta(days=14)).strftime("%Y%m%d"),
+            },
+            "fields": "ts_code,trade_date,close",
+        }
+        try:
+            body = requests.post(
+                "https://fastapic.stockai888.top", json=payload, timeout=60
+            ).json()
+            if body.get("code") != 0:
+                raise RuntimeError(body.get("msg"))
+            data = body["data"]
+            frame = pd.DataFrame(data["items"], columns=data["fields"])
+            frame["date"] = pd.to_datetime(frame["trade_date"])
+            close = frame.sort_values("date").set_index("date")["close"].astype(float)
+            returns[name] = close.shift(-2) / close.shift(-1) - 1
+        except Exception as exc:
+            print(f"benchmark {name} unavailable: {exc}", flush=True)
+    if not returns:
+        return None
+    result = pd.DataFrame(returns).sort_index()
+    result.to_csv(run_dir / "benchmark_daily_returns.csv", index_label="date")
     return result
 
 
 def topk_equity(frame: pd.DataFrame, score: np.ndarray, topk: int = 10) -> pd.Series:
-    work = frame[["date", "label_abs"]].copy()
+    work = frame[["date", "label_abs", "buy_blocked_proxy", "sell_blocked_proxy"]].copy()
     work["score"] = score
-    daily = (
+    selected = (
         work.sort_values(["date", "score"], ascending=[True, False])
         .groupby("date", sort=True)
         .head(topk)
-        .groupby("date")["label_abs"]
-        .mean()
-        .sort_index()
     )
-    return (1 + daily - 0.00047).cumprod()
+    selected["gross"] = selected["label_abs"].where(
+        ~selected["buy_blocked_proxy"].fillna(False), 0.0
+    )
+    commission = np.where(
+        selected["buy_blocked_proxy"].fillna(False),
+        0.0,
+        np.where(selected["sell_blocked_proxy"].fillna(False), 0.000235, 0.00047),
+    )
+    selected["net"] = selected["gross"] - commission
+    daily = selected.groupby("date")["net"].mean().sort_index()
+    return (1 + daily).cumprod()
 
 
 def save_plots(
@@ -260,6 +500,79 @@ def predict(booster: xgb.Booster, dmatrix: xgb.DMatrix) -> np.ndarray:
     return booster.predict(dmatrix, iteration_range=(0, best + 1))
 
 
+def write_readable_report(run_dir: Path, summary: dict) -> None:
+    selection = summary["selection_metrics"]
+    test = summary["test_metrics"]
+    rows = []
+    for name in ("global", "finetuned", "a_only"):
+        metrics = test[name]
+        rows.append(
+            {
+                "model": name,
+                "selected": name == summary["chosen_on_selection"],
+                "selection_rank_ic": selection[name]["RankIC"],
+                "test_ic": metrics["IC"],
+                "test_rank_ic": metrics["RankIC"],
+                "top1_net": metrics["Top1_net_cumulative"],
+                "top3_net": metrics["Top3_net_cumulative"],
+                "top5_net": metrics["Top5_net_cumulative"],
+                "top10_net": metrics["Top10_net_cumulative"],
+                "top10_win_rate": metrics["Top10_stock_win_rate"],
+                "top10_max_drawdown": metrics["Top10_net_max_drawdown"],
+                "csi300": metrics.get("CSI300_cumulative"),
+                "csi1000": metrics.get("CSI1000_cumulative"),
+            }
+        )
+    comparison = pd.DataFrame(rows)
+    comparison.to_csv(run_dir / "transfer_comparison.csv", index=False)
+    pct_columns = [
+        "top1_net",
+        "top3_net",
+        "top5_net",
+        "top10_net",
+        "top10_win_rate",
+        "top10_max_drawdown",
+        "csi300",
+        "csi1000",
+    ]
+    display = comparison.copy()
+    for column in pct_columns:
+        display[column] = display[column].map(
+            lambda value: "" if pd.isna(value) else f"{value:.2%}"
+        )
+    for column in ("selection_rank_ic", "test_ic", "test_rank_ic"):
+        display[column] = display[column].map(lambda value: f"{value:.4f}")
+    lines = [
+        f"# {summary['run_tag']}",
+        "",
+        "## Outcome",
+        "",
+        f"Selection-valid chose `{summary['chosen_on_selection']}` by executable RankIC.",
+        "A model is not deployable merely because IC is positive; strict Top-K net "
+        "returns and drawdown must also pass.",
+        "",
+        display.to_markdown(index=False),
+        "",
+        "## Method",
+        "",
+        f"- Pretraining rows: {summary['rows']['pretrain']:,}",
+        f"- A-mainboard fine-tuning rows: {summary['rows']['fine']:,}",
+        f"- Blind-test rows: {summary['rows']['test']:,}",
+        "- Historical ST stocks are excluded using exact daily limit ratios.",
+        "- Top-K is fixed before execution; a next-day close-limit buy remains cash "
+        "without rank fallback.",
+        "- Commission is 0.0235% per side; minimum CNY 5 and stamp duty are not included.",
+        "",
+        "## Interpretation",
+        "",
+        "This is a one-year out-of-sample research result, not a trading recommendation. "
+        "Inspect `selection_metrics.csv`, `test_metrics.csv`, `test_predictions.csv`, "
+        "`model_comparison.png`, and `test_top10_equity.png` for full evidence.",
+        "",
+    ]
+    (run_dir / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-tag", default=f"global_to_a_{datetime.now():%y%m%d_%H%M%S}")
@@ -283,6 +596,14 @@ def main() -> None:
     parser.add_argument("--early-stopping-rounds", type=int, default=30)
     parser.add_argument("--threads", type=int, default=12)
     parser.add_argument("--seed", type=int, default=20260731)
+    parser.add_argument("--min-listed-days", type=int, default=120)
+    parser.add_argument("--max-abs-label", type=float, default=0.20)
+    parser.add_argument(
+        "--drop-a-buy-blocked-train",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Do not reward historically unbuyable next-day limit-up A-share samples.",
+    )
     args = parser.parse_args()
     ensure_dirs()
     started = time.monotonic()
@@ -300,6 +621,11 @@ def main() -> None:
             getattr(args, f"max_symbols_{market.lower()}"),
             args.pretrain_rows_per_market,
             args.seed + idx,
+            args.min_listed_days,
+            args.max_abs_label,
+            training_filter=(
+                market == "A" and args.drop_a_buy_blocked_train
+            ),
         )
         for idx, market in enumerate(MARKETS)
     ]
@@ -316,6 +642,11 @@ def main() -> None:
             getattr(args, f"max_symbols_{market.lower()}"),
             0,
             args.seed,
+            args.min_listed_days,
+            args.max_abs_label,
+            training_filter=(
+                market == "A" and args.drop_a_buy_blocked_train
+            ),
         )
         for market in MARKETS
     ]
@@ -324,7 +655,15 @@ def main() -> None:
     )
     valid_global_rows = len(valid_global)
     fine = load_period(
-        "A", args.fine_start, args.train_end, args.max_symbols_a, args.fine_rows, args.seed
+        "A",
+        args.fine_start,
+        args.train_end,
+        args.max_symbols_a,
+        args.fine_rows,
+        args.seed,
+        args.min_listed_days,
+        args.max_abs_label,
+        training_filter=args.drop_a_buy_blocked_train,
     )
     fine = add_market_features(add_learning_target(fine))
     fine_symbols = int(fine["symbol"].nunique())
@@ -333,12 +672,32 @@ def main() -> None:
     gc.collect()
     selection = add_market_features(
         add_learning_target(
-            load_period("A", args.select_start, args.select_end, args.max_symbols_a, 0, args.seed)
+            load_period(
+                "A",
+                args.select_start,
+                args.select_end,
+                args.max_symbols_a,
+                0,
+                args.seed,
+                args.min_listed_days,
+                args.max_abs_label,
+                training_filter=False,
+            )
         )
     )
     test = add_market_features(
         add_learning_target(
-            load_period("A", args.test_start, args.test_end, args.max_symbols_a, 0, args.seed)
+            load_period(
+                "A",
+                args.test_start,
+                args.test_end,
+                args.max_symbols_a,
+                0,
+                args.seed,
+                args.min_listed_days,
+                args.max_abs_label,
+                training_filter=False,
+            )
         )
     )
 
@@ -445,10 +804,11 @@ def main() -> None:
         test_score = weight * test_base["finetuned"] + (1 - weight) * test_base["global"]
     else:
         test_score = test_base[chosen]
+    benchmarks = fetch_index_benchmarks(args.test_start, args.test_end, run_dir)
     test_metrics = {
-        name: daily_metrics(test, score) for name, score in test_base.items()
+        name: daily_metrics(test, score, benchmarks) for name, score in test_base.items()
     }
-    test_metrics[chosen] = daily_metrics(test, test_score)
+    test_metrics[chosen] = daily_metrics(test, test_score, benchmarks)
     plotted_scores = dict(test_base)
     plotted_scores[chosen] = test_score
     save_plots(run_dir, selection_metrics, test_metrics, test, plotted_scores)
@@ -496,9 +856,20 @@ def main() -> None:
             "vwap": "OHLC4 proxy used consistently across A/HK/US",
             "selection": "blend/model choice made only on selection-valid; test untouched",
             "cost": "0.0235% buy + 0.0235% sell; minimum CNY 5 and stamp duty excluded",
+            "quality_filter": (
+                f"listed_days>={args.min_listed_days}; abs(label)<="
+                f"{args.max_abs_label}; historical A buy-limit-locked rows excluded "
+                "from learning"
+            ),
+            "strict_execution": (
+                "Top-K is selected before execution; next-day buy-limit-locked "
+                "slots remain cash without fallback. Sell-limit rows are marked "
+                "to market and charged buy-side commission only."
+            ),
         },
     }
     atomic_json(run_dir / "summary.json", summary)
+    write_readable_report(run_dir, summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 

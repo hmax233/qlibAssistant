@@ -12,7 +12,7 @@ import pandas as pd
 from common import FACTORS, LOGS, RAW, alpha158_frame, atomic_json, ensure_dirs
 
 
-def build_market(market: str, limit: int) -> dict:
+def build_market(market: str, limit: int, force: bool = False) -> dict:
     source = RAW / market.lower()
     output = FACTORS / market.lower()
     output.mkdir(parents=True, exist_ok=True)
@@ -22,7 +22,8 @@ def build_market(market: str, limit: int) -> dict:
     pending = [
         p
         for p in files
-        if not (output / p.name).exists()
+        if force
+        or not (output / p.name).exists()
         or (output / p.name).stat().st_mtime < p.stat().st_mtime
     ]
     success = failed = 0
@@ -59,9 +60,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--markets", nargs="+", choices=["A", "US", "HK"], default=["A", "US", "HK"])
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     ensure_dirs()
-    reports = [build_market(market, args.limit) for market in args.markets]
+    reports = [build_market(market, args.limit, args.force) for market in args.markets]
     print(json.dumps(reports, ensure_ascii=False, indent=2))
 
 

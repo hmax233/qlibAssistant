@@ -11,6 +11,7 @@ MODULE_DIR = Path(__file__).resolve().parents[1] / "script" / "cross_market"
 sys.path.insert(0, str(MODULE_DIR))
 
 from common import alpha158_frame, factor_columns  # noqa: E402
+from train_global_then_a import daily_metrics  # noqa: E402
 
 
 def sample_ohlcv(rows: int = 180) -> pd.DataFrame:
@@ -44,3 +45,24 @@ def test_market_flags_are_not_counted_as_alpha_factors() -> None:
     factors = alpha158_frame(sample_ohlcv(), symbol="TEST", market="A")
     factors["MARKET_A"] = 1.0
     assert len(factor_columns(factors)) == 158
+
+
+def test_strict_topk_keeps_blocked_slot_in_cash_without_fallback() -> None:
+    rows = []
+    for date in pd.bdate_range("2026-01-01", periods=3):
+        for rank in range(20):
+            rows.append(
+                {
+                    "date": date,
+                    "symbol": f"S{rank:02d}",
+                    "label_abs": 0.10 if rank == 0 else 0.001,
+                    "buy_blocked_proxy": rank == 0,
+                    "sell_blocked_proxy": False,
+                }
+            )
+    frame = pd.DataFrame(rows)
+    score = np.tile(np.arange(20, 0, -1), 3)
+    metrics = daily_metrics(frame, score)
+    assert metrics["Top1_buy_blocked_slots"] == 3
+    assert metrics["Top1_gross_cumulative"] == 0.0
+    assert metrics["Top1_ideal_net_cumulative"] > 0.30

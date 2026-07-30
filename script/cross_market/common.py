@@ -105,7 +105,8 @@ def _rolling_linear(series: pd.Series, window: int) -> tuple[pd.Series, pd.Serie
     intercept = (sy - slope * sx) / window
     fitted_last = intercept + slope * (window - 1)
     residual = y - fitted_last
-    corr_denom = np.sqrt((window * sx2 - sx * sx) * (window * sy2 - sy * sy))
+    y_variance_term = (window * sy2 - sy * sy).clip(lower=0)
+    corr_denom = np.sqrt((window * sx2 - sx * sx) * y_variance_term)
     corr = (window * xy - sx * sy) / corr_denom.replace(0, np.nan)
     return slope, corr.pow(2), residual
 
@@ -213,6 +214,16 @@ def alpha158_frame(frame: pd.DataFrame, symbol: str, market: str) -> pd.DataFram
     out["close"] = c
     out["next_buy_close"] = c.shift(-1)
     out["next_sell_close"] = c.shift(-2)
+    out["listed_days"] = np.arange(1, len(out) + 1, dtype=np.int32)
+    out["next_buy_return"] = c.shift(-1) / c - 1
+    out["next_buy_low_return"] = l.shift(-1) / c - 1
+    out["next_sell_high_return"] = h.shift(-2) / c.shift(-1) - 1
+    # Close-execution fallback for ordinary 10% main-board limits. The training
+    # pipeline upgrades this with Tushare's exact daily limit prices, which also
+    # identifies historical ST 5% limits. A close locked at the limit cannot be
+    # assumed executable merely because the board opened intraday.
+    out["buy_blocked_proxy"] = out["next_buy_return"] >= 0.095
+    out["sell_blocked_proxy"] = out["label_abs"] <= -0.095
     out = out.replace([np.inf, -np.inf], np.nan).copy()
     return out
 
@@ -227,6 +238,19 @@ def factor_columns(frame: pd.DataFrame) -> list[str]:
         "close",
         "next_buy_close",
         "next_sell_close",
+        "listed_days",
+        "next_buy_return",
+        "next_buy_low_return",
+        "next_sell_high_return",
+        "buy_blocked_proxy",
+        "sell_blocked_proxy",
+        "_next_buy_date",
+        "_next_sell_date",
+        "signal_up_return",
+        "buy_up_return",
+        "sell_down_return",
+        "is_st_signal",
+        "limit_data_available",
     }
     return [
         c for c in frame.columns

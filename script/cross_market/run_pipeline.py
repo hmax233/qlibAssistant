@@ -53,7 +53,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-tag", default=f"global_to_a_{datetime.now():%y%m%d_%H%M%S}")
     parser.add_argument("--pilot", action="store_true")
-    parser.add_argument("--start-at", choices=["download", "export_a", "factors", "train"], default="download")
+    parser.add_argument(
+        "--start-at",
+        choices=[
+            "download",
+            "export_a",
+            "factors",
+            "limits",
+            "inventory",
+            "audit",
+            "train",
+        ],
+        default="download",
+    )
     args = parser.parse_args()
     ensure_dirs()
     log_file = LOGS / f"{args.run_tag}.log"
@@ -72,6 +84,9 @@ def main() -> None:
         "2004-01-01",
     ]
     factor_cmd = [str(PYTHON), "script/cross_market/build_factor_store.py"]
+    limit_cmd = [str(PYTHON), "script/cross_market/download_a_stk_limit.py"]
+    inventory_cmd = [str(PYTHON), "script/cross_market/summarize_store.py"]
+    audit_cmd = [str(PYTHON), "script/cross_market/audit_alpha158_compatibility.py"]
     train_cmd = [
         str(PYTHON),
         "script/cross_market/train_global_then_a.py",
@@ -100,6 +115,9 @@ def main() -> None:
             ("download", yahoo_cmd),
             ("export_a", export_cmd),
             ("factors", factor_cmd),
+            ("limits", limit_cmd),
+            ("inventory", inventory_cmd),
+            ("audit", audit_cmd),
             ("train", train_cmd),
         ]
     )
