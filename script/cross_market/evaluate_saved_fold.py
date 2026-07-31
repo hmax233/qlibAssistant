@@ -45,6 +45,12 @@ DEFAULT_COMPARISON = (
     / "analysis"
     / "source_hard_filter_20260728_225020"
 )
+DEFAULT_MAINBOARD_COMPARISON = (
+    ROOT
+    / ".qlibAssistant"
+    / "analysis"
+    / "hard_risk_filter_20260728_223233"
+)
 
 
 def comparison_dates(folder: Path, fold: str) -> pd.DatetimeIndex:
@@ -100,6 +106,38 @@ def previous_source_rows(folder: Path, fold: str) -> pd.DataFrame:
     ].copy()
 
 
+def mainboard_rows(
+    folder: Path,
+    fold: str,
+    dates: pd.DatetimeIndex,
+    benchmarks: dict[str, pd.Series],
+) -> pd.DataFrame:
+    """Re-summarize Mainboard20 on the exact shared comparison dates."""
+
+    daily = pd.read_csv(folder / "hard_filter_daily.csv", parse_dates=["datetime"])
+    selected = daily[
+        daily["fold"].eq(fold)
+        & daily["topk"].eq(1)
+        & daily["rule"].isin(["baseline", "event_guard"])
+        & daily["fallback"].eq(False)
+        & daily["datetime"].isin(dates)
+    ].copy()
+    rows = []
+    for rule_name, group in selected.groupby("rule", sort=False):
+        group = group.set_index("datetime").sort_index()
+        rows.append(
+            {
+                "source": "Mainboard20",
+                "fold": fold,
+                "topk": 1,
+                "rule": rule_name,
+                "fallback": False,
+                **summarize(group, benchmarks),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-tag", required=True)
@@ -107,6 +145,11 @@ def main() -> None:
     parser.add_argument("--start", default="2026-02-17")
     parser.add_argument("--end", default="2026-07-17")
     parser.add_argument("--comparison-dir", type=Path, default=DEFAULT_COMPARISON)
+    parser.add_argument(
+        "--mainboard-comparison-dir",
+        type=Path,
+        default=DEFAULT_MAINBOARD_COMPARISON,
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -196,6 +239,13 @@ def main() -> None:
     )
 
     previous = previous_source_rows(args.comparison_dir, args.fold)
+    mainboard = mainboard_rows(
+        args.mainboard_comparison_dir,
+        args.fold,
+        dates,
+        legacy_benchmarks,
+    )
+    previous = pd.concat([previous, mainboard], ignore_index=True, sort=False)
     previous.to_csv(output / "previous_multisource_fold3.csv", index=False)
     combined = pd.concat(
         [
