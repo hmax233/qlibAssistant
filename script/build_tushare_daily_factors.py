@@ -78,6 +78,14 @@ def build_symbol(root: Path, instrument: str) -> pd.DataFrame:
         out["mf_lg_amount_imbalance"] + out["mf_elg_amount_imbalance"]
         - out["mf_sm_amount_imbalance"]
     )
+    large_buy_amount = m[["buy_lg_amount", "buy_elg_amount"]].sum(axis=1, min_count=1)
+    large_sell_amount = m[["sell_lg_amount", "sell_elg_amount"]].sum(axis=1, min_count=1)
+    out["mf_large_amount_share"] = safe_ratio(large_buy_amount + large_sell_amount, total_amount)
+    out["mf_large_buy_pressure"] = safe_ratio(large_buy_amount, large_buy_amount + large_sell_amount)
+    out["mf_elg_minus_lg"] = out["mf_elg_amount_imbalance"] - out["mf_lg_amount_imbalance"]
+    out["mf_amount_volume_divergence"] = out["mf_net_amount_ratio"] - out["mf_net_volume_ratio"]
+    out["mf_net_amount_to_circ_mv"] = safe_ratio(m["net_mf_amount"], b["circ_mv"])
+    out["mf_net_amount_to_free_share"] = safe_ratio(m["net_mf_amount"], b["free_share"])
 
     close = b["close"].combine_first(p["close_qfq"])
     out["cyq_winner_rate"] = c["winner_rate"] / 100.0
@@ -86,6 +94,16 @@ def build_symbol(root: Path, instrument: str) -> pd.DataFrame:
     out["cyq_cost90_width"] = safe_ratio(c["cost_95pct"], c["cost_5pct"]) - 1.0
     out["cyq_cost70_width"] = safe_ratio(c["cost_85pct"], c["cost_15pct"]) - 1.0
     out["cyq_position_in_history"] = safe_ratio(close - c["his_low"], c["his_high"] - c["his_low"])
+    for percentile in (5, 15, 50, 85, 95):
+        out[f"cyq_close_to_cost{percentile}"] = safe_ratio(close, c[f"cost_{percentile}pct"]) - 1.0
+    upper_chip_width = c["cost_95pct"] - c["cost_50pct"]
+    lower_chip_width = c["cost_50pct"] - c["cost_5pct"]
+    out["cyq_cost_asymmetry"] = safe_ratio(upper_chip_width - lower_chip_width,
+                                           upper_chip_width + lower_chip_width)
+    out["cyq_core_cost_asymmetry"] = safe_ratio(
+        (c["cost_85pct"] - c["cost_50pct"]) - (c["cost_50pct"] - c["cost_15pct"]),
+        c["cost_85pct"] - c["cost_15pct"],
+    )
 
     out["pro_atr_to_close"] = safe_ratio(p["atr_qfq"], p["close_qfq"])
     out["pro_asi"] = p["asi_qfq"]
@@ -107,12 +125,19 @@ def build_symbol(root: Path, instrument: str) -> pd.DataFrame:
         out[target] = p[source]
     # Scale OBV by current traded volume proxy to avoid a listing-age trend.
     out["pro_obv_scaled"] = safe_ratio(p["obv_qfq"], total_volume.rolling(20, min_periods=5).mean())
+    out["pro_dmi_spread"] = out["pro_dmi_pdi"] - out["pro_dmi_mdi"]
+    out["pro_dmi_strength"] = out["pro_dmi_adx"] * out["pro_dmi_spread"]
+    out["pro_mfi_psy_divergence"] = out["pro_mfi"] - out["pro_psy"]
+    out["pro_brar_spread"] = out["pro_brar_ar"] - out["pro_brar_br"]
+    out["pro_wr_reversal"] = -(out["pro_wr"] + out["pro_wr1"]) / 2.0
 
     rolling_columns = [
         "db_turnover", "db_free_turnover", "db_volume_ratio",
         "mf_net_amount_ratio", "mf_large_minus_small", "mf_buy_pressure",
         "cyq_winner_rate", "cyq_weight_avg_deviation", "cyq_cost90_width",
-        "pro_atr_to_close", "pro_mfi", "pro_dmi_adx", "pro_vr",
+        "mf_large_buy_pressure", "mf_large_amount_share",
+        "cyq_cost70_width", "cyq_cost_asymmetry",
+        "pro_atr_to_close", "pro_mfi", "pro_dmi_adx", "pro_dmi_spread", "pro_vr",
     ]
     rolling_features = {}
     for column in rolling_columns:
@@ -122,6 +147,30 @@ def build_symbol(root: Path, instrument: str) -> pd.DataFrame:
             rolling_features[f"{column}_std_{window}d"] = rolling.std()
         rolling_features[f"{column}_change_5d"] = out[column] - out[column].shift(5)
     out = pd.concat([out, pd.DataFrame(rolling_features, index=out.index)], axis=1)
+    # Point-in-time surprises, persistence and economically motivated interactions.
+    for column in (
+        "mf_net_amount_ratio", "mf_large_minus_small", "mf_elg_amount_imbalance",
+        "db_turnover", "db_free_turnover", "db_volume_ratio", "cyq_winner_rate",
+    ):
+        mean20 = out[column].rolling(20, min_periods=10).mean()
+        std20 = out[column].rolling(20, min_periods=10).std().replace(0.0, np.nan)
+        out[f"{column}_surprise_20d"] = (out[column] - mean20) / std20
+        out[f"{column}_positive_ratio_5d"] = (
+            out[column].gt(0).rolling(5, min_periods=3).mean()
+        )
+    out["mf_net_amount_persistence_3d"] = out["mf_net_amount_ratio"].rolling(3, min_periods=2).sum()
+    out["mf_net_amount_persistence_10d"] = out["mf_net_amount_ratio"].rolling(10, min_periods=5).sum()
+    out["mf_large_flow_persistence_5d"] = out["mf_large_minus_small"].rolling(5, min_periods=3).sum()
+    out["cyq_winner_change_1d"] = out["cyq_winner_rate"].diff()
+    out["cyq_winner_change_5d"] = out["cyq_winner_rate"].diff(5)
+    out["cyq_width_change_5d"] = out["cyq_cost90_width"].diff(5)
+    out["flow_turnover_interaction"] = out["mf_net_amount_ratio"] * out["db_free_turnover"]
+    out["large_flow_trend_interaction"] = out["mf_large_minus_small"] * out["pro_dmi_strength"]
+    out["crowding_outflow_risk"] = out["cyq_winner_rate"] * (-out["mf_net_amount_ratio"])
+    out["chip_breakout_strength"] = out["cyq_close_to_cost85"] * out["mf_large_buy_pressure"]
+    out["illiquid_flow_pressure"] = out["mf_net_amount_ratio"] / np.sqrt(
+        out["db_free_turnover"].clip(lower=1e-6)
+    )
     out = out.replace([np.inf, -np.inf], np.nan).astype("float32")
     out.insert(0, "instrument", instrument)
     out.index.name = "datetime"
@@ -133,19 +182,50 @@ def main():
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--skip-cross-sectional-ranks", action="store_true")
+    parser.add_argument(
+        "--partitioned",
+        action="store_true",
+        help="write one raw-factor parquet per instrument; ranks can be computed after feature selection",
+    )
     args = parser.parse_args()
     started = time.monotonic()
     instruments = sorted(path.stem for path in (args.input / "daily_basic").glob("*.parquet"))
-    frames, failures = [], []
+    frames, failures, rows_written, feature_count = [], [], 0, 0
     for index, instrument in enumerate(instruments, 1):
         try:
             frame = build_symbol(args.input, instrument)
             if not frame.empty:
-                frames.append(frame)
+                feature_count = max(feature_count, len(frame.columns) - 2)
+                if args.partitioned:
+                    args.output.mkdir(parents=True, exist_ok=True)
+                    target = args.output / f"{instrument}.parquet"
+                    temporary = target.with_suffix(".tmp.parquet")
+                    frame.to_parquet(temporary, index=False, compression="zstd")
+                    temporary.replace(target)
+                    rows_written += len(frame)
+                else:
+                    frames.append(frame)
         except Exception as exc:
             failures.append({"instrument": instrument, "error": repr(exc)[:500]})
         if index % 25 == 0 or index == len(instruments):
-            print(f"factor {index}/{len(instruments)} rows={sum(len(x) for x in frames)} failures={len(failures)}", flush=True)
+            current_rows = rows_written if args.partitioned else sum(len(x) for x in frames)
+            print(f"factor {index}/{len(instruments)} rows={current_rows} failures={len(failures)}", flush=True)
+    if args.partitioned:
+        report = {
+            "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "input": str(args.input.resolve()), "output": str(args.output.resolve()),
+            "symbols": len(instruments), "rows": rows_written,
+            "features": feature_count,
+            "partitioned": True, "cross_sectional_ranks": False,
+            "failures": failures, "elapsed_seconds": round(time.monotonic() - started, 2),
+            "timing": "All date-T fields are published daily market fields known after the T close.",
+        }
+        report_path = args.output / "build_report_latest.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        if failures:
+            raise SystemExit(f"{len(failures)} instruments failed")
+        return
     if not frames:
         raise RuntimeError("no daily supplement factors built")
     result = pd.concat(frames, ignore_index=True).sort_values(["datetime", "instrument"])

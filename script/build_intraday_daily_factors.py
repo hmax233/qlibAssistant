@@ -13,6 +13,7 @@ import argparse
 import json
 import math
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -131,18 +132,65 @@ def aggregate_day(group: pd.DataFrame) -> pd.Series:
         else np.nan
     )
     signed_volume = float((np.sign(simple_returns) * volume).sum())
+    signed_amount = float((np.sign(simple_returns) * amount).sum())
     price_volume_corr = safe_correlation(simple_returns, np.log1p(volume))
     range_volume_corr = safe_correlation(ranges, np.log1p(volume))
+    return_autocorr_1 = safe_correlation(simple_returns[1:], simple_returns[:-1])
+    volume_autocorr_1 = safe_correlation(np.log1p(volume[1:]), np.log1p(volume[:-1]))
+    return_leads_volume_corr = safe_correlation(simple_returns[:-1], np.log1p(volume[1:]))
     trend_slope, trend_r2 = trend_metrics(close)
     max_drawdown, max_runup = path_drawdown(close, opening)
+    realized_variance = float(np.square(log_returns).sum())
+    upside_variance = float(np.square(np.maximum(log_returns, 0.0)).sum())
+    downside_variance = float(np.square(np.minimum(log_returns, 0.0)).sum())
+    bipower_variation = (
+        float(np.pi / 2.0 * (np.abs(log_returns[1:]) * np.abs(log_returns[:-1])).sum())
+        if len(log_returns) > 1 else np.nan
+    )
+    jump_variation_ratio = safe_divide(
+        max(realized_variance - bipower_variation, 0.0), realized_variance
+    )
+    absolute_return_sum = float(np.abs(simple_returns).sum())
+    path_efficiency = safe_divide(abs(closing / opening - 1.0), absolute_return_sum)
+    running_amount = np.cumsum(amount)
+    running_volume = np.cumsum(volume)
+    running_vwap = np.divide(
+        running_amount,
+        running_volume,
+        out=np.full_like(running_amount, np.nan, dtype=float),
+        where=running_volume > EPS,
+    )
+    vwap_side = np.sign(close - running_vwap)
+    valid_vwap_side = vwap_side[np.isfinite(vwap_side) & (vwap_side != 0)]
+    vwap_cross_count = (
+        int(np.count_nonzero(valid_vwap_side[1:] != valid_vwap_side[:-1]))
+        if len(valid_vwap_side) > 1 else 0
+    )
+    time_axis = np.linspace(-0.5, 0.5, len(group), dtype=float)
+    volume_profile_slope = safe_divide(
+        float((time_axis * (volume - volume.mean())).sum()),
+        float(np.square(time_axis).sum() * max(volume.mean(), EPS)),
+    )
+    top_abs_return_share = safe_divide(
+        float(np.sort(np.abs(simple_returns))[-min(2, len(simple_returns)):].sum()),
+        absolute_return_sum,
+    )
+    opening_bars = min(2, len(group))
+    closing_bars = min(2, len(group))
     return pd.Series(
         {
             "bar_count": len(group),
+            "session_open": opening,
+            "session_close": closing,
             "intraday_return": safe_divide(closing, opening) - 1.0,
             "realized_volatility": float(np.sqrt(np.square(log_returns).sum())),
+            "upside_realized_volatility": float(np.sqrt(upside_variance)),
             "downside_realized_volatility": float(
-                np.sqrt(np.square(np.minimum(log_returns, 0.0)).sum())
+                np.sqrt(downside_variance)
             ),
+            "downside_variance_share": safe_divide(downside_variance, realized_variance),
+            "bipower_variation": bipower_variation,
+            "jump_variation_ratio": jump_variation_ratio,
             "realized_skew": float(pd.Series(log_returns).skew()),
             "realized_kurtosis": float(pd.Series(log_returns).kurt()),
             "intraday_max_drawdown": max_drawdown,
@@ -151,6 +199,10 @@ def aggregate_day(group: pd.DataFrame) -> pd.Series:
             "close_location": safe_divide(closing - daily_low, daily_high - daily_low),
             "vwap": vwap,
             "close_vwap_deviation": safe_divide(closing, vwap) - 1.0,
+            "above_running_vwap_ratio": float(np.nanmean(close > running_vwap)),
+            "vwap_cross_count": vwap_cross_count,
+            "opening_30m_return": safe_divide(float(close[opening_bars - 1]), opening) - 1.0,
+            "closing_30m_return": safe_divide(closing, float(open_values[-closing_bars])) - 1.0,
             "first_hour_return": first_hour_return,
             "last_hour_return": last_hour_return,
             "morning_return": morning_return,
@@ -168,8 +220,15 @@ def aggregate_day(group: pd.DataFrame) -> pd.Series:
             "volume_entropy": normalized_entropy(volume),
             "amount_entropy": normalized_entropy(amount),
             "signed_volume_imbalance": safe_divide(signed_volume, total_volume),
+            "signed_amount_imbalance": safe_divide(signed_amount, total_amount),
+            "up_volume_share": safe_divide(volume[simple_returns > 0].sum(), total_volume),
+            "up_amount_share": safe_divide(amount[simple_returns > 0].sum(), total_amount),
             "price_volume_corr": price_volume_corr,
             "range_volume_corr": range_volume_corr,
+            "return_autocorr_1": return_autocorr_1,
+            "volume_autocorr_1": volume_autocorr_1,
+            "return_leads_volume_corr": return_leads_volume_corr,
+            "volume_profile_slope": volume_profile_slope,
             "amihud_intraday": float(
                 np.nanmean(np.abs(simple_returns) / np.maximum(amount / 1_000_000.0, EPS))
             ),
@@ -177,6 +236,10 @@ def aggregate_day(group: pd.DataFrame) -> pd.Series:
             "zero_volume_ratio": float((volume <= 0).mean()),
             "max_bar_return": float(np.nanmax(simple_returns)),
             "min_bar_return": float(np.nanmin(simple_returns)),
+            "max_return_time": float(np.nanargmax(simple_returns) / max(len(simple_returns) - 1, 1)),
+            "min_return_time": float(np.nanargmin(simple_returns) / max(len(simple_returns) - 1, 1)),
+            "top_abs_return_share": top_abs_return_share,
+            "path_efficiency": path_efficiency,
             "trend_log_return": trend_slope,
             "trend_r2": trend_r2,
             "total_volume": total_volume,
@@ -196,6 +259,13 @@ ROLLING_BASES = (
     "afternoon_minus_morning",
     "last_hour_volume_share",
     "signed_volume_imbalance",
+    "signed_amount_imbalance",
+    "downside_variance_share",
+    "jump_variation_ratio",
+    "above_running_vwap_ratio",
+    "vwap_cross_count",
+    "path_efficiency",
+    "volume_profile_slope",
     "price_volume_corr",
     "amihud_intraday",
     "trend_log_return",
@@ -205,6 +275,11 @@ ROLLING_BASES = (
 
 def add_rolling_features(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.sort_values("datetime").copy()
+    frame["overnight_gap"] = frame["session_open"] / frame["session_close"].shift(1) - 1.0
+    frame["gap_intraday_reversal"] = frame["overnight_gap"] * frame["intraday_return"]
+    frame["late_minus_early_return"] = frame["closing_30m_return"] - frame["opening_30m_return"]
+    frame["late_volume_surge"] = frame["last_hour_volume_share"] - frame["first_hour_volume_share"]
+    frame = frame.drop(columns=["session_open", "session_close"])
     for column in ROLLING_BASES:
         for window in (5, 20):
             rolling = frame[column].rolling(window, min_periods=max(3, window // 2))
@@ -247,32 +322,46 @@ def build_symbol(symbol_dir: Path, output: Path, force: bool) -> dict:
     }
 
 
+def build_symbol_task(task: tuple[Path, Path, bool]) -> dict:
+    symbol_dir, output, force = task
+    return build_symbol(symbol_dir, output, force)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     started = time.monotonic()
     symbol_dirs = sorted(path for path in args.input.iterdir() if path.is_dir())
     results = []
     failures = []
-    for index, symbol_dir in enumerate(symbol_dirs, 1):
-        try:
-            result = build_symbol(
-                symbol_dir,
-                args.output / f"{symbol_dir.name}.parquet",
-                args.force,
-            )
-            results.append(result)
-        except Exception as exc:
-            failures.append({"instrument": symbol_dir.name, "error": repr(exc)[:500]})
-        if index % 25 == 0 or index == len(symbol_dirs):
-            print(
-                f"factors {index}/{len(symbol_dirs)} built={sum(r['status']=='built' for r in results)} "
-                f"failed={len(failures)}",
-                flush=True,
-            )
+    tasks = [
+        (symbol_dir, args.output / f"{symbol_dir.name}.parquet", args.force)
+        for symbol_dir in symbol_dirs
+    ]
+    if args.workers <= 1:
+        iterator = ((task, None) for task in tasks)
+        for index, (task, _) in enumerate(iterator, 1):
+            try:
+                results.append(build_symbol_task(task))
+            except Exception as exc:
+                failures.append({"instrument": task[0].name, "error": repr(exc)[:500]})
+            if index % 25 == 0 or index == len(tasks):
+                print(f"factors {index}/{len(tasks)} built={sum(r['status']=='built' for r in results)} failed={len(failures)}", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            future_map = {executor.submit(build_symbol_task, task): task for task in tasks}
+            for index, future in enumerate(as_completed(future_map), 1):
+                task = future_map[future]
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    failures.append({"instrument": task[0].name, "error": repr(exc)[:500]})
+                if index % 25 == 0 or index == len(tasks):
+                    print(f"factors {index}/{len(tasks)} built={sum(r['status']=='built' for r in results)} failed={len(failures)}", flush=True)
     built = [result for result in results if result["status"] == "built"]
     report = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
