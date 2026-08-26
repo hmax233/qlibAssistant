@@ -196,6 +196,17 @@ def replay_checkpoints(run, store, predictions_by_split, device):
     torch.set_num_threads(2)
 
     checkpoint = torch.load(run / "best_model.pt", map_location="cpu", weights_only=False)
+    run_configuration = json.loads((run / "configuration.json").read_text())
+    checkpoint_configuration = checkpoint["configuration"]
+    for field in ("model", "data_manifest_sha256", "model_code_sha256", "segments"):
+        if checkpoint_configuration[field] != run_configuration[field]:
+            raise AssertionError(f"Best checkpoint configuration mismatch: {field}")
+    checkpoint_source = checkpoint_configuration["script_sha256"]
+    if checkpoint_source != run_configuration["script_sha256"]:
+        previous_sources = {event["previous_script_sha256"] for event in run_configuration.get("resume_events", [])}
+        archive = ROOT / "script/train_alpha360_cross_stock_before_io_repair.py"
+        if checkpoint_source not in previous_sources or not archive.is_file() or file_hash(archive) != checkpoint_source:
+            raise AssertionError("Best checkpoint source is neither current nor a verified recorded pre-repair source")
     config = Alpha360TransformerConfig(**checkpoint["configuration"]["model"])
     model = Alpha360CrossStockTransformer(store.manifest["stock_count"], config)
     initial_identity = model.stock_identity.weight.detach().clone()
@@ -221,7 +232,10 @@ def replay_checkpoints(run, store, predictions_by_split, device):
             np.testing.assert_allclose(replayed, expected, rtol=0.01, atol=tolerance)
             error = max(error, float(np.abs(replayed - expected).max()))
         results.append({"split": split, "date": batch["date"], "stocks": len(codes), "max_return_error": error})
-    return {"best_epoch": checkpoint["epoch"], "frozen_identity_exact_match": True, "replayed_dates": results}
+    return {"best_epoch": checkpoint["epoch"], "frozen_identity_exact_match": True, "replayed_dates": results,
+            "checkpoint_script_sha256": checkpoint_source,
+            "current_script_sha256": run_configuration["script_sha256"],
+            "checkpoint_source_provenance_verified": True}
 
 
 def run_audit(args):
