@@ -167,3 +167,35 @@ event_guard 和主板过滤需要在后续统一执行回测中比较，不能�
   股票排列等变性、冻结身份向量、padding mask、反向传播和未来价格不进入特征。
 - 已完成 3 股票的极小端到端功能测试；其 IC 不具有经济意义，不作效果汇报。
 - 完整截面 CUDA 短测和正式训练状态，见本节后续运行记录。
+
+### 00:51 正式任务已启动
+
+- 12 项单元测试通过；初始实现提交为 `826a0fd`。
+- Windows 完整截面烟雾测试通过：1002 只历史股票、20,040 个股票日样本；
+  Alpha360 360 列与 Qlib 对照一致；完成一轮训练和所有分段 CSV 导出。
+  这是极短功能测试，其收益、IC 不用于推断模型有效性。
+- CUDA BF16 可用。该短测从开始训练至全部评估约 3.6 秒，包含冷启动，
+  **不能把这个数字当作 120 个月正式训练耗时**。
+- 正式一次性任务 `Qlib_Alpha360_CrossStock_Fold3_120m_260827`
+  已于 2026-08-27 00:50:50 启动，数据导出主进程 PID 33856。
+  截至 00:51 已完成第一块并开始第二块数据；尚未进入正式 epoch。
+- 第一块明确排除了 29 个不完整训练日期，有效训练起点为 2015-05-29；
+  Valid、Selection-valid、Test 边界没有改变。
+- 执行链为：正式数据导出 → 完整截面吞吐短测 → 新建正式模型训练 →
+  载入 Valid 最优权重 → 输出 Valid/Selection-valid/Test 指标和预测。
+  任一步报错则停止后续步骤，不把失败当作完成。
+- 耗时外推会自动写入 `benchmark/benchmark.json`。首个正式 epoch 后，
+  用 `run/epoch_metrics.csv` 的 `epoch_seconds` 复核更准确。
+- 本次冻结的 Mac 行情日历截止 2026-08-21，满足 Test 最后一个信号日
+  2026-07-17 的 T+2 标签要求；不是在声称同步了台式机 8 月 26 日版本。
+- Mac 压缩包附带的两个 `calendars/._day*.txt` AppleDouble 元数据文件
+  已从独立 Windows 快照删除，否则 Qlib 会误当成行情频率文件。正常行情未改动。
+- Mac 本次导出/测试均已退出，没有留下本次 Python 训练进程。
+
+Mac 终端实时查看台式机日志：
+
+```bash
+ssh -o HostKeyAlias=192.168.1.7 -o StrictHostKeyChecking=yes -p 22 12600@100.76.140.38 'powershell -NoProfile -Command "Get-Content E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_cross_stock_fold3_120m_260827\train.log -Tail 20 -Wait"'
+```
+
+关闭这个日志查看窗口只会断开查看，不会终止台式机上的一次性训练任务。
