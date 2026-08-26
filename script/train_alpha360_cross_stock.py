@@ -32,12 +32,28 @@ SEGMENTS = {
     "test": ["2026-02-17", "2026-07-17"],
 }
 
+# Explicit provenance for the Windows status-file sharing repair. This is not a
+# general permission to resume after arbitrary training-code changes.
+PRE_IO_REPAIR_SCRIPT_SHA256 = "a61606f4d5375914ebaf64e649cdcf65f6f84f634ea91b1eb7d67dd91f7ce7b2"
+
+
+def replace_with_retry(source: Path, destination: Path, attempts: int = 20) -> None:
+    """A short-lived Windows reader can deny an otherwise valid atomic rename."""
+    for attempt in range(attempts):
+        try:
+            source.replace(destination)
+            return
+        except PermissionError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(min(0.05 * (attempt + 1), 0.25))
+
 
 def write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    temporary.replace(path)
+    replace_with_retry(temporary, path)
 
 
 def file_hash(path: Path) -> str:
@@ -354,10 +370,14 @@ def train(args) -> None:
         "autocast_dtype": str(amp_dtype) if device.type == "cuda" else "float32",
     }
     history, first_epoch, best, stale = [], 0, float("inf"), 0
+    previous_epoch_seconds = 0.0
     if args.resume:
         old_config = json.loads((args.output / "configuration.json").read_text())
         for key in ("model", "data_manifest_sha256", "seed", "learning_rate", "gradient_accumulation_dates", "script_sha256", "model_code_sha256"):
             if old_config[key] != configuration[key]:
+                if (key == "script_sha256" and args.resume_io_repair
+                        and old_config[key] == PRE_IO_REPAIR_SCRIPT_SHA256):
+                    continue
                 raise RuntimeError(f"Resume configuration mismatch: {key}")
         state = torch.load(args.output / "last_checkpoint.pt", map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
@@ -365,6 +385,19 @@ def train(args) -> None:
         scaler.load_state_dict(state["scaler"])
         first_epoch, best, stale = state["epoch"], state["best"], state["stale"]
         history = state["history"]
+        previous_epoch_seconds = sum(row["epoch_seconds"] for row in history)
+        configuration["resume_events"] = old_config.get("resume_events", []) + [{
+            "from_epoch": first_epoch, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "previous_script_sha256": old_config["script_sha256"],
+            "current_script_sha256": configuration["script_sha256"],
+            "io_repair": bool(args.resume_io_repair),
+            "note": "atomic publication retry; model, data, optimizer and loss unchanged",
+        }]
+        if args.resume_io_repair:
+            archive = args.output / "configuration_before_io_repair.json"
+            if archive.exists():
+                raise FileExistsError("I/O repair was already recorded; use ordinary --resume")
+            write_json(archive, old_config)
         torch.set_rng_state(state["torch_rng"].cpu())
         if device.type == "cuda":
             torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda_rng"]])
@@ -512,7 +545,7 @@ def train(args) -> None:
             best, stale = valid["nll_scaled_3leg"], 0
             temporary = args.output / "best_model.pt.tmp"
             torch.save({"model": model.state_dict(), "configuration": configuration, "epoch": epoch + 1}, temporary)
-            temporary.replace(args.output / "best_model.pt")
+            replace_with_retry(temporary, args.output / "best_model.pt")
         else:
             stale += 1
         history.append({"epoch": epoch + 1, "train_nll": train_loss, **valid,
@@ -524,7 +557,7 @@ def train(args) -> None:
                     "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}
         temporary = args.output / "last_checkpoint.pt.tmp"
         torch.save(snapshot, temporary)
-        temporary.replace(args.output / "last_checkpoint.pt")
+        replace_with_retry(temporary, args.output / "last_checkpoint.pt")
         print("EPOCH " + json.dumps(history[-1]), flush=True)
         if stale >= args.patience or (args.output / "STOP_AFTER_EPOCH").exists():
             if (args.output / "STOP_AFTER_EPOCH").exists():
@@ -540,7 +573,8 @@ def train(args) -> None:
     pd.DataFrame(summary).to_csv(args.output / "summary.csv", index=False)
     write_json(args.output / "status.json", {
         "status": "completed", "best_epoch": best_state["epoch"],
-        "elapsed_seconds": time.monotonic() - started,
+        "elapsed_seconds": previous_epoch_seconds + time.monotonic() - started,
+        "elapsed_basis": "completed epochs plus final attempt/evaluation; excludes failed partial epoch and downtime",
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         "backtest": "not performed; predictions/metrics are not tradable PnL",
     })
@@ -569,8 +603,12 @@ def main():
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--benchmark-days", type=int, default=12)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume-io-repair", action="store_true",
+                        help="Explicitly resume the identified pre-repair version after Windows atomic-write repair")
     parser.add_argument("--log-file", type=Path)
     args = parser.parse_args()
+    if args.resume_io_repair and not args.resume:
+        parser.error("--resume-io-repair requires --resume")
     if args.mode in ("train", "pipeline") and args.output is None:
         parser.error("train/pipeline require --output")
     if min(args.epochs, args.patience, args.export_days, args.accumulate_dates, args.benchmark_days) < 1:

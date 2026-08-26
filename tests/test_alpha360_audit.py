@@ -108,3 +108,44 @@ def test_finalizer_completed_bundle_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("Duplicate must not restart anything"))
     finalize(tmp_path, timeout_hours=0)
     assert json.loads(path.read_text()) == marker
+
+
+def test_atomic_publish_retries_transient_windows_reader(tmp_path, monkeypatch):
+    from pathlib import Path
+    from script.train_alpha360_cross_stock import replace_with_retry
+    import time
+
+    source, target = tmp_path / "status.tmp", tmp_path / "status.json"
+    source.write_text("complete")
+    original = Path.replace
+    calls = []
+
+    def transient(self, destination):
+        calls.append(destination)
+        if len(calls) < 3:
+            raise PermissionError("Windows reader still holds destination")
+        return original(self, destination)
+
+    monkeypatch.setattr(Path, "replace", transient)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    replace_with_retry(source, target)
+    assert target.read_text() == "complete"
+    assert len(calls) == 3
+
+
+def test_atomic_publish_does_not_hide_persistent_permission_error(tmp_path, monkeypatch):
+    from pathlib import Path
+    from script.train_alpha360_cross_stock import replace_with_retry
+    import time
+
+    calls = []
+
+    def denied(self, destination):
+        calls.append(destination)
+        raise PermissionError("persistent denial")
+
+    monkeypatch.setattr(Path, "replace", denied)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    with pytest.raises(PermissionError):
+        replace_with_retry(tmp_path / "source", tmp_path / "dest", attempts=3)
+    assert len(calls) == 3

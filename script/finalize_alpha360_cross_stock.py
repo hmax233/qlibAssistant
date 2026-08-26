@@ -102,6 +102,10 @@ def finalize(root, timeout_hours):
         for path in (root / "data/manifest.json", root / "data/stock_ids.json", root / "data/normalizer.npz",
                      root / "benchmark/benchmark.json", root / "train.log"):
             archive.write(path, str(path.relative_to(root)))
+        for path in (root / "resume_io.log", root / "data/failure_before_io_repair_260827.json",
+                     root / "finalization_before_io_repair.json"):
+            if path.is_file():
+                archive.write(path, str(path.relative_to(root)))
         for directory in (root / "script", root / "roll"):
             for path in directory.glob("*.py"):
                 archive.write(path, str(path.relative_to(root)))
