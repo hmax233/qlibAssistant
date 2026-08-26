@@ -232,6 +232,17 @@ def run_audit(args):
     configuration = json.loads((args.run / "configuration.json").read_text())
     if configuration["data_manifest_sha256"] != file_hash(args.data / "manifest.json"):
         raise AssertionError("Run refers to a different dataset")
+    for relative, key in (("script/train_alpha360_cross_stock.py", "script_sha256"),
+                          ("roll/alpha360_cross_stock.py", "model_code_sha256")):
+        if file_hash(ROOT / relative) != configuration[key]:
+            raise AssertionError(f"Training source changed: {relative}")
+    store.verify_parts()
+    portable_normalizer = np.load(args.run / "normalizer.npz", allow_pickle=False)
+    np.testing.assert_array_equal(portable_normalizer["mean"], store.mean)
+    np.testing.assert_array_equal(portable_normalizer["std"], store.std)
+    portable_ids = json.loads((args.run / "stock_ids.json").read_text())
+    if portable_ids != {code: idx for idx, code in store.id_to_code.items()}:
+        raise AssertionError("Portable stock vocabulary differs from the training dataset")
     epochs = pd.read_csv(args.run / "epoch_metrics.csv")
     if not np.isfinite(epochs[["train_nll", "nll_scaled_3leg"]].values).all():
         raise AssertionError("Nonfinite epoch loss")
@@ -281,6 +292,8 @@ def run_audit(args):
     pd.DataFrame(nll_rows).to_csv(args.output / "nll_baseline.csv", index=False)
     write_json(args.output / "training_baseline.json", baselines)
     write_json(args.output / "audit.json", {"status": "passed", "data_manifest_sha256": configuration["data_manifest_sha256"],
+                                           "source_and_array_hashes_verified": True,
+                                           "portable_normalizer_and_vocabulary_verified": True,
                                            "prediction_files": audit_rows, "checkpoint_replay": replay,
                                            "interpretation": "statistical evaluation only; not executable backtest PnL"})
     lines = ["# Alpha360 截面 Transformer：完成核验与预测评估", "", 
