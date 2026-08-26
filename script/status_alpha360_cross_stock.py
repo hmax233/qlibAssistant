@@ -59,5 +59,22 @@ def inspect(root):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--after-epoch", type=int, help="Wait for a newer completed epoch or terminal state")
+    parser.add_argument("--timeout-seconds", type=float, default=55.0)
     args = parser.parse_args()
+    if args.after_epoch is not None:
+        deadline = time.monotonic() + min(max(args.timeout_seconds, 0), 55.0)
+        while time.monotonic() < deadline:
+            state = read_json(args.root / "run/status.json") or {}
+            if state.get("status") in ("completed", "paused", "failed") or (args.root / "data/last_failure.json").exists():
+                break
+            path = args.root / "run/epoch_metrics.csv"
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    history = list(csv.DictReader(stream))
+                if history and int(history[-1]["epoch"]) > args.after_epoch:
+                    break
+            except (FileNotFoundError, KeyError, ValueError, OSError):
+                pass  # writer may be publishing a new epoch row
+            time.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
     print(json.dumps(inspect(args.root), ensure_ascii=False))
