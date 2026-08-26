@@ -62,19 +62,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--after-epoch", type=int, help="Wait for a newer completed epoch or terminal state")
+    parser.add_argument("--until-finalized", action="store_true", help="Bounded wait for audit/packaging, not merely training")
     parser.add_argument("--timeout-seconds", type=float, default=55.0)
     args = parser.parse_args()
-    if args.after_epoch is not None:
+    if args.after_epoch is not None or args.until_finalized:
         deadline = time.monotonic() + min(max(args.timeout_seconds, 0), 55.0)
         while time.monotonic() < deadline:
             state = read_json(args.root / "run/status.json") or {}
-            if state.get("status") in ("completed", "paused", "failed") or (args.root / "data/last_failure.json").exists():
+            finalization = read_json(args.root / "finalization_status.json") or {}
+            terminal = (finalization.get("status") in ("completed", "failed") if args.until_finalized
+                        else state.get("status") == "completed")
+            if terminal or state.get("status") in ("paused", "failed") or (args.root / "data/last_failure.json").exists():
                 break
             path = args.root / "run/epoch_metrics.csv"
             try:
                 with path.open(encoding="utf-8") as stream:
                     history = list(csv.DictReader(stream))
-                if history and int(history[-1]["epoch"]) > args.after_epoch:
+                if not args.until_finalized and history and int(history[-1]["epoch"]) > args.after_epoch:
                     break
             except (FileNotFoundError, KeyError, ValueError, OSError):
                 pass  # writer may be publishing a new epoch row
