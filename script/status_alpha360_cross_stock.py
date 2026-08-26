@@ -20,6 +20,7 @@ def inspect(root):
     result = {"checked_at": time.strftime("%Y-%m-%d %H:%M:%S")}
     state = read_json(root / "run/status.json")
     result["state"] = state or read_json(root / "benchmark/status.json") or read_json(root / "data/export_status.json")
+    result["finalization"] = read_json(root / "finalization_status.json")
     manifest = read_json(root / "data/manifest.json")
     if manifest:
         result["data"] = {"stocks_historical": manifest["stock_count"], "export_seconds": manifest["export_seconds"],
@@ -35,6 +36,7 @@ def inspect(root):
     if path.exists():
         with path.open(encoding="utf-8") as stream:
             history = list(csv.DictReader(stream))
+        history = [row for row in history if row.get("epoch") and row.get("epoch_seconds") and row.get("best_valid_nll")]
         if history:
             fields = ("epoch", "train_nll", "nll_scaled_3leg", "epoch_seconds", "best_valid_nll",
                       "close1_close2_rank_ic", "close1_close2_rank_icir", "close1_close2_brier", "close1_close2_coverage95")

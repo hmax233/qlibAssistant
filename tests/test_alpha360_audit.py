@@ -81,3 +81,30 @@ def test_prediction_loader_requests_no_prices_after_signal_date():
     prices.loc[calendar[64]:] = -999999
     _, changed, _ = signal_features(FakeData(), str(signal.date()))
     np.testing.assert_array_equal(first, changed)
+
+
+def test_finalizer_wait_is_bounded_and_does_not_restart_training(tmp_path, monkeypatch):
+    from script.finalize_alpha360_cross_stock import finalize
+    import subprocess
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No subprocess may start before training completes")
+
+    monkeypatch.setattr(subprocess, "run", forbidden)
+    with pytest.raises(TimeoutError):
+        finalize(tmp_path, timeout_hours=0)
+
+
+def test_finalizer_completed_bundle_is_idempotent(tmp_path, monkeypatch):
+    import json
+    import subprocess
+    from script.finalize_alpha360_cross_stock import finalize, file_hash
+
+    bundle = tmp_path / "results.zip"
+    bundle.write_bytes(b"test-result")
+    marker = {"status": "completed", "bundle": str(bundle), "bundle_sha256": file_hash(bundle)}
+    path = tmp_path / "finalization_status.json"
+    path.write_text(json.dumps(marker))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("Duplicate must not restart anything"))
+    finalize(tmp_path, timeout_hours=0)
+    assert json.loads(path.read_text()) == marker

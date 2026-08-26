@@ -26,7 +26,11 @@ NAMES = ("open1_close2", "close1_open2", "open1_open2", "close1_close2")
 MATRIX = np.asarray([[1, 1, 1], [0, 1, 0], [1, 1, 0], [0, 1, 1]], dtype="float64")
 
 
-def training_baseline(store):
+def mainboard_code(code):
+    return str(code).startswith(("SH60", "SZ00"))
+
+
+def training_baseline(store, mainboard_only=False):
     """Constant predictor fit on Train only; equal weight per usable date."""
     means, seconds, return_means, positive_rates = [], [], [], []
     for part in store.manifest["parts"]:
@@ -34,8 +38,12 @@ def training_baseline(store):
             continue
         labels = np.load(store.directory / f"{part['prefix']}_labels.npy", mmap_mode="r")
         offsets = np.load(store.directory / f"{part['prefix']}_offsets.npy")
+        ids = np.load(store.directory / f"{part['prefix']}_stock_ids.npy", mmap_mode="r") if mainboard_only else None
         for begin, end in zip(offsets[:-1], offsets[1:]):
             z = np.asarray(labels[begin:end], dtype="float64")
+            if mainboard_only:
+                eligible = [mainboard_code(store.id_to_code[int(idx)]) for idx in ids[begin:end]]
+                z = z[np.asarray(eligible)]
             z = z[np.isfinite(z).all(axis=1)]
             if not len(z):
                 continue
@@ -50,7 +58,8 @@ def training_baseline(store):
     covariance = np.mean(seconds, axis=0) - np.outer(mean, mean)
     covariance += np.eye(3) * 1e-10
     return {
-        "fit_split": "train", "fit_dates": len(means), "leg_mean": mean.tolist(),
+        "fit_split": "train", "fit_dates": len(means), "universe": "mainboard" if mainboard_only else "all",
+        "leg_mean": mean.tolist(),
         "leg_covariance": covariance.tolist(),
         "ordinary_return_mean": np.mean(return_means, axis=0).tolist(),
         "probability_positive": np.mean(positive_rates, axis=0).tolist(),
@@ -229,7 +238,7 @@ def run_audit(args):
     best_epoch = int(epochs.loc[epochs["nll_scaled_3leg"].idxmin(), "epoch"])
     if best_epoch != state["best_epoch"]:
         raise AssertionError("Checkpoint is not the best early-stopping Valid epoch")
-    baseline = training_baseline(store)
+    baselines = {"all": training_baseline(store), "mainboard": training_baseline(store, mainboard_only=True)}
     summaries, daily, calibration, nll_rows = [], [], [], []
     original_summary = pd.read_csv(args.run / "summary.csv").set_index("split")
     prediction_sets = {}
@@ -239,17 +248,28 @@ def run_audit(args):
         frame = pd.read_csv(path, parse_dates=["datetime"]).set_index(["datetime", "instrument"]).sort_index()
         validate_probability_columns(frame)
         labels = validate_rows_and_labels(store, split, frame)
-        rows, daily_rows, calibration_rows = statistical_metrics(frame, split, baseline)
+        rows, daily_rows, calibration_rows = statistical_metrics(frame, split, baselines["all"])
         for row in rows:
             name = row["horizon"]
             np.testing.assert_allclose(row["rank_ic"], original_summary.loc[split, name + "_rank_ic"], atol=1e-7, rtol=1e-5)
             np.testing.assert_allclose(row["brier"], original_summary.loc[split, name + "_brier"], atol=1e-7, rtol=1e-5)
+        for group in (rows, daily_rows, calibration_rows):
+            for row in group:
+                row["universe"] = "all"
         summaries.extend(rows)
         daily.extend(daily_rows)
         calibration.extend(calibration_rows)
+        eligible = frame.index.get_level_values("instrument").map(mainboard_code)
+        board_rows, board_daily, board_calibration = statistical_metrics(frame.loc[eligible], split, baselines["mainboard"])
+        for group in (board_rows, board_daily, board_calibration):
+            for row in group:
+                row["universe"] = "mainboard"
+        summaries.extend(board_rows)
+        daily.extend(board_daily)
+        calibration.extend(board_calibration)
         nll_rows.append({"split": split,
                          "model_nll_scaled_3leg": float(original_summary.loc[split, "nll_scaled_3leg"]),
-                         "train_gaussian_nll_scaled_3leg": gaussian_baseline_nll(labels, baseline)})
+                         "train_gaussian_nll_scaled_3leg": gaussian_baseline_nll(labels, baselines["all"])})
         prediction_sets[split] = frame
         audit_rows.append({"split": split, "rows": len(frame), "dates": frame.index.get_level_values("datetime").nunique(),
                            "sha256": file_hash(path), "probabilities_and_labels_verified": True})
@@ -259,20 +279,21 @@ def run_audit(args):
     pd.DataFrame(daily).to_csv(args.output / "daily_recomputed.csv", index=False)
     pd.DataFrame(calibration).to_csv(args.output / "probability_calibration.csv", index=False)
     pd.DataFrame(nll_rows).to_csv(args.output / "nll_baseline.csv", index=False)
-    write_json(args.output / "training_baseline.json", baseline)
+    write_json(args.output / "training_baseline.json", baselines)
     write_json(args.output / "audit.json", {"status": "passed", "data_manifest_sha256": configuration["data_manifest_sha256"],
                                            "prediction_files": audit_rows, "checkpoint_replay": replay,
                                            "interpretation": "statistical evaluation only; not executable backtest PnL"})
     lines = ["# Alpha360 截面 Transformer：完成核验与预测评估", "", 
              "这是预测与概率分布评估，不是实际可成交的交易回测。不会用 Test 结果倒推修改模型。", "",
+             "项目此前已反复查看过该历史 Test 区间，因此这是冻结规则的历史对照，不是整个研究从未接触过的新样本外证据。", "",
              f"- 最优 epoch：{best_epoch}；实际完成：{len(epochs)} epoch。",
              f"- 完整 epoch 平均耗时：{epochs['epoch_seconds'].mean():.1f} 秒；训练及最终评估：{state['elapsed_seconds']/3600:.2f} 小时。",
              f"- 检查点重放、冻结股票 embedding、四区间代数关系和真实标签一致性检查全部通过。", "",
-             "## Test 指标", "", "| 持仓区间 | Rank IC | Rank ICIR | MAE | Brier | 历史上涨率基线 Brier | 95%区间覆盖率 |",
-             "|---|---:|---:|---:|---:|---:|---:|"]
+             "## Test 指标", "", "| 股票范围 | 持仓区间 | Rank IC | Rank ICIR | MAE | Brier | 历史上涨率基线 Brier | 95%区间覆盖率 |",
+             "|---|---|---:|---:|---:|---:|---:|---:|"]
     for row in summaries:
         if row["split"] == "test":
-            lines.append(f"| {row['horizon']} | {row['rank_ic']:.4f} | {row['rank_icir']:.4f} | {row['mae']:.2%} | {row['brier']:.4f} | {row['train_rate_brier']:.4f} | {row['coverage95']:.2%} |")
+            lines.append(f"| {row['universe']} | {row['horizon']} | {row['rank_ic']:.4f} | {row['rank_icir']:.4f} | {row['mae']:.2%} | {row['brier']:.4f} | {row['train_rate_brier']:.4f} | {row['coverage95']:.2%} |")
     lines.extend(["", "## 指标怎么读", "",
                   "- Rank IC 看每天的横截面排序能力，Rank ICIR 是这些日度相关系数的均值/标准差，不是胜率。",
                   "- MAE 是绝对收益预测的平均误差；例如 0.02 表示平均相差约 2 个百分点。",
@@ -280,6 +301,7 @@ def run_audit(args):
                   "- 95% 预测区间若只覆盖很少真实收益，说明不确定性被低估；输出高概率不能当作真实高胜率。",
                   "- NLL 比较在相同的 log-return×100 尺度上；不同尺度的 NLL 不能直接比数值。",
                   "- 基线仅使用 Train 拟合。Valid 用于早停，Selection-valid 和 Test 不参加训练更新。",
+                  "- all 是历史 CSI1000 全池；mainboard 只评估其中沪深主板，排除科创板和创业板。两种范围分别拟合各自的 Train 常数基线。",
                   "- 本报告没有计入手续费、涨跌停、停牌、交易门槛或 event_guard，不能当作实盘收益。", "",
                   "## 文件", "", "- metrics_compact.csv：四种区间在三个分段上的完整统计指标。",
                   "- probability_calibration.csv：预测概率分箱与真实上涨比例。",

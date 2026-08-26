@@ -199,3 +199,59 @@ ssh -o HostKeyAlias=192.168.1.7 -o StrictHostKeyChecking=yes -p 22 12600@100.76.
 ```
 
 关闭这个日志查看窗口只会断开查看，不会终止台式机上的一次性训练任务。
+
+### 01:14 训练与自动验收
+
+- 数据导出耗时 366 秒；有效 Train 为 2402 个日期、2,402,042 个股票日，
+  其中 2,318,793 行有完整三段标签。Valid/Selection-valid/Test 分别为
+  105/100/99 个信号日；前两段最后 2 日不参与标签指标。
+- 正式训练 PID 28800。首轮受冷启动与数据读取影响约 290 秒，随后每轮
+  约 78～96 秒。估时须区分首轮和稳定吞吐，不能只根据模型参数量猜测。
+- 当前 19 项测试通过，包括无未来行情的独立推理输入、自动验收超时和重复执行保护。
+- 新增一次性验收任务 `Qlib_Alpha360_Finalize_260827`，轻量检查每 30 秒一次；
+  等待期间不占 GPU，不重启训练。其流程是：完成训练 → 独立指标/标签/权重核验 →
+  只读取信号日及以前行情重新推理 → 与已保存的最后一个 Test 日预测比对 → 打包。
+  状态为 `finalization_status.json`，日志为 `finalize.log`，完成后该进程退出。
+- 训练仍由 Valid NLL 选最优 epoch。某一轮 Rank IC 较高但 NLL 不最优，
+  不会临时改成按它选权重，更不会用 Test 挑 epoch。
+
+只看紧凑进度（不会启动训练）：
+
+```bash
+ssh -o HostKeyAlias=192.168.1.7 -o StrictHostKeyChecking=yes -p 22 12600@100.76.140.38 E:/Miniconda/envs/qlibass/python.exe E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_cross_stock_fold3_120m_260827/script/status_alpha360_cross_stock.py --root E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_cross_stock_fold3_120m_260827
+```
+
+完成后的独立验收命令（目录必须新建，不能覆盖旧报告）：
+
+```bash
+python script/audit_alpha360_cross_stock.py --run /path/to/run --data /path/to/data --output /path/to/audit_new --device cuda
+```
+
+验收同时给出完整 CSI1000 和其中沪深主板两种范围，包含四种持仓区间的
+Rank IC/ICIR、MAE、Brier、AUC、方向准确率、50/80/95% 区间覆盖率。
+常数上涨概率、平均收益和联合高斯基线只用 Train 拟合；主板另拟合自己的基线。
+这使“输出概率是否真的比历史上涨率更有用”可以直接检查，而不是只看 IC。
+
+### 以后如何单独推理
+
+完成的 `run` 目录包含权重、词典和标准化参数；推理不需要复制数 GB 的训练数组。
+Mac 使用 CPU 即可，不会调用 TRA，也不改变现有 Fixed 每日预测流程：
+
+```bash
+/Users/hmax/miniconda3/envs/qlibAssistant/bin/python script/predict_alpha360_cross_stock.py \
+  --run /path/to/completed/run \
+  --provider ~/.qlib/qlib_data/cn_data \
+  --date latest \
+  --device cpu \
+  --output /path/to/new_prediction_directory
+```
+
+- 默认按 `close1_close2_expected_return` 排序；`--rank-horizon` 可选表中其他三个区间。
+- 固定输出两个 CSV：`ranking_all.csv`、`ranking_mainboard.csv`，另有 `metadata.json`。
+- 代码、名称、板块放前面。名称可通过 `--names-csv` 提供，需含 `instrument,name` 两列；
+  未提供时名称留空，不把代码伪装成股票名称。
+- `probability_positive` 是模型分布隐含的上涨概率，需结合校准结果理解；
+  `return_std` 是普通收益的标准差，不是均值的估计标准误。
+- 新出现的股票使用全零未知身份向量并显式标记。输入历史仍是该股票自身过去 60 个交易日。
+- `mainboard` 只过滤输出，截面注意力仍使用完整 CSI1000，和训练时一致。
+- CSV 尚未应用 event_guard、市场门槛、手续费及可成交约束，不等于实盘买入指令。
