@@ -403,6 +403,8 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     method = (output / "method_and_findings.md").read_text(encoding="utf-8")
     assert "selection_valid" in method
     assert "Test is opened only after model components and trading rules are frozen" in method
+    assert "universe-level survivorship bias" in method
+    assert "epoch 50 actually trains at about `1.33e-6`" in method
     assert "100" in method
     assert "STAR and ChiNext excluded" in method
     assert "Calibration and frictionless ranking diagnostics" in method

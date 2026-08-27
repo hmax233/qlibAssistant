@@ -948,6 +948,11 @@ def write_method_and_findings(
         "- Test is opened only after model components and trading rules are frozen. The frozen Test artifact may be reread by deterministic aggregation, backtest, and report stages, but no Test metric is fed back into re-ranking, re-selection, threshold tuning, or rule choice.",
         "- The report generator is read-only with respect to every input and fails if a Test diagnostic rule grid is present.",
         "",
+        "## Known experiment limitations",
+        "",
+        "- E6 uses a bounded current-S&P-500 approximation for its US stock tokens. This has universe-level survivorship bias, so E6 is exploratory cross-market evidence rather than a point-in-time, unbiased US OOS experiment.",
+        "- E0--E5 record `minimum_learning_rate=1e-6`, but scheduler step ordering means epoch 50 actually trains at about `1.33e-6` and reaches `1e-6` only after that epoch. E6 was corrected before training so epoch 50 itself uses `1e-6`.",
+        "",
         "## Strict execution assumptions",
         "",
     ]
