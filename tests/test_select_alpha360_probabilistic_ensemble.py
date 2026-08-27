@@ -267,6 +267,39 @@ def test_selection_never_reads_test_before_manifest(tmp_path: Path) -> None:
     assert all(f"{horizon}_expected_return" in selection_predictions for horizon in HORIZONS)
 
 
+def test_selection_accepts_only_sub_micro_csv_label_serialization_noise(
+    tmp_path: Path,
+) -> None:
+    actual = np.array([-0.03, 0.00, 0.03, -0.02, 0.01, 0.04])
+    one, two = tmp_path / "one", tmp_path / "two"
+    data_manifest = tmp_path / "data_manifest.json"
+    data_manifest.write_text("{}", encoding="utf-8")
+    write_run(one, actual, actual, data_manifest)
+    write_run(two, actual * 0.9, actual + 7e-8, data_manifest)
+    protocol = tmp_path / "protocol.json"
+    write_protocol(protocol, ["one", "two"], sha256(data_manifest))
+    output = tmp_path / "selection" / "selection.json"
+    select(protocol, {"one": one, "two": two}, output)
+    assert output.is_file()
+
+
+def test_selection_rejects_materially_different_realized_labels(tmp_path: Path) -> None:
+    actual = np.array([-0.03, 0.00, 0.03, -0.02, 0.01, 0.04])
+    one, two = tmp_path / "one", tmp_path / "two"
+    data_manifest = tmp_path / "data_manifest.json"
+    data_manifest.write_text("{}", encoding="utf-8")
+    write_run(one, actual, actual, data_manifest)
+    write_run(two, actual * 0.9, actual + 2e-6, data_manifest)
+    protocol = tmp_path / "protocol.json"
+    write_protocol(protocol, ["one", "two"], sha256(data_manifest))
+    with pytest.raises(ValueError, match="Realized labels disagree"):
+        select(
+            protocol,
+            {"one": one, "two": two},
+            tmp_path / "selection" / "selection.json",
+        )
+
+
 def test_selection_excludes_legacy_rows_crossing_the_test_label_boundary(
     tmp_path: Path,
 ) -> None:

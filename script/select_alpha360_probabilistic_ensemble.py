@@ -22,6 +22,12 @@ import pandas as pd
 
 HORIZONS = ("open1_close2", "close1_open2", "open1_open2", "close1_close2")
 KEYS = ["datetime", "instrument"]
+# E0's legacy CSV serializes realized returns to roughly seven decimal places,
+# while E1--E6 preserve float32 values with a few more digits.  Differences
+# below these bounds are serialization noise, not distinct labels.  The NaN
+# pattern must still be bit-identical and larger discrepancies fail closed.
+LABEL_EQUAL_RTOL = 1e-6
+LABEL_EQUAL_ATOL = 1e-7
 
 
 def sha256(path: Path) -> str:
@@ -598,7 +604,13 @@ def align_components(
     reference = merged[f"{component_names[0]}__actual"].to_numpy(float)
     for name in component_names[1:]:
         actual = merged[f"{name}__actual"].to_numpy(float)
-        if not np.allclose(reference, actual, rtol=1e-7, atol=1e-9, equal_nan=True):
+        if not np.array_equal(np.isnan(reference), np.isnan(actual)) or not np.allclose(
+            reference,
+            actual,
+            rtol=LABEL_EQUAL_RTOL,
+            atol=LABEL_EQUAL_ATOL,
+            equal_nan=True,
+        ):
             raise ValueError(f"Realized labels disagree between candidates for {horizon}")
     merged["actual_return"] = reference
     return merged, paths
@@ -663,10 +675,14 @@ def exact_mixture_nll(frame: pd.DataFrame, names: list[str]) -> np.ndarray:
             -0.5 * ((target - mean) ** 2 / variance + np.log(variance) + math.log(2 * math.pi))
         )
     values = np.column_stack(log_probabilities)
-    maximum = np.nanmax(values, axis=1)
-    log_mixture = maximum + np.log(np.exp(values - maximum[:, None]).mean(axis=1))
-    result = -log_mixture
-    result[~valid] = np.nan
+    result = np.full(len(frame), np.nan, dtype=float)
+    if valid.any():
+        usable = values[valid]
+        maximum = np.max(usable, axis=1)
+        log_mixture = maximum + np.log(
+            np.exp(usable - maximum[:, None]).mean(axis=1)
+        )
+        result[valid] = -log_mixture
     return result
 
 
