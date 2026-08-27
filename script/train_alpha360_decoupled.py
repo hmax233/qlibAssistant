@@ -290,7 +290,15 @@ class Trainer:
     def train(self):
         args, torch = self.args, self.torch
         if args.output.exists() and not args.resume:
-            raise FileExistsError("Output exists; use --resume or select a new directory")
+            # --log-file commonly lives inside the output directory and is
+            # opened before Trainer is constructed. That empty/new log alone
+            # does not make this a pre-existing experiment.
+            permitted = {args.log_file.resolve()} if args.log_file else set()
+            unexpected = [path for path in args.output.iterdir() if path.resolve() not in permitted]
+            if unexpected:
+                raise FileExistsError(
+                    f"Output contains an existing run ({unexpected[0]}); use --resume or a new directory"
+                )
         args.output.mkdir(parents=True, exist_ok=True)
         history, first_epoch = [], 0
         best_nll = float("inf")
