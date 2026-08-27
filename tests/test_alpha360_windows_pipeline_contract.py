@@ -143,30 +143,21 @@ def test_selector_evaluate_requests_test_only_for_manifest_selected_components()
     assert selection < test_alignment
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Trainer.__init__ verifies every split, including Test, before command/manifest gating",
-)
 def test_decoupled_train_and_evaluate_do_not_touch_test_before_manifest_gate() -> None:
     constructor = function_source(TRAINER, "Trainer", "__init__")
     assert ".verify_parts()" not in constructor
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="E1-E5 Test evaluation does not authenticate the valid-selected checkpoint hash",
-)
 def test_decoupled_test_uses_the_checkpoint_frozen_at_selection_time() -> None:
     body = function_source(TRAINER, "Trainer", "evaluate_test")
-    assert "checkpoint_sha256" in body
-    assert "file_hash(checkpoint" in body
-    assert "selection_manifest_sha256" in body[: body.index('evaluate_current("test"')]
+    freeze = body.index("validate_frozen_selection_manifest(")
+    checkpoint_hash = body.index("checkpoint_hash = file_hash(checkpoint_path)")
+    checkpoint_configuration = body.index('checkpoint.get("configuration")')
+    test_hashes = body.index('self.store.verify_parts("test")')
+    test_evaluation = body.index('evaluate_current("test"')
+    assert freeze < checkpoint_hash < checkpoint_configuration < test_hashes < test_evaluation
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Selector evaluate currently accepts an already-test-read or fabricated manifest",
-)
 def test_selector_rejects_non_pretest_manifest_before_opening_test(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     write_candidate(candidate)
@@ -176,10 +167,6 @@ def test_selector_rejects_non_pretest_manifest_before_opening_test(tmp_path: Pat
         evaluate(manifest, tmp_path / "evaluation")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Selector creates its final output directory before preflighting all selected Test files",
-)
 def test_selector_evaluate_failure_does_not_poison_rerun_directory(tmp_path: Path) -> None:
     candidate = tmp_path / "candidate"
     write_candidate(candidate, test=False)
@@ -222,14 +209,18 @@ def test_selector_selection_publish_is_transactional_and_rerunnable(
     assert (manifest.parent / "selection_valid_ensemble_predictions.csv").is_file()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Selector reads protocol horizons but does not enforce its data hash, splits, or experiment matrix",
-)
 def test_selector_enforces_frozen_protocol_against_every_candidate() -> None:
-    body = function_source(SELECTOR, None, "select")
+    selection = function_source(SELECTOR, None, "select")
+    protocol = function_source(SELECTOR, None, "load_protocol")
+    candidate = function_source(SELECTOR, None, "validate_candidate_manifest")
+    configuration = function_source(SELECTOR, None, "validate_configuration_against_protocol")
+    assert "load_protocol(protocol)" in selection
+    assert "validate_candidate_manifest(name, path, protocol_body)" in selection
     for required in ("data_manifest_sha256", "segments", "experiments", "optimization"):
-        assert f'protocol_body["{required}"]' in body
+        assert required in protocol
+    assert "data_manifest_sha256" in candidate
+    assert "segments" in configuration
+    assert "optimization" in configuration
 
 
 @pytest.mark.xfail(

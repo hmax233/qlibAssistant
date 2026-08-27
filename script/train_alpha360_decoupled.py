@@ -67,6 +67,58 @@ def merge_prediction_columns(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return result.sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
+def frozen_file(path: Path) -> dict[str, str]:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return {"path": str(path), "sha256": file_hash(path)}
+
+
+def write_selection_candidate_manifest(
+    output: Path,
+    data: Path,
+    configuration: dict,
+    checkpoints: dict[str, dict],
+) -> dict:
+    """Publish the complete pre-Test freeze for one E1--E5 candidate."""
+
+    output = output.expanduser().resolve()
+    configuration_path = output / "configuration.json"
+    data_manifest_path = data.expanduser().resolve() / "manifest.json"
+    predictions_path = output / "selection_valid_predictions.csv"
+    summary_path = output / "selection_valid_summary.csv"
+    if configuration != json.loads(configuration_path.read_text(encoding="utf-8-sig")):
+        raise RuntimeError("In-memory and persisted candidate configurations disagree")
+    if configuration.get("data_manifest_sha256") != file_hash(data_manifest_path):
+        raise RuntimeError("Candidate configuration/data manifest hash mismatch")
+    normalized_checkpoints: dict[str, dict] = {}
+    for horizon, metadata in checkpoints.items():
+        path = Path(metadata["path"]).expanduser().resolve()
+        reference = frozen_file(path)
+        if reference["sha256"] != metadata["sha256"]:
+            raise RuntimeError(f"Checkpoint changed before candidate freeze: {horizon}")
+        normalized_checkpoints[horizon] = {
+            **metadata,
+            **reference,
+        }
+    manifest = {
+        "schema_version": 1,
+        "status": "selection_complete",
+        "candidate_directory": str(output),
+        "selection_split": "selection_valid",
+        "test_files_read": False,
+        "configuration": frozen_file(configuration_path),
+        "data_manifest": frozen_file(data_manifest_path),
+        "segments": configuration["segments"],
+        "selection_valid_predictions": frozen_file(predictions_path),
+        "selection_valid_summary": frozen_file(summary_path),
+        "checkpoints": normalized_checkpoints,
+        "completed": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    write_json(output / "selection_candidate_manifest.json", manifest)
+    return manifest
+
+
 class Trainer:
     def __init__(self, args):
         # Qlib before torch avoids DLL ordering trouble in the Windows conda env.
@@ -125,6 +177,7 @@ class Trainer:
             "epochs": args.epochs,
             "early_stopping": False,
             "date_batch_size": args.date_batch_size,
+            "target_scale": args.target_scale,
             "gradient_accumulation": False,
             "gradient_clipping": False,
             "optimizer": "AdamW",
@@ -381,10 +434,14 @@ class Trainer:
             replace_with_retry(temporary, args.output / "last_checkpoint.pt")
             print("EPOCH " + json.dumps(row), flush=True)
 
-        prediction_frames, selection_rows, checkpoint_hashes = [], [], {}
+        prediction_frames, selection_rows, checkpoint_hashes, checkpoint_freeze = [], [], {}, {}
         for name in self.horizon_names:
             checkpoint_path = args.output / f"best_{name}_rank_ic_model.pt"
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            if checkpoint.get("configuration") != self.configuration:
+                raise RuntimeError(f"Checkpoint/configuration mismatch before Selection freeze: {name}")
+            if checkpoint.get("selection_metric") != f"{name}_rank_ic":
+                raise RuntimeError(f"Checkpoint has the wrong Selection metric: {name}")
             self.model.load_state_dict(checkpoint["model"])
             metrics, daily, predictions = self.evaluate_current(
                 "selection_valid", collect=True, only_horizon=name
@@ -396,20 +453,45 @@ class Trainer:
                 "valid_selection_value": checkpoint["selection_value"], **metrics,
             })
             checkpoint_hashes[name] = file_hash(checkpoint_path)
+            checkpoint_freeze[name] = {
+                "path": str(checkpoint_path.resolve()),
+                "sha256": checkpoint_hashes[name],
+                "epoch": checkpoint["epoch"],
+                "selection_metric": checkpoint["selection_metric"],
+                "selection_value": checkpoint["selection_value"],
+            }
         merge_prediction_columns(prediction_frames).to_csv(
             args.output / "selection_valid_predictions.csv", index=False
         )
         pd.DataFrame(selection_rows).to_csv(args.output / "selection_valid_summary.csv", index=False)
+        candidate_manifest = write_selection_candidate_manifest(
+            args.output, args.data, self.configuration, checkpoint_freeze
+        )
+        candidate_manifest_path = args.output / "selection_candidate_manifest.json"
         write_json(args.output / "status.json", {
             "status": "selection_ready", "epochs": args.epochs,
             "test_read": False, "checkpoint_sha256": checkpoint_hashes,
+            "selection_candidate_manifest": str(candidate_manifest_path.resolve()),
+            "selection_candidate_manifest_sha256": file_hash(candidate_manifest_path),
+            "selection_candidate_status": candidate_manifest["status"],
             "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         print("SELECTION_VALID READY; TEST REMAINS LOCKED", flush=True)
 
     def evaluate_test(self, manifest_path: Path, candidate_name: str):
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        expected = Path(manifest["candidates"][candidate_name]).resolve()
+        from script.select_alpha360_probabilistic_ensemble import (
+            validate_frozen_selection_manifest,
+        )
+
+        # Authenticate the protocol, every candidate manifest, all Selection
+        # inputs, and all selected checkpoint hashes before touching Test.
+        manifest_path = manifest_path.expanduser().resolve()
+        manifest, _, candidates, frozen_candidates = validate_frozen_selection_manifest(
+            manifest_path, require_test_artifacts=False
+        )
+        if candidate_name not in candidates:
+            raise RuntimeError(f"Candidate {candidate_name!r} is absent from the frozen manifest")
+        expected = candidates[candidate_name]
         if expected != self.args.output.resolve():
             raise RuntimeError(f"Selection manifest candidate path mismatch: {expected}")
         selected_horizons = [
@@ -418,32 +500,119 @@ class Trainer:
         ]
         if not selected_horizons:
             raise RuntimeError(f"Candidate {candidate_name} was not selected for any horizon")
-        destination = self.args.output / "test_predictions.csv"
-        if destination.exists():
-            raise FileExistsError(destination)
-        # The frozen manifest and selected-horizon gate above must succeed
+        frozen_candidate = frozen_candidates[candidate_name]
+        frozen_configuration_path = Path(
+            frozen_candidate["configuration"]["path"]
+        ).resolve()
+        frozen_configuration = json.loads(
+            frozen_configuration_path.read_text(encoding="utf-8-sig")
+        )
+        stable_configuration_keys = (
+            "model_mode",
+            "horizon_names",
+            "model",
+            "data_manifest_sha256",
+            "segments",
+            "seed",
+            "epochs",
+            "date_batch_size",
+            "target_scale",
+            "learning_rate",
+            "minimum_learning_rate",
+            "weight_decay",
+            "warmup_epochs",
+            "warmup_start_factor",
+            "gradient_accumulation",
+            "gradient_clipping",
+            "model_code_sha256",
+        )
+        for key in stable_configuration_keys:
+            if frozen_configuration.get(key) != self.configuration.get(key):
+                raise RuntimeError(f"Frozen/current candidate configuration mismatch: {key}")
+
+        destinations = [
+            self.args.output / "test_predictions.csv",
+            self.args.output / "test_summary.csv",
+            self.args.output / "test_access.json",
+            self.args.output / "test_completion_audit.json",
+            *[
+                self.args.output / f"test_{name}_daily_metrics.csv"
+                for name in selected_horizons
+            ],
+        ]
+        for destination in destinations:
+            if destination.exists():
+                raise FileExistsError(destination)
+
+        checkpoints: dict[str, dict] = {}
+        checkpoint_hashes: dict[str, str] = {}
+        for name in selected_horizons:
+            checkpoint_reference = frozen_candidate["checkpoints"][name]
+            checkpoint_path = Path(checkpoint_reference["path"]).resolve()
+            checkpoint_hash = file_hash(checkpoint_path)
+            expected_hash = manifest["selections"][name]["selected_checkpoint_sha256"].get(
+                candidate_name
+            )
+            if checkpoint_hash != checkpoint_reference["sha256"] or checkpoint_hash != expected_hash:
+                raise RuntimeError(f"Frozen checkpoint hash mismatch before Test: {name}")
+            checkpoint = self.torch.load(
+                checkpoint_path, map_location=self.device, weights_only=False
+            )
+            if checkpoint.get("configuration") != frozen_configuration:
+                raise RuntimeError(f"Frozen checkpoint configuration mismatch before Test: {name}")
+            if checkpoint.get("selection_metric") != f"{name}_rank_ic":
+                raise RuntimeError(f"Frozen checkpoint metric mismatch before Test: {name}")
+            checkpoints[name] = checkpoint
+            checkpoint_hashes[name] = checkpoint_hash
+
+        # The full freeze and selected-checkpoint gates above must succeed
         # before any held-out Test array is hashed or memory-mapped.
         print("Selection manifest frozen; verifying held-out Test hashes...", flush=True)
         self.store.verify_parts("test")
         frames, rows = [], []
         for name in selected_horizons:
-            checkpoint = self.torch.load(
-                self.args.output / f"best_{name}_rank_ic_model.pt",
-                map_location=self.device, weights_only=False,
-            )
+            checkpoint = checkpoints[name]
             self.model.load_state_dict(checkpoint["model"])
             metrics, daily, predictions = self.evaluate_current("test", collect=True, only_horizon=name)
             daily.to_csv(self.args.output / f"test_{name}_daily_metrics.csv", index=False)
             frames.append(predictions)
             rows.append({"horizon": name, "checkpoint_epoch": checkpoint["epoch"], **metrics})
-        merge_prediction_columns(frames).to_csv(destination, index=False)
-        pd.DataFrame(rows).to_csv(self.args.output / "test_summary.csv", index=False)
-        write_json(self.args.output / "test_access.json", {
-            "selection_manifest": str(manifest_path.resolve()),
-            "selection_manifest_sha256": file_hash(manifest_path),
-            "candidate_name": candidate_name, "horizons": selected_horizons,
-            "test_read": True, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
+        predictions_path = self.args.output / "test_predictions.csv"
+        summary_path = self.args.output / "test_summary.csv"
+        merge_prediction_columns(frames).to_csv(predictions_path, index=False)
+        pd.DataFrame(rows).to_csv(summary_path, index=False)
+        test_access_path = self.args.output / "test_access.json"
+        access = {
+            "schema_version": 1,
+            "status": "test_access_complete",
+            "selection_manifest": frozen_file(manifest_path),
+            "candidate_manifest": frozen_candidate["candidate_manifest"],
+            "candidate_name": candidate_name,
+            "selected_horizons": selected_horizons,
+            "checkpoint_sha256": checkpoint_hashes,
+            "test_read": True,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        write_json(test_access_path, access)
+        artifact_paths = [
+            predictions_path,
+            summary_path,
+            test_access_path,
+            *[self.args.output / f"test_{name}_daily_metrics.csv" for name in selected_horizons],
+        ]
+        completion = {
+            "schema_version": 1,
+            "status": "test_complete",
+            "test_read": True,
+            "selection_manifest": frozen_file(manifest_path),
+            "candidate_manifest": frozen_candidate["candidate_manifest"],
+            "candidate_name": candidate_name,
+            "selected_horizons": selected_horizons,
+            "checkpoint_sha256": checkpoint_hashes,
+            "artifacts": {path.name: frozen_file(path) for path in artifact_paths},
+            "completed": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        write_json(self.args.output / "test_completion_audit.json", completion)
 
 
 def parse_args():
