@@ -162,11 +162,16 @@ def test_stage_evidence_bundle_copies_and_authenticates_selected_checkpoint_audi
     }
     for horizon in horizons:
         remote_payloads[f"E:/candidate/best_{horizon}.pt"] = f"weights-{horizon}".encode()
+    checkpoint_hashes = {
+        horizon: hashlib.sha256(remote_payloads[f"E:/candidate/best_{horizon}.pt"]).hexdigest()
+        for horizon in horizons
+    }
     remote_payloads["E:/candidate/test_completion_audit.json"] = json.dumps({
         "status": "test_complete",
         "test_read": True,
         "candidate_name": "candidate",
         "selected_horizons": horizons,
+        "checkpoint_sha256": checkpoint_hashes,
     }).encode()
 
     def reference(path: str) -> dict:
@@ -187,7 +192,11 @@ def test_stage_evidence_bundle_copies_and_authenticates_selected_checkpoint_audi
             }
         },
         "selections": {
-            horizon: {"selected_components": ["candidate"]} for horizon in horizons
+            horizon: {
+                "selected_components": ["candidate"],
+                "selected_checkpoint_sha256": {"candidate": checkpoint_hashes[horizon]},
+            }
+            for horizon in horizons
         },
     }
     (staging / "selection_manifest.json").write_text(

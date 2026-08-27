@@ -652,6 +652,19 @@ def stage_evidence_bundle(staging: Path, status: dict) -> dict:
                 raise ValueError(f"Test completion audit is incomplete for {name}")
             if actual_horizons != expected_horizons:
                 raise RuntimeError(f"Test audit horizons differ from Selection for {name}")
+            if name == "E0_joint_three_leg":
+                audit_checkpoints = {
+                    horizon: body.get("sha256")
+                    for horizon, body in test_audit.get("horizon_checkpoints", {}).items()
+                }
+            else:
+                audit_checkpoints = test_audit.get("checkpoint_sha256", {})
+            expected_checkpoint_hashes = {
+                horizon: selection["selections"][horizon]["selected_checkpoint_sha256"][name]
+                for horizon in expected_horizons
+            }
+            if audit_checkpoints != expected_checkpoint_hashes:
+                raise RuntimeError(f"Test audit checkpoints differ from Selection for {name}")
             checkpoints = freeze.get("checkpoints")
             if not isinstance(checkpoints, dict):
                 raise ValueError(f"Missing checkpoint freeze for {name}")
