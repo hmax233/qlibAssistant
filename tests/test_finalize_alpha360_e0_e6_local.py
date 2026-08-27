@@ -31,4 +31,7 @@ def test_finalizer_runs_both_strict_variants_and_read_only_report() -> None:
     assert '"--minimum-commission", "5"' in source
     assert '"--slippage-bps", "0", "5"' in source
     assert 'report_alpha360_probabilistic_experiments.py' in source
+    assert 'report_alpha360_training_curves.py' in source
+    assert '"E6_a_us_four_head"' in source
+    assert '"--expected-epochs", "50"' in source
     assert "staging.replace(output)" in source

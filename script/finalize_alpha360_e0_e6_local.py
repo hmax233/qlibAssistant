@@ -27,6 +27,8 @@ USER = "12600"
 PORT = "22"
 HOST_KEY_ALIAS = "192.168.1.7"
 REMOTE_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_e6_full_260828"
+REMOTE_BASE_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_probabilistic_matrix_260828"
+REMOTE_E0_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_cross_stock_fold3_120m_v2_260828/run"
 REMOTE_FILES = {
     "pipeline_status.json": "pipeline_status.json",
     "pipeline.log": "pipeline.log",
@@ -40,6 +42,15 @@ REMOTE_FILES = {
     "evaluated_selection_manifest.json": (
         "test_evaluation_e0_e6/evaluated_selection_manifest.json"
     ),
+}
+REMOTE_EPOCH_METRICS = {
+    "E0_joint_three_leg": f"{REMOTE_E0_ROOT}/epoch_metrics.csv",
+    "E1_shared_four_head": f"{REMOTE_BASE_ROOT}/E1_shared_four_head/epoch_metrics.csv",
+    "E2_single_open1_close2": f"{REMOTE_BASE_ROOT}/E2_single_open1_close2/epoch_metrics.csv",
+    "E3_single_close1_open2": f"{REMOTE_BASE_ROOT}/E3_single_close1_open2/epoch_metrics.csv",
+    "E4_single_open1_open2": f"{REMOTE_BASE_ROOT}/E4_single_open1_open2/epoch_metrics.csv",
+    "E5_single_close1_close2": f"{REMOTE_BASE_ROOT}/E5_single_close1_close2/epoch_metrics.csv",
+    "E6_a_us_four_head": f"{REMOTE_ROOT}/E6_a_us_four_head/epoch_metrics.csv",
 }
 
 
@@ -85,6 +96,12 @@ def fetch_artifacts(staging: Path) -> None:
         source = f"{USER}@{HOST}:{REMOTE_ROOT}/{remote_relative}"
         checked([*scp_base(), source, str(staging / local_name)])
 
+    epoch_directory = staging / "epoch_metrics"
+    epoch_directory.mkdir()
+    for experiment, remote_path in REMOTE_EPOCH_METRICS.items():
+        source = f"{USER}@{HOST}:{remote_path}"
+        checked([*scp_base(), source, str(epoch_directory / f"{experiment}.csv")])
+
 
 def run_backtest(staging: Path, variant: str) -> Path:
     output = staging / f"strict_backtest_{variant}"
@@ -128,6 +145,22 @@ def build_report(staging: Path, mainboard: Path, all_board: Path) -> Path:
     return output
 
 
+def build_training_curves(staging: Path) -> Path:
+    output = staging / "training_curves"
+    command = [
+        sys.executable,
+        str(ROOT / "script/report_alpha360_training_curves.py"),
+    ]
+    for experiment in REMOTE_EPOCH_METRICS:
+        command.extend([
+            "--metrics",
+            f"{experiment}={staging / 'epoch_metrics' / f'{experiment}.csv'}",
+        ])
+    command.extend(["--expected-epochs", "50", "--output", str(output)])
+    checked(command)
+    return output
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -162,10 +195,12 @@ def main() -> int:
         mainboard = run_backtest(staging, "mainboard")
         all_board = run_backtest(staging, "all")
         report = build_report(staging, mainboard, all_board)
+        training_curves = build_training_curves(staging)
         completion = {
             "status": "complete",
             "remote_status": status,
             "report": str(report.relative_to(staging)),
+            "training_curves": str(training_curves.relative_to(staging)),
             "completed": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         (staging / "local_completion.json").write_text(
