@@ -391,7 +391,7 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
         assert image.shape[1] > 500
     method = (output / "method_and_findings.md").read_text(encoding="utf-8")
     assert "selection_valid" in method
-    assert "Test is evaluated exactly once" in method
+    assert "Test is opened only after model components and trading rules are frozen" in method
     assert "100" in method
     assert "STAR and ChiNext excluded" in method
     assert "Calibration and frictionless ranking diagnostics" in method
@@ -439,6 +439,18 @@ def test_duplicate_fixed_reference_row_fails_atomically(
     frame = pd.read_csv(path)
     pd.concat([frame, frame.iloc[[0]]], ignore_index=True).to_csv(path, index=False)
     with pytest.raises(ValueError, match="duplicate key rows"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_unresolved_test_position_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["mainboard"] / "test_selected_uncertainty_rules.csv"
+    frame = pd.read_csv(path)
+    frame.loc[0, "unresolved_exit"] = 1
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="unresolved positions"):
         run_report(complete_fixture)
     assert not complete_fixture["output"].exists()
 

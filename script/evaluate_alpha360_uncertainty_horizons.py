@@ -112,6 +112,20 @@ def load_inputs(args):
     return prices, limits, index, calendar
 
 
+def execution_input_audit(path: Path, rows: int, start, end) -> dict:
+    """Freeze the local execution-data identity used by rule selection/backtest."""
+
+    resolved = path.expanduser().resolve()
+    return {
+        "path": str(resolved),
+        "sha256": sha256(resolved),
+        "size": resolved.stat().st_size,
+        "rows": int(rows),
+        "start": pd.Timestamp(start).strftime("%Y-%m-%d"),
+        "end": pd.Timestamp(end).strftime("%Y-%m-%d"),
+    }
+
+
 def benchmark_equity(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
                      horizon: str, benchmark: str) -> pd.Series:
     """Simulate the benchmark with the same entry/exit phases and temporal sleeves."""
@@ -377,9 +391,13 @@ def attempt_exit(
     if event_number < position.scheduled_exit_event:
         return False
     raw_price = quote(prices, date, position.instrument, phase)
+    raw_volume = quote(prices, date, position.instrument, "vol") if "vol" in prices else None
     down = limit(limits, date, position.instrument, "down_limit")
     if raw_price is None or raw_price <= 0 or down is None or down <= 0:
         counters["blocked_sell_missing_attempts"] += 1
+        return False
+    if raw_volume is not None and raw_volume <= 0:
+        counters["blocked_sell_suspended_attempts"] += 1
         return False
     position.last_price = raw_price
     if raw_price <= down + 0.005:
@@ -425,6 +443,7 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
         "blocked_buy_up_limit": 0, "blocked_buy_missing": 0, "too_expensive": 0,
         "delayed_exit_trades": 0, "skipped_busy_slots": 0, "filtered_cash_slots": 0,
         "blocked_sell_missing_attempts": 0, "blocked_sell_down_limit_attempts": 0,
+        "blocked_buy_suspended": 0, "blocked_sell_suspended_attempts": 0,
         "completed_exit_trades": 0, "unresolved_exit": 0,
         "fallback_replacements": 0,
     }
@@ -520,9 +539,18 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
                 if candidate.instrument in used:
                     continue
                 raw_buy = quote(prices, entry_date, candidate.instrument, entry_phase)
+                raw_volume = (
+                    quote(prices, entry_date, candidate.instrument, "vol")
+                    if "vol" in prices else None
+                )
                 upper = limit(limits, entry_date, candidate.instrument, "up_limit")
                 if raw_buy is None or raw_buy <= 0 or upper is None or upper <= 0:
                     counters["blocked_buy_missing"] += 1
+                    if not fallback:
+                        break
+                    continue
+                if raw_volume is not None and raw_volume <= 0:
+                    counters["blocked_buy_suspended"] += 1
                     if not fallback:
                         break
                     continue
@@ -666,6 +694,17 @@ def uncertainty_grid(split, predictions, prices, limits, calendar, args):
                 summary["split"] = split
                 rows.append(summary)
     return pd.DataFrame(rows)
+
+
+def require_flat_account(frame: pd.DataFrame, label: str) -> None:
+    """Fail closed when the available execution history cannot close a position."""
+
+    if "unresolved_exit" not in frame:
+        raise ValueError(f"{label} is missing unresolved_exit")
+    unresolved = pd.to_numeric(frame["unresolved_exit"], errors="coerce")
+    if unresolved.isna().any() or (unresolved != 0).any():
+        count = int(unresolved.fillna(1).ne(0).sum())
+        raise RuntimeError(f"{label} contains {count} account rows with unresolved exits")
 
 
 def select_rules(selection: pd.DataFrame, selection_slippage: float, minimum_active_days: int):
@@ -858,6 +897,7 @@ def main():
     selection_grid = uncertainty_grid(
         "selection_valid", selection_frame, prices, limits, calendar, args
     )
+    require_flat_account(selection_grid, "Selection-valid uncertainty grid")
     selection_grid = attach_benchmarks(selection_grid, selection_frame, index, calendar)
     chosen = select_rules(selection_grid, args.selection_slippage_bps, args.minimum_active_days)
 
@@ -870,6 +910,7 @@ def main():
             raise ValueError("Valid and Selection-valid are not strictly chronological")
         valid_frame = filter_board(valid_frame, args.board_variant)
         valid_grid = uncertainty_grid("valid", valid_frame, prices, limits, calendar, args)
+        require_flat_account(valid_grid, "Valid uncertainty grid")
         valid_grid = attach_benchmarks(valid_grid, valid_frame, index, calendar)
         robust_chosen = select_robust_rules(
             valid_grid, selection_grid, args.selection_slippage_bps, args.minimum_active_days
@@ -892,6 +933,19 @@ def main():
         "minimum_active_days": args.minimum_active_days,
         "board_variant": args.board_variant,
         "fallback": args.fallback,
+        "execution_data_inputs": {
+            "daily_ohlc": execution_input_audit(
+                args.daily_ohlc_cache, len(prices),
+                prices.index.get_level_values(0).min(), prices.index.get_level_values(0).max(),
+            ),
+            "exact_limits": execution_input_audit(
+                args.exact_limits, len(limits),
+                limits.index.get_level_values(0).min(), limits.index.get_level_values(0).max(),
+            ),
+            "index_cache": execution_input_audit(
+                args.index_cache, len(index), index["datetime"].min(), index["datetime"].max(),
+            ),
+        },
         "chosen": chosen.to_dict(orient="records"),
         "robust_chosen": (
             robust_chosen.to_dict(orient="records") if robust_chosen is not None else None
@@ -911,10 +965,12 @@ def main():
         raise ValueError("Selection-valid and Test are not strictly chronological")
     test_frame = filter_board(test_frame, args.board_variant)
     baseline = baseline_matrix("test", test_frame, prices, limits, calendar, args, output)
+    require_flat_account(baseline, "Test baseline matrix")
     baseline = attach_benchmarks(baseline, test_frame, index, calendar)
     chosen_test = evaluate_chosen(
         chosen, test_frame, prices, limits, calendar, args, output, "selection"
     )
+    require_flat_account(chosen_test, "Test selected-rule matrix")
     chosen_test = attach_benchmarks(chosen_test, test_frame, index, calendar)
 
     robust_test = robust_comparison = None
@@ -922,10 +978,12 @@ def main():
         robust_test = evaluate_chosen(
             robust_chosen, test_frame, prices, limits, calendar, args, output, "robust"
         )
+        require_flat_account(robust_test, "Test robust-rule matrix")
         robust_test = attach_benchmarks(robust_test, test_frame, index, calendar)
     test_grid = None
     if args.diagnostic_test_grid:
         test_grid = uncertainty_grid("test", test_frame, prices, limits, calendar, args)
+        require_flat_account(test_grid, "Diagnostic Test uncertainty grid")
         test_grid = attach_benchmarks(test_grid, test_frame, index, calendar)
     alignment_frames = {"selection_valid": selection_frame, "test": test_frame}
     if valid_path is not None:

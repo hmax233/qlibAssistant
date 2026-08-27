@@ -582,6 +582,7 @@ def load_strict_backtest(
         "trade_win_rate",
         "max_drawdown_marked",
         "completed_trades",
+        "unresolved_exit",
         "CSI1000_gross_cumulative",
         "net_excess_vs_CSI1000",
         "CSI300_gross_cumulative",
@@ -597,6 +598,10 @@ def load_strict_backtest(
         f"{variant} Test selection-rule",
         common_summary_columns,
     )
+    if (pd.to_numeric(baseline["unresolved_exit"], errors="coerce") != 0).any():
+        raise ValueError(f"{variant} Test baseline contains unresolved positions")
+    if (pd.to_numeric(selected["unresolved_exit"], errors="coerce") != 0).any():
+        raise ValueError(f"{variant} Test selection-rule contains unresolved positions")
     baseline = baseline.loc[
         baseline["topk"].eq(1)
         & np.isclose(baseline["slippage_bps_each_side"], slippage)
@@ -913,7 +918,7 @@ def write_method_and_findings(
         "",
         "- Model components were selected only on `selection_valid`; the immutable selection manifest has `test_files_read=false`.",
         "- Trading rules were selected only on `selection_valid` and frozen in each `chosen_rule_manifest_pre_test.json` before Test was opened.",
-        "- Test is evaluated exactly once for the frozen model components and frozen trading rules. No Test metric is used for re-ranking, re-selection, threshold tuning, or rule choice.",
+        "- Test is opened only after model components and trading rules are frozen. The frozen Test artifact may be reread by deterministic aggregation, backtest, and report stages, but no Test metric is fed back into re-ranking, re-selection, threshold tuning, or rule choice.",
         "- The report generator is read-only with respect to every input and fails if a Test diagnostic rule grid is present.",
         "",
         "## Strict execution assumptions",

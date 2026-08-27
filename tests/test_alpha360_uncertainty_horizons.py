@@ -100,6 +100,31 @@ def test_flat_market_marked_equity_conserves_cash_after_buy():
     assert result["max_drawdown_marked"] > -0.001
 
 
+def test_zero_volume_entry_is_treated_as_suspended():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    index = pd.MultiIndex.from_product(
+        [calendar, ["SH600000"]], names=["trade_date", "instrument"]
+    )
+    prices = pd.DataFrame({
+        "open": 10.0, "close": 10.0, "vol": [1000.0, 0.0, 1000.0],
+    }, index=index)
+    limits = pd.DataFrame({"up_limit": 11.0, "down_limit": 9.0}, index=index)
+    predictions = pd.DataFrame({
+        "datetime": [calendar[0]], "instrument": ["SH600000"],
+        "close1_close2_expected_return": [0.02],
+        "close1_close2_return_std": [0.03],
+        "close1_close2_probability_positive": [0.60],
+    })
+    _, result = simulate(
+        predictions, prices, limits, calendar, "close1_close2", "mean_all",
+        1, False, 0.0, 100000.0, 0.000235, 5.0,
+    )
+    assert result["completed_trades"] == 0
+    assert result["blocked_buy_suspended"] == 1
+
+
 def test_unresolved_future_exit_does_not_cancel_the_historical_buy():
     calendar, prices, limits, predictions = execution_inputs()
     limits.loc[(calendar[3], "SH600000"), "down_limit"] = 9.5
