@@ -1,21 +1,24 @@
 $ErrorActionPreference = 'Stop'
 
-$Root = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_probabilistic_matrix_260828'
-$Data = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_cross_stock_fold3_120m_260827\data'
+$BaseRoot = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_probabilistic_matrix_260828'
+$BaseStatus = Join-Path $BaseRoot 'pipeline_status.json'
+$BaseData = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_cross_stock_fold3_120m_260827\data'
 $E0Run = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_cross_stock_fold3_120m_v2_260828\run'
-$E0Status = Join-Path $E0Run 'status.json'
-$E0Candidate = Join-Path $Root 'E0_joint_three_leg'
+$E6Root = 'E:\qlibAssistant\.qlibAssistant\remote_runs\alpha360_e6_full_260828'
+$E6Data = Join-Path $E6Root 'store'
+$E6Output = Join-Path $E6Root 'run'
 $Python = 'E:\Miniconda\envs\qlibass\python.exe'
-$TrainEntry = Join-Path $Root 'script\train_alpha360_decoupled.py'
-$Materializer = Join-Path $Root 'script\materialize_alpha360_joint_checkpoints.py'
-$Selector = Join-Path $Root 'script\select_alpha360_probabilistic_ensemble.py'
-$Protocol = Join-Path $Root 'script\alpha360_experiments\fixed_fold3_probabilistic_v1.json'
-$PipelineStatus = Join-Path $Root 'pipeline_status.json'
-$SelectionDirectory = Join-Path $Root 'selection'
+$TrainEntry = Join-Path $BaseRoot 'script\train_alpha360_decoupled.py'
+$E6TrainEntry = Join-Path $E6Root 'script\train_alpha360_cross_market.py'
+$Materializer = Join-Path $BaseRoot 'script\materialize_alpha360_joint_checkpoints.py'
+$Selector = Join-Path $E6Root 'script\select_alpha360_probabilistic_ensemble.py'
+$Protocol = Join-Path $E6Root 'script\alpha360_experiments\fixed_fold3_probabilistic_cross_market_v1.json'
+$PipelineStatus = Join-Path $E6Root 'pipeline_status.json'
+$SelectionDirectory = Join-Path $E6Root 'selection_e0_e6'
 $SelectionManifest = Join-Path $SelectionDirectory 'selection_manifest.json'
-$TestEvaluation = Join-Path $Root 'test_evaluation'
-$Transcript = Join-Path $Root 'pipeline.log'
-$SelectionOnly = $true
+$TestEvaluation = Join-Path $E6Root 'test_evaluation_e0_e6'
+$Transcript = Join-Path $E6Root 'pipeline.log'
+$E0Candidate = Join-Path $BaseRoot 'E0_joint_three_leg'
 
 $Experiments = @(
     @{Id='E1_shared_four_head'; Mode='shared_four_head'; Horizon=$null},
@@ -53,7 +56,7 @@ function Move-DirectoryToArchive([string]$Path, [string]$Label) {
     Write-Host "Archived incomplete directory: $Path -> $Archive"
 }
 
-function Move-CandidateTestArtifactsToArchive([string]$Output, [string]$Label) {
+function Move-CandidateTestArtifactsToArchive([string]$Output) {
     $Names = @(
         'test_predictions.csv', 'test_summary.csv', 'test_access.json',
         'test_completion_audit.json', 'test_materialization_manifest.json'
@@ -66,10 +69,9 @@ function Move-CandidateTestArtifactsToArchive([string]$Output, [string]$Label) {
     $Files += @(Get-ChildItem -Path $Output -Filter 'test_*_daily_metrics.csv' -File -ErrorAction SilentlyContinue)
     if ($Files.Count -eq 0) { return }
     $Stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $Archive = Join-Path $Output "${Label}_$Stamp"
+    $Archive = Join-Path $Output "incomplete_test_$Stamp"
     New-Item -ItemType Directory -Path $Archive | Out-Null
     foreach ($File in $Files) { Move-Item -Path $File.FullName -Destination $Archive }
-    Write-Host "Archived incomplete Test artifacts under: $Archive"
 }
 
 function Test-CandidateSelection([string]$Name, [string]$Directory) {
@@ -90,124 +92,95 @@ function Test-CandidateTest([string]$Name) {
 
 Start-Transcript -Path $Transcript -Append | Out-Null
 try {
-    Write-PipelineStatus @{status='waiting_for_e0'; e0_status=$E0Status; test_read=$false}
+    Write-PipelineStatus @{
+        status='waiting_for_e0_e5_selection'; base_status=$BaseStatus;
+        test_access_authorized=$false; test_read=$false
+    }
     while ($true) {
-        if (-not (Test-Path $E0Status)) { throw "E0 status is missing: $E0Status" }
-        $E0 = Get-Content $E0Status -Raw | ConvertFrom-Json
-        if ($E0.status -eq 'completed') { break }
-        if ($E0.status -in @('failed', 'error')) { throw 'E0 failed; refusing to start E1-E5' }
+        if (-not (Test-Path $BaseStatus)) { throw "Base pipeline status is missing: $BaseStatus" }
+        $Base = Get-Content $BaseStatus -Raw | ConvertFrom-Json
+        if ($Base.status -eq 'selection_ready') { break }
+        if ($Base.status -eq 'test_ready') {
+            throw 'Base pipeline already opened Test; refusing to claim a blind E0-E6 comparison'
+        }
+        if ($Base.status -eq 'failed') { throw "Base E0-E5 pipeline failed: $($Base.error)" }
         Start-Sleep -Seconds 30
     }
 
-    # E0 resume is accepted only after configuration, data, Selection output,
-    # materialization_manifest.json, and all checkpoint sha256 values pass.
-    $E0SelectionReady = $false
-    if (Test-Path $E0Candidate) {
-        $E0SelectionReady = Test-CandidateSelection 'E0_joint_three_leg' $E0Candidate
-        if (-not $E0SelectionReady) {
-            Move-DirectoryToArchive $E0Candidate 'E0_joint_three_leg_invalid_selection'
-        }
+    if (-not (Test-CandidateSelection 'E0_joint_three_leg' $E0Candidate)) {
+        throw 'E0 candidate failed cross-market protocol authentication'
     }
-    if (-not $E0SelectionReady) {
-        Write-PipelineStatus @{status='materializing_e0_selection'; test_read=$false}
-        Invoke-CheckedPython @(
-            '-u', $Materializer, 'selection',
-            '--source-run', $E0Run, '--data', $Data, '--output', $E0Candidate,
-            '--device', 'cuda', '--bf16', '--threads', '4'
-        ) 'Materialize E0 horizon-specific Selection-valid predictions'
-        if (-not (Test-CandidateSelection 'E0_joint_three_leg' $E0Candidate)) {
-            throw 'Fresh E0 Selection materialization failed authentication'
+    foreach ($Experiment in $Experiments) {
+        $Output = Join-Path $BaseRoot $Experiment.Id
+        if (-not (Test-CandidateSelection $Experiment.Id $Output)) {
+            throw "Base candidate failed cross-market protocol authentication: $($Experiment.Id)"
         }
     }
 
-    foreach ($Experiment in $Experiments) {
-        $Output = Join-Path $Root $Experiment.Id
-        $Status = Join-Path $Output 'status.json'
-        if (Test-Path $Status) {
-            $Existing = Get-Content $Status -Raw | ConvertFrom-Json
-            if ($Existing.status -eq 'selection_ready') {
-                # validate-candidate authenticates configuration.json,
-                # selection_valid_predictions.csv, selection_valid_summary.csv,
-                # data_manifest_sha256, protocol_sha256, test_read, and checkpoint hashes.
-                if (Test-CandidateSelection $Experiment.Id $Output) {
-                    Write-PipelineStatus @{
-                        status='skipped_selection_ready'; experiment=$Experiment.Id; test_read=$false
-                    }
-                    continue
-                }
-                Move-DirectoryToArchive $Output "$($Experiment.Id)_invalid_selection_ready"
+    $E6Ready = $false
+    if (Test-Path (Join-Path $E6Output 'status.json')) {
+        $Existing = Get-Content (Join-Path $E6Output 'status.json') -Raw | ConvertFrom-Json
+        if ($Existing.status -eq 'selection_ready') {
+            $E6Ready = Test-CandidateSelection 'E6_a_us_four_head' $E6Output
+            if (-not $E6Ready) {
+                Move-DirectoryToArchive $E6Output 'run_invalid_selection_ready'
             }
         }
+    }
+    if (-not $E6Ready) {
         $Arguments = @(
-            '-u', $TrainEntry, 'train', '--data', $Data, '--output', $Output,
-            '--model-mode', $Experiment.Mode, '--device', 'cuda', '--threads', '4',
-            '--epochs', '50', '--learning-rate', '0.0003',
-            '--min-learning-rate', '0.000001', '--weight-decay', '0.0001',
-            '--warmup-epochs', '3', '--warmup-start-factor', '0.3333333333333333',
+            '-u', $E6TrainEntry, 'train', '--data', $E6Data, '--output', $E6Output,
+            '--device', 'cuda', '--bf16', '--threads', '4',
+            '--learning-rate', '0.0003', '--minimum-learning-rate', '0.000001',
+            '--weight-decay', '0.0001', '--warmup-epochs', '3',
+            '--warmup-start-factor', '0.3333333333333333',
             '--date-batch-size', '4', '--target-scale', '100',
-            '--log-file', (Join-Path $Output 'train.log')
+            '--log-file', (Join-Path $E6Output 'train.log')
         )
-        if ($Experiment.Horizon) { $Arguments += @('--horizon', $Experiment.Horizon) }
-        if (Test-Path (Join-Path $Output 'last_checkpoint.pt')) {
+        if (Test-Path (Join-Path $E6Output 'last_checkpoint.pt')) {
             $Arguments += '--resume'
-        } elseif (Test-Path $Output) {
-            Move-DirectoryToArchive $Output "$($Experiment.Id)_incomplete_without_checkpoint"
+        } elseif (Test-Path $E6Output) {
+            Move-DirectoryToArchive $E6Output 'run_incomplete_without_checkpoint'
         }
         Write-PipelineStatus @{
-            status='training'; experiment=$Experiment.Id; output=$Output;
+            status='training_e6'; output=$E6Output; date_batch_size=4;
             gradient_clipping=$false; gradient_accumulation=$false;
-            date_batch_size=4; test_read=$false
+            test_access_authorized=$false; test_read=$false
         }
-        Invoke-CheckedPython $Arguments "Train $($Experiment.Id)"
-        if (-not (Test-CandidateSelection $Experiment.Id $Output)) {
-            throw "Fresh Selection candidate failed authentication: $($Experiment.Id)"
+        Invoke-CheckedPython $Arguments 'Train E6 A+US cross-market model for 50 epochs'
+        if (-not (Test-CandidateSelection 'E6_a_us_four_head' $E6Output)) {
+            throw 'Fresh E6 Selection candidate failed authentication'
         }
     }
 
     $SelectionReady = $false
     if (Test-Path $SelectionDirectory) {
         if (Test-Path $SelectionManifest) {
-            $ValidationArguments = @(
-                '-u', $Selector, 'validate-selection', '--manifest', $SelectionManifest
-            )
-            $SelectionReady = Test-PythonValidation `
-                -Arguments $ValidationArguments -Stage 'Frozen ensemble Selection manifest'
+            $Validation = @('-u', $Selector, 'validate-selection', '--manifest', $SelectionManifest)
+            $SelectionReady = Test-PythonValidation -Arguments $Validation -Stage 'E0-E6 freeze'
         }
         if (-not $SelectionReady) {
-            Move-DirectoryToArchive $SelectionDirectory 'selection_invalid_or_incomplete'
+            Move-DirectoryToArchive $SelectionDirectory 'selection_e0_e6_invalid_or_incomplete'
         }
     }
     if (-not $SelectionReady) {
-        $SelectionArguments = @(
+        $Arguments = @(
             '-u', $Selector, 'select', '--protocol', $Protocol,
             '--candidate', "E0_joint_three_leg=$E0Candidate"
         )
         foreach ($Experiment in $Experiments) {
-            $SelectionArguments += @(
-                '--candidate', "$($Experiment.Id)=$(Join-Path $Root $Experiment.Id)"
-            )
+            $Arguments += @('--candidate', "$($Experiment.Id)=$(Join-Path $BaseRoot $Experiment.Id)")
         }
-        $SelectionArguments += @('--output', $SelectionManifest)
-        Write-PipelineStatus @{status='selecting_ensemble'; test_read=$false}
-        Invoke-CheckedPython $SelectionArguments 'Select ensemble on Selection-valid and freeze manifest'
+        $Arguments += @('--candidate', "E6_a_us_four_head=$E6Output", '--output', $SelectionManifest)
+        Write-PipelineStatus @{
+            status='selecting_e0_e6_ensemble'; test_access_authorized=$false; test_read=$false
+        }
+        Invoke-CheckedPython $Arguments 'Select and freeze E0-E6 ensemble on Selection-valid'
         Invoke-CheckedPython @(
             '-u', $Selector, 'validate-selection', '--manifest', $SelectionManifest
-        ) 'Authenticate newly frozen Selection manifest'
+        ) 'Authenticate E0-E6 Selection freeze'
     }
 
-    if ($SelectionOnly) {
-        Write-PipelineStatus @{
-            status='selection_ready'; experiments=@($Experiments.Id);
-            selection_manifest=$SelectionManifest;
-            selection_predictions=(Join-Path $SelectionDirectory 'selection_valid_ensemble_predictions.csv');
-            test_access_authorized=$false; test_materialization_started=$false; test_read=$false;
-            next_stage='E6 cross-market training and combined E0-E6 Selection freeze'
-        }
-        Write-Host 'E0-E5 SELECTION READY; HELD-OUT TEST REMAINS LOCKED FOR E6'
-        return
-    }
-
-    # Test authorization, materialization start, and completed reads are distinct states.
     $Frozen = Get-Content $SelectionManifest -Raw | ConvertFrom-Json
     $SelectedCandidates = @(
         $Frozen.selections.PSObject.Properties |
@@ -222,38 +195,33 @@ try {
 
     if ($SelectedCandidates -contains 'E0_joint_three_leg') {
         if (-not (Test-CandidateTest 'E0_joint_three_leg')) {
-            Move-CandidateTestArtifactsToArchive $E0Candidate 'incomplete_test'
+            Move-CandidateTestArtifactsToArchive $E0Candidate
             Write-PipelineStatus @{
                 status='materializing_selected_test'; candidate='E0_joint_three_leg';
                 test_access_authorized=$true; test_materialization_started=$true; test_read=$false
             }
             Invoke-CheckedPython @(
                 '-u', $Materializer, 'evaluate-test', '--source-run', $E0Run,
-                '--data', $Data, '--output', $E0Candidate,
+                '--data', $BaseData, '--output', $E0Candidate,
                 '--selection-manifest', $SelectionManifest,
                 '--candidate-name', 'E0_joint_three_leg',
                 '--device', 'cuda', '--bf16', '--threads', '4'
             ) 'Materialize selected E0 Test horizons'
         }
-        if (-not (Test-CandidateTest 'E0_joint_three_leg')) {
-            throw 'E0 Test artifacts failed authentication'
-        }
+        if (-not (Test-CandidateTest 'E0_joint_three_leg')) { throw 'E0 Test audit failed' }
     }
 
     foreach ($Experiment in $Experiments) {
         if ($SelectedCandidates -notcontains $Experiment.Id) { continue }
-        $Output = Join-Path $Root $Experiment.Id
+        $Output = Join-Path $BaseRoot $Experiment.Id
         if (Test-CandidateTest $Experiment.Id) { continue }
-        # Required files: test_predictions.csv, test_summary.csv,
-        # test_access.json, test_completion_audit.json, plus matching
-        # selection_manifest_sha256 and checkpoint hashes.
-        Move-CandidateTestArtifactsToArchive $Output 'incomplete_test'
+        Move-CandidateTestArtifactsToArchive $Output
         Write-PipelineStatus @{
             status='materializing_selected_test'; candidate=$Experiment.Id;
             test_access_authorized=$true; test_materialization_started=$true; test_read=$false
         }
         $Arguments = @(
-            '-u', $TrainEntry, 'evaluate-test', '--data', $Data, '--output', $Output,
+            '-u', $TrainEntry, 'evaluate-test', '--data', $BaseData, '--output', $Output,
             '--model-mode', $Experiment.Mode, '--device', 'cuda', '--threads', '4',
             '--target-scale', '100', '--selection-manifest', $SelectionManifest,
             '--candidate-name', $Experiment.Id,
@@ -261,9 +229,25 @@ try {
         )
         if ($Experiment.Horizon) { $Arguments += @('--horizon', $Experiment.Horizon) }
         Invoke-CheckedPython $Arguments "Evaluate selected Test horizons for $($Experiment.Id)"
-        if (-not (Test-CandidateTest $Experiment.Id)) {
-            throw "Test artifacts failed authentication: $($Experiment.Id)"
+        if (-not (Test-CandidateTest $Experiment.Id)) { throw "Test audit failed: $($Experiment.Id)" }
+    }
+
+    if ($SelectedCandidates -contains 'E6_a_us_four_head') {
+        if (-not (Test-CandidateTest 'E6_a_us_four_head')) {
+            Move-CandidateTestArtifactsToArchive $E6Output
+            Write-PipelineStatus @{
+                status='materializing_selected_test'; candidate='E6_a_us_four_head';
+                test_access_authorized=$true; test_materialization_started=$true; test_read=$false
+            }
+            Invoke-CheckedPython @(
+                '-u', $E6TrainEntry, 'evaluate-test', '--data', $E6Data,
+                '--output', $E6Output, '--device', 'cuda', '--bf16', '--threads', '4',
+                '--target-scale', '100', '--selection-manifest', $SelectionManifest,
+                '--candidate-name', 'E6_a_us_four_head',
+                '--log-file', (Join-Path $E6Output 'test.log')
+            ) 'Evaluate selected E6 Test horizons'
         }
+        if (-not (Test-CandidateTest 'E6_a_us_four_head')) { throw 'E6 Test audit failed' }
     }
 
     Write-PipelineStatus @{
@@ -273,31 +257,28 @@ try {
 
     $AggregateReady = $false
     if (Test-Path $TestEvaluation) {
-        $ValidationArguments = @(
+        $Validation = @(
             '-u', $Selector, 'validate-test-evaluation', '--manifest', $SelectionManifest,
             '--output-directory', $TestEvaluation
         )
-        $AggregateReady = Test-PythonValidation `
-            -Arguments $ValidationArguments -Stage 'Aggregate Test evaluation'
+        $AggregateReady = Test-PythonValidation -Arguments $Validation -Stage 'E0-E6 Test aggregate'
         if (-not $AggregateReady) {
-            Move-DirectoryToArchive $TestEvaluation 'test_evaluation_invalid_or_incomplete'
+            Move-DirectoryToArchive $TestEvaluation 'test_evaluation_e0_e6_invalid_or_incomplete'
         }
     }
     if (-not $AggregateReady) {
         Invoke-CheckedPython @(
             '-u', $Selector, 'evaluate', '--manifest', $SelectionManifest,
             '--output-directory', $TestEvaluation
-        ) 'Evaluate frozen ensemble on Test'
+        ) 'Evaluate frozen E0-E6 ensemble on Test'
     }
-    # test_ready requires test_predictions.csv, test_summary.csv,
-    # evaluated_selection_manifest.json, test_completion_audit.json, and all hashes.
     Invoke-CheckedPython @(
         '-u', $Selector, 'validate-test-evaluation', '--manifest', $SelectionManifest,
         '--output-directory', $TestEvaluation
-    ) 'Authenticate complete aggregate Test evaluation'
+    ) 'Authenticate complete E0-E6 Test evaluation'
     Write-PipelineStatus @{
-        status='test_ready'; experiments=@($Experiments.Id);
-        selected_candidates=$SelectedCandidates; selection_manifest=$SelectionManifest;
+        status='test_ready'; selected_candidates=$SelectedCandidates;
+        selection_manifest=$SelectionManifest;
         selection_predictions=(Join-Path $SelectionDirectory 'selection_valid_ensemble_predictions.csv');
         test_predictions=(Join-Path $TestEvaluation 'test_predictions.csv');
         test_summary=(Join-Path $TestEvaluation 'test_summary.csv');

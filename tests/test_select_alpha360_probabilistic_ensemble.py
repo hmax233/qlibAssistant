@@ -308,6 +308,27 @@ def test_selection_rejects_protocol_data_hash_mismatch(tmp_path: Path) -> None:
         select(protocol, {"candidate": candidate}, tmp_path / "selection" / "selection.json")
 
 
+def test_protocol_can_freeze_a_candidate_specific_cross_market_data_hash(
+    tmp_path: Path,
+) -> None:
+    actual = np.array([-0.03, 0.00, 0.03, -0.02, 0.01, 0.04])
+    candidate = tmp_path / "e6"
+    data_manifest = tmp_path / "e6_data_manifest.json"
+    data_manifest.write_text("{}", encoding="utf-8")
+    write_run(candidate, actual, actual, data_manifest)
+    protocol = tmp_path / "protocol.json"
+    write_protocol(protocol, ["e6"], "base-a-share-data-hash")
+    body = json.loads(protocol.read_text())
+    body["experiments"][0]["data_manifest_sha256"] = sha256(data_manifest)
+    protocol.write_text(json.dumps(body), encoding="utf-8")
+    output = tmp_path / "selection" / "selection_manifest.json"
+    select(protocol, {"e6": candidate}, output)
+    manifest = json.loads(output.read_text())
+    assert manifest["candidate_freeze"]["e6"]["data_manifest"]["sha256"] == sha256(
+        data_manifest
+    )
+
+
 def test_evaluate_requires_test_completion_audit_and_writes_aggregate_audit(
     tmp_path: Path,
 ) -> None:

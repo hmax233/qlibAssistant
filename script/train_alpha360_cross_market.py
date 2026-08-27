@@ -48,6 +48,10 @@ from script.train_alpha360_cross_stock import (  # noqa: E402
     replace_with_retry,
     write_json,
 )
+from script.train_alpha360_decoupled import (  # noqa: E402
+    frozen_file,
+    write_selection_candidate_manifest,
+)
 
 
 FORMAL_EPOCHS = 50
@@ -362,6 +366,7 @@ class Trainer:
             "epochs": FORMAL_EPOCHS,
             "early_stopping": False,
             "date_batch_size": args.date_batch_size,
+            "target_scale": args.target_scale,
             "gradient_accumulation": False,
             "gradient_clipping": False,
             "optimizer": "AdamW",
@@ -695,6 +700,7 @@ class Trainer:
         frames: list[pd.DataFrame] = []
         summary: list[dict[str, Any]] = []
         checkpoint_hashes: dict[str, str] = {}
+        checkpoint_freeze: dict[str, dict[str, Any]] = {}
         for horizon in HORIZON_NAMES:
             checkpoint_path = args.output / f"best_{horizon}_rank_ic_model.pt"
             if not checkpoint_path.is_file():
@@ -720,10 +726,21 @@ class Trainer:
                 }
             )
             checkpoint_hashes[horizon] = file_hash(checkpoint_path)
+            checkpoint_freeze[horizon] = {
+                "path": str(checkpoint_path.resolve()),
+                "sha256": checkpoint_hashes[horizon],
+                "epoch": checkpoint["epoch"],
+                "selection_metric": checkpoint["selection_metric"],
+                "selection_value": checkpoint["selection_value"],
+            }
         selection_predictions = args.output / "selection_valid_predictions.csv"
         selection_summary = args.output / "selection_valid_summary.csv"
         atomic_csv(merge_prediction_columns(frames), selection_predictions)
         atomic_csv(pd.DataFrame(summary), selection_summary)
+        candidate_manifest = write_selection_candidate_manifest(
+            args.output, args.data, self.configuration, checkpoint_freeze
+        )
+        candidate_manifest_path = args.output / "selection_candidate_manifest.json"
         write_json(
             args.output / "status.json",
             {
@@ -734,6 +751,9 @@ class Trainer:
                 "checkpoint_sha256": checkpoint_hashes,
                 "selection_valid_predictions_sha256": file_hash(selection_predictions),
                 "selection_valid_summary_sha256": file_hash(selection_summary),
+                "selection_candidate_manifest": str(candidate_manifest_path.resolve()),
+                "selection_candidate_manifest_sha256": file_hash(candidate_manifest_path),
+                "selection_candidate_status": candidate_manifest["status"],
                 "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         )
@@ -745,12 +765,26 @@ class Trainer:
         candidate_name: str,
         manifest: dict[str, Any],
         selected_horizons: tuple[str, ...],
+        frozen_candidate: dict[str, Any] | None = None,
     ) -> None:
         del manifest  # It was fully validated before this Trainer was created.
         destination = self.args.output / "test_predictions.csv"
+        summary_path = self.args.output / "test_summary.csv"
         access_path = self.args.output / "test_access.json"
-        if destination.exists() or access_path.exists():
-            raise FileExistsError("Test was already materialized for this candidate")
+        completion_path = self.args.output / "test_completion_audit.json"
+        destinations = [
+            destination,
+            summary_path,
+            access_path,
+            completion_path,
+            *[
+                self.args.output / f"test_{horizon}_daily_metrics.csv"
+                for horizon in selected_horizons
+            ],
+        ]
+        for path in destinations:
+            if path.exists():
+                raise FileExistsError(f"Test artifact already exists: {path}")
         status = json.loads((self.args.output / "status.json").read_text(encoding="utf-8"))
         if status.get("status") != "selection_ready" or status.get("test_read") is not False:
             raise RuntimeError("Candidate is not in the frozen pre-Test selection-ready state")
@@ -765,6 +799,7 @@ class Trainer:
             "segments",
             "epochs",
             "date_batch_size",
+            "target_scale",
             "gradient_accumulation",
             "gradient_clipping",
             "learning_rate",
@@ -775,10 +810,23 @@ class Trainer:
             if run_configuration.get(key) != self.configuration.get(key):
                 raise RuntimeError(f"Test configuration mismatch: {key}")
         checkpoints: dict[str, dict[str, Any]] = {}
+        checkpoint_hashes: dict[str, str] = {}
         for horizon in selected_horizons:
             checkpoint_path = self.args.output / f"best_{horizon}_rank_ic_model.pt"
-            if file_hash(checkpoint_path) != status["checkpoint_sha256"][horizon]:
+            checkpoint_hash = file_hash(checkpoint_path)
+            if checkpoint_hash != status["checkpoint_sha256"][horizon]:
                 raise RuntimeError(f"Checkpoint hash mismatch: {horizon}")
+            if frozen_candidate is not None:
+                frozen_reference = frozen_candidate["checkpoints"][horizon]
+                expected_hash = manifest["selections"][horizon][
+                    "selected_checkpoint_sha256"
+                ].get(candidate_name)
+                if (
+                    Path(frozen_reference["path"]).resolve() != checkpoint_path.resolve()
+                    or frozen_reference["sha256"] != checkpoint_hash
+                    or expected_hash != checkpoint_hash
+                ):
+                    raise RuntimeError(f"Frozen checkpoint hash mismatch: {horizon}")
             checkpoint = self.torch.load(
                 checkpoint_path, map_location=self.device, weights_only=False
             )
@@ -792,6 +840,7 @@ class Trainer:
             if checkpoint_configuration.get("model") != run_configuration.get("model"):
                 raise RuntimeError(f"Checkpoint model configuration mismatch: {horizon}")
             checkpoints[horizon] = checkpoint
+            checkpoint_hashes[horizon] = checkpoint_hash
 
         # Every manifest, run, selection prediction, and selected checkpoint
         # invariant has now been checked. This is the first operation allowed
@@ -811,7 +860,6 @@ class Trainer:
                 {"horizon": horizon, "checkpoint_epoch": checkpoint["epoch"], **metrics}
             )
         atomic_csv(merge_prediction_columns(frames), destination)
-        summary_path = self.args.output / "test_summary.csv"
         atomic_csv(pd.DataFrame(summary), summary_path)
         write_json(
             access_path,
@@ -826,6 +874,31 @@ class Trainer:
                 "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             },
         )
+        artifact_paths = [
+            destination,
+            summary_path,
+            access_path,
+            *[
+                self.args.output / f"test_{horizon}_daily_metrics.csv"
+                for horizon in selected_horizons
+            ],
+        ]
+        completion = {
+            "schema_version": 1,
+            "status": "test_complete",
+            "test_read": True,
+            "selection_manifest": frozen_file(Path(manifest_path)),
+            "candidate_manifest": (
+                frozen_candidate["candidate_manifest"] if frozen_candidate is not None
+                else frozen_file(self.args.output / "selection_candidate_manifest.json")
+            ),
+            "candidate_name": candidate_name,
+            "selected_horizons": list(selected_horizons),
+            "checkpoint_sha256": checkpoint_hashes,
+            "artifacts": {path.name: frozen_file(path) for path in artifact_paths},
+            "completed": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        write_json(completion_path, completion)
         print(f"E6 TEST MATERIALIZED FOR {selected_horizons}", flush=True)
 
 
@@ -837,7 +910,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=20260828)
+    parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--minimum-learning-rate", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -885,17 +958,30 @@ def main(argv: list[str] | None = None) -> None:
             trainer = Trainer(args, command="train")
             trainer.train()
         else:
-            # The manifest and candidate hashes are validated before Trainer
-            # construction and therefore before any Test split access.
-            manifest, selected = validate_frozen_selection_manifest(
-                args.selection_manifest, args.candidate_name, args.output
+            # The shared selector authenticates the protocol, every candidate,
+            # Selection predictions, and frozen checkpoints before Test access.
+            from script.select_alpha360_probabilistic_ensemble import (
+                validate_frozen_selection_manifest as validate_complete_freeze,
             )
+
+            manifest, _, candidates, frozen_candidates = validate_complete_freeze(
+                args.selection_manifest, require_test_artifacts=False
+            )
+            if candidates.get(args.candidate_name) != args.output.resolve():
+                raise RuntimeError("Selection manifest candidate path mismatch")
+            selected = tuple(
+                horizon for horizon in HORIZON_NAMES
+                if args.candidate_name in manifest["selections"][horizon]["selected_components"]
+            )
+            if not selected:
+                raise RuntimeError(f"Candidate {args.candidate_name} was not selected")
             trainer = Trainer(args, command="evaluate-test")
             trainer.evaluate_test(
                 args.selection_manifest,
                 args.candidate_name,
                 manifest,
                 selected,
+                frozen_candidates[args.candidate_name],
             )
     except Exception as error:
         args.output.mkdir(parents=True, exist_ok=True)

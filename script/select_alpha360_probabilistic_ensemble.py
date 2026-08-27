@@ -87,10 +87,26 @@ def _configuration_value(configuration: dict, *names: str):
     raise ValueError(f"Candidate configuration lacks all aliases {names}")
 
 
-def validate_configuration_against_protocol(configuration: dict, protocol_body: dict) -> None:
+def protocol_experiment(protocol_body: dict, candidate_name: str) -> dict:
+    matches = [
+        value for value in protocol_body["experiments"]
+        if isinstance(value, dict) and value.get("id") == candidate_name
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"Protocol does not define candidate {candidate_name!r} exactly once")
+    return matches[0]
+
+
+def validate_configuration_against_protocol(
+    configuration: dict, protocol_body: dict, candidate_name: str
+) -> None:
     if configuration.get("segments") != protocol_body["segments"]:
         raise RuntimeError("Candidate segments do not match the frozen protocol")
-    if configuration.get("data_manifest_sha256") != protocol_body["data_manifest_sha256"]:
+    experiment = protocol_experiment(protocol_body, candidate_name)
+    expected_data_hash = experiment.get(
+        "data_manifest_sha256", protocol_body["data_manifest_sha256"]
+    )
+    if configuration.get("data_manifest_sha256") != expected_data_hash:
         raise RuntimeError("Candidate data manifest hash does not match the frozen protocol")
     optimization = protocol_body["optimization"]
     aliases = {
@@ -174,7 +190,7 @@ def validate_candidate_manifest(
         raise RuntimeError(f"Candidate {candidate_name!r} manifest/configuration segments disagree")
     if sha256(data_manifest_path) != configuration.get("data_manifest_sha256"):
         raise RuntimeError(f"Candidate {candidate_name!r} configuration/data manifest disagree")
-    validate_configuration_against_protocol(configuration, protocol_body)
+    validate_configuration_against_protocol(configuration, protocol_body, candidate_name)
     if not isinstance(checkpoints, dict) or not checkpoints:
         raise ValueError(f"Candidate {candidate_name!r} has no frozen checkpoints")
     normalized_checkpoints: dict[str, dict] = {}

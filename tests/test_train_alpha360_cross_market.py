@@ -316,6 +316,9 @@ def test_evaluate_test_reads_and_exports_only_selected_horizons(tmp_path: Path) 
         ),
         encoding="utf-8",
     )
+    (candidate / "selection_candidate_manifest.json").write_text(
+        json.dumps({"status": "selection_complete"}), encoding="utf-8"
+    )
 
     class StoreSpy:
         def __init__(self):
@@ -374,6 +377,9 @@ def test_evaluate_test_reads_and_exports_only_selected_horizons(tmp_path: Path) 
     access = json.loads((candidate / "test_access.json").read_text(encoding="utf-8"))
     assert access["horizons"] == ["open1_open2"]
     assert access["selection_manifest_sha256"] == file_hash(manifest_path)
+    completion = json.loads((candidate / "test_completion_audit.json").read_text())
+    assert completion["status"] == "test_complete"
+    assert completion["test_read"] is True
 
 
 def test_cpu_benchmark_smoke_records_protocol_and_never_accesses_test(
