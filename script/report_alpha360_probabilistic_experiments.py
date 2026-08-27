@@ -212,7 +212,9 @@ def validate_metric_mapping(
     label: str,
 ) -> None:
     observed = observable_prediction_metrics(frame, horizon)
-    for metric in ("days", "rows", "rank_ic", "mae", "brier"):
+    for metric in observed:
+        if metric == "rank_icir":
+            continue
         _assert_close(reported[metric], observed[metric], f"{label}/{horizon}/{metric}")
     observed_icir = observed["rank_icir"]
     reported_icir = reported["rank_icir"]
