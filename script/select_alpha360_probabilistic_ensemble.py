@@ -13,6 +13,8 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import shutil
+import uuid
 
 import numpy as np
 import pandas as pd
@@ -212,6 +214,71 @@ def _same_frozen_candidate(expected: dict, actual: dict, name: str) -> None:
             raise RuntimeError(f"Frozen candidate {name!r} changed after ensemble selection: {key}")
 
 
+def _validate_candidate_test_artifacts(
+    manifest_path: Path,
+    manifest: dict,
+    candidates: dict[str, Path],
+    normalized: dict[str, dict],
+    name: str,
+) -> dict:
+    if name not in candidates or name not in normalized:
+        raise RuntimeError(f"Candidate {name!r} is absent from the frozen selection manifest")
+    expected_horizons = [
+        horizon for horizon in HORIZONS
+        if name in manifest["selections"][horizon]["selected_components"]
+    ]
+    if not expected_horizons:
+        raise RuntimeError(f"Candidate {name!r} was not selected for any horizon")
+    run = candidates[name]
+    kind = normalized[name]["kind"]
+    audit_path = run / (
+        "test_completion_audit.json" if kind == "decoupled"
+        else "test_materialization_manifest.json"
+    )
+    audit = read_json(audit_path)
+    if kind == "decoupled":
+        if audit.get("status") != "test_complete" or audit.get("test_read") is not True:
+            raise ValueError(f"Candidate {name!r} Test audit is incomplete")
+        manifest_ref = audit.get("selection_manifest")
+        prediction_ref = audit.get("artifacts", {}).get("test_predictions.csv")
+        checkpoint_hashes = audit.get("checkpoint_sha256", {})
+        audited_horizons = audit.get("selected_horizons")
+        for required_name in ("test_predictions.csv", "test_summary.csv", "test_access.json"):
+            verify_reference(
+                audit.get("artifacts", {}).get(required_name),
+                f"{name} Test artifact {required_name}",
+                run / required_name,
+            )
+    else:
+        if audit.get("command") != "evaluate-test" or audit.get("test_read") is not True:
+            raise ValueError(f"E0 candidate {name!r} Test audit is incomplete")
+        manifest_ref = audit.get("selection_manifest")
+        prediction_ref = audit.get("prediction_output")
+        checkpoint_hashes = {
+            horizon: value.get("sha256")
+            for horizon, value in audit.get("horizon_checkpoints", {}).items()
+        }
+        audited_horizons = audit.get("selected_horizons")
+    verify_reference(manifest_ref, f"{name} Test selection manifest", manifest_path)
+    selection_manifest_hash = sha256(manifest_path)
+    if manifest_ref.get("sha256") != selection_manifest_hash:
+        raise RuntimeError(f"Candidate {name!r} Test audit used another selection manifest")
+    verify_reference(prediction_ref, f"{name} Test predictions", run / "test_predictions.csv")
+    if audited_horizons != expected_horizons:
+        raise RuntimeError(f"Candidate {name!r} Test horizons differ from the freeze")
+    for horizon in expected_horizons:
+        expected_hash = manifest["selections"][horizon]["selected_checkpoint_sha256"][name]
+        if checkpoint_hashes.get(horizon) != expected_hash:
+            raise RuntimeError(f"Candidate {name!r} Test audit checkpoint mismatch: {horizon}")
+    return {
+        "candidate": name,
+        "kind": kind,
+        "selected_horizons": expected_horizons,
+        "test_audit": file_reference(audit_path),
+        "selection_manifest_sha256": selection_manifest_hash,
+    }
+
+
 def validate_frozen_selection_manifest(
     manifest_path: Path,
     *,
@@ -269,47 +336,67 @@ def validate_frozen_selection_manifest(
                 raise RuntimeError(f"Selected checkpoint hash changed for {name}/{horizon}")
             selected_candidates.add(name)
     if require_test_artifacts:
-        selection_manifest_hash = sha256(manifest_path)
         for name in selected_candidates:
-            run = candidates[name]
-            kind = normalized[name]["kind"]
-            audit_path = run / (
-                "test_completion_audit.json" if kind == "decoupled"
-                else "test_materialization_manifest.json"
+            _validate_candidate_test_artifacts(
+                manifest_path, manifest, candidates, normalized, name
             )
-            audit = read_json(audit_path)
-            if kind == "decoupled":
-                if audit.get("status") != "test_complete" or audit.get("test_read") is not True:
-                    raise ValueError(f"Candidate {name!r} Test audit is incomplete")
-                manifest_ref = audit.get("selection_manifest")
-                prediction_ref = audit.get("artifacts", {}).get("test_predictions.csv")
-                checkpoint_hashes = audit.get("checkpoint_sha256", {})
-                audited_horizons = audit.get("selected_horizons")
-            else:
-                if audit.get("command") != "evaluate-test" or audit.get("test_read") is not True:
-                    raise ValueError(f"E0 candidate {name!r} Test audit is incomplete")
-                manifest_ref = audit.get("selection_manifest")
-                prediction_ref = audit.get("prediction_output")
-                checkpoint_hashes = {
-                    horizon: value.get("sha256")
-                    for horizon, value in audit.get("horizon_checkpoints", {}).items()
-                }
-                audited_horizons = audit.get("selected_horizons")
-            verify_reference(manifest_ref, f"{name} Test selection manifest", manifest_path)
-            if manifest_ref.get("sha256") != selection_manifest_hash:
-                raise RuntimeError(f"Candidate {name!r} Test audit used another selection manifest")
-            verify_reference(prediction_ref, f"{name} Test predictions", run / "test_predictions.csv")
-            expected_horizons = [
-                horizon for horizon in HORIZONS
-                if name in selections[horizon]["selected_components"]
-            ]
-            if audited_horizons != expected_horizons:
-                raise RuntimeError(f"Candidate {name!r} Test horizons differ from the freeze")
-            for horizon in expected_horizons:
-                expected_hash = selections[horizon]["selected_checkpoint_sha256"][name]
-                if checkpoint_hashes.get(horizon) != expected_hash:
-                    raise RuntimeError(f"Candidate {name!r} Test audit checkpoint mismatch: {horizon}")
     return manifest, protocol_body, candidates, normalized
+
+
+def validate_one_candidate(protocol: Path, candidate_name: str, run: Path) -> dict:
+    protocol_body, protocol_hash = load_protocol(protocol)
+    expected_experiments = {value["id"] for value in protocol_body["experiments"]}
+    if candidate_name not in expected_experiments:
+        raise RuntimeError(f"Candidate {candidate_name!r} is not registered in the protocol")
+    result = validate_candidate_manifest(candidate_name, run, protocol_body)
+    return {"protocol_sha256": protocol_hash, "candidate": candidate_name, **result}
+
+
+def validate_one_candidate_test(manifest_path: Path, candidate_name: str) -> dict:
+    manifest, _, candidates, normalized = validate_frozen_selection_manifest(
+        manifest_path, require_test_artifacts=False
+    )
+    return _validate_candidate_test_artifacts(
+        manifest_path.expanduser().resolve(), manifest, candidates, normalized, candidate_name
+    )
+
+
+def validate_test_evaluation(manifest_path: Path, output_directory: Path) -> dict:
+    manifest_path = manifest_path.expanduser().resolve()
+    output_directory = output_directory.expanduser().resolve()
+    validate_frozen_selection_manifest(manifest_path, require_test_artifacts=True)
+    completion_path = output_directory / "test_completion_audit.json"
+    completion = read_json(completion_path)
+    if completion.get("status") != "test_complete" or completion.get("test_read") is not True:
+        raise ValueError("Aggregate Test completion audit is incomplete")
+    verify_reference(
+        completion.get("selection_manifest"),
+        "aggregate Test selection manifest",
+        manifest_path,
+    )
+    required = (
+        "test_predictions.csv",
+        "test_summary.csv",
+        "evaluated_selection_manifest.json",
+    )
+    for filename in required:
+        verify_reference(
+            completion.get("artifacts", {}).get(filename),
+            f"aggregate Test artifact {filename}",
+            output_directory / filename,
+        )
+    evaluated = read_json(output_directory / "evaluated_selection_manifest.json")
+    if evaluated.get("test_files_read") is not True:
+        raise ValueError("Evaluated selection manifest does not record completed Test access")
+    if evaluated.get("protocol_sha256") != read_json(manifest_path).get("protocol_sha256"):
+        raise RuntimeError("Aggregate Test evaluation used another frozen protocol")
+    return {
+        "status": "test_complete",
+        "test_read": True,
+        "selection_manifest_sha256": sha256(manifest_path),
+        "completion_audit": file_reference(completion_path),
+        "artifacts": {filename: file_reference(output_directory / filename) for filename in required},
+    }
 
 
 def parse_candidates(values: list[str]) -> dict[str, Path]:
@@ -506,8 +593,13 @@ def combination_key(item: dict) -> tuple[float, float, float, int]:
 
 
 def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
+    output = output.expanduser().resolve()
     if output.exists():
         raise FileExistsError(f"Selection manifest already exists: {output}")
+    if output.parent.exists():
+        raise FileExistsError(
+            f"Selection publication directory already exists without a manifest: {output.parent}"
+        )
     protocol = protocol.expanduser().resolve()
     protocol_body, protocol_hash = load_protocol(protocol)
     expected_experiments = {value["id"] for value in protocol_body["experiments"]}
@@ -565,29 +657,39 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
             },
             "selection_valid_metrics": selected["metrics"],
         }
-    selection_predictions = output.parent / "selection_valid_ensemble_predictions.csv"
-    if selection_predictions.exists():
-        raise FileExistsError(selection_predictions)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    merge_standardized_horizons(selected_prediction_frames).to_csv(
-        selection_predictions, index=False
-    )
-    manifest = {
-        "schema_version": 1,
-        "protocol": str(protocol),
-        "protocol_sha256": protocol_hash,
-        "protocol_segments": protocol_body["segments"],
-        "protocol_data_manifest_sha256": protocol_body["data_manifest_sha256"],
-        "selection_split": "selection_valid",
-        "test_files_read": False,
-        "candidates": {name: str(path) for name, path in candidates.items()},
-        "candidate_freeze": candidate_freeze,
-        "input_sha256": file_hashes,
-        "selection_valid_ensemble_predictions": str(selection_predictions.resolve()),
-        "selection_valid_ensemble_predictions_sha256": sha256(selection_predictions),
-        "selections": selections,
-    }
-    output.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    final_predictions = output.parent / "selection_valid_ensemble_predictions.csv"
+    staging = output.parent.parent / f".{output.parent.name}.staging-{uuid.uuid4().hex}"
+    staging.mkdir(parents=False, exist_ok=False)
+    try:
+        staging_predictions = staging / final_predictions.name
+        staging_manifest = staging / output.name
+        merge_standardized_horizons(selected_prediction_frames).to_csv(
+            staging_predictions, index=False
+        )
+        manifest = {
+            "schema_version": 1,
+            "protocol": str(protocol),
+            "protocol_sha256": protocol_hash,
+            "protocol_segments": protocol_body["segments"],
+            "protocol_data_manifest_sha256": protocol_body["data_manifest_sha256"],
+            "selection_split": "selection_valid",
+            "test_files_read": False,
+            "candidates": {name: str(path) for name, path in candidates.items()},
+            "candidate_freeze": candidate_freeze,
+            "input_sha256": file_hashes,
+            "selection_valid_ensemble_predictions": str(final_predictions),
+            "selection_valid_ensemble_predictions_sha256": sha256(staging_predictions),
+            "selections": selections,
+        }
+        staging_manifest.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        # One directory rename publishes the CSV and immutable manifest
+        # together.  A failed write leaves no final directory and is retryable.
+        staging.replace(output.parent)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
@@ -662,11 +764,44 @@ def main() -> None:
     evaluation = subparsers.add_parser("evaluate")
     evaluation.add_argument("--manifest", type=Path, required=True)
     evaluation.add_argument("--output-directory", type=Path, required=True)
+    candidate_validation = subparsers.add_parser("validate-candidate")
+    candidate_validation.add_argument("--protocol", type=Path, required=True)
+    candidate_validation.add_argument("--candidate-name", required=True)
+    candidate_validation.add_argument("--candidate-directory", type=Path, required=True)
+    selection_validation = subparsers.add_parser("validate-selection")
+    selection_validation.add_argument("--manifest", type=Path, required=True)
+    candidate_test_validation = subparsers.add_parser("validate-candidate-test")
+    candidate_test_validation.add_argument("--manifest", type=Path, required=True)
+    candidate_test_validation.add_argument("--candidate-name", required=True)
+    test_validation = subparsers.add_parser("validate-test-evaluation")
+    test_validation.add_argument("--manifest", type=Path, required=True)
+    test_validation.add_argument("--output-directory", type=Path, required=True)
     args = parser.parse_args()
     if args.command == "select":
         select(args.protocol, parse_candidates(args.candidate), args.output)
-    else:
+    elif args.command == "evaluate":
         evaluate(args.manifest, args.output_directory)
+    elif args.command == "validate-candidate":
+        print(json.dumps(validate_one_candidate(
+            args.protocol, args.candidate_name, args.candidate_directory
+        ), ensure_ascii=False, indent=2))
+    elif args.command == "validate-selection":
+        manifest, _, _, _ = validate_frozen_selection_manifest(
+            args.manifest, require_test_artifacts=False
+        )
+        print(json.dumps({
+            "status": "selection_frozen",
+            "test_files_read": manifest["test_files_read"],
+            "selection_manifest_sha256": sha256(args.manifest),
+        }, ensure_ascii=False, indent=2))
+    elif args.command == "validate-candidate-test":
+        print(json.dumps(validate_one_candidate_test(
+            args.manifest, args.candidate_name
+        ), ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(validate_test_evaluation(
+            args.manifest, args.output_directory
+        ), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

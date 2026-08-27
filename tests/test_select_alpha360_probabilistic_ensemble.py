@@ -122,6 +122,13 @@ def write_run(
 
 def write_test_completion(candidate: Path, selection_manifest: Path, horizons: list[str]) -> None:
     test_predictions = candidate / "test_predictions.csv"
+    test_summary = candidate / "test_summary.csv"
+    test_access = candidate / "test_access.json"
+    test_summary.write_text("horizon\n", encoding="utf-8")
+    test_access.write_text(json.dumps({
+        "status": "test_access_complete", "test_read": True,
+        "selection_manifest": reference(selection_manifest),
+    }), encoding="utf-8")
     audit = {
         "schema_version": 1,
         "status": "test_complete",
@@ -133,7 +140,11 @@ def write_test_completion(candidate: Path, selection_manifest: Path, horizons: l
             horizon: sha256(candidate / f"best_{horizon}_rank_ic_model.pt")
             for horizon in horizons
         },
-        "artifacts": {"test_predictions.csv": reference(test_predictions)},
+        "artifacts": {
+            "test_predictions.csv": reference(test_predictions),
+            "test_summary.csv": reference(test_summary),
+            "test_access.json": reference(test_access),
+        },
     }
     (candidate / "test_completion_audit.json").write_text(json.dumps(audit), encoding="utf-8")
 
@@ -232,17 +243,18 @@ def test_selection_never_reads_test_before_manifest(tmp_path: Path) -> None:
     (good / "test_predictions.csv").write_text("forbidden", encoding="utf-8")
     protocol = tmp_path / "protocol.json"
     write_protocol(protocol, ["good", "weak"], sha256(data_manifest))
-    output = tmp_path / "selection.json"
+    output = tmp_path / "selection" / "selection.json"
     select(protocol, {"good": good, "weak": weak}, output)
     manifest = json.loads(output.read_text())
     assert manifest["test_files_read"] is False
     assert all(value["selected_components"] == ["good"] for value in manifest["selections"].values())
-    selection_predictions = pd.read_csv(tmp_path / "selection_valid_ensemble_predictions.csv")
+    selection_predictions = pd.read_csv(output.parent / "selection_valid_ensemble_predictions.csv")
     assert all(f"{horizon}_expected_return" in selection_predictions for horizon in HORIZONS)
 
 
 def test_selection_refuses_overwrite(tmp_path: Path) -> None:
-    output = tmp_path / "selection.json"
+    output = tmp_path / "selection" / "selection.json"
+    output.parent.mkdir()
     output.write_text("{}")
     with pytest.raises(FileExistsError):
         select(tmp_path / "missing.json", {}, output)
@@ -257,7 +269,7 @@ def test_selection_supports_single_horizon_candidate_files(tmp_path: Path) -> No
     write_run(single, actual, actual, data_manifest, ("close1_close2",))
     protocol = tmp_path / "protocol.json"
     write_protocol(protocol, ["shared", "single"], sha256(data_manifest))
-    output = tmp_path / "selection.json"
+    output = tmp_path / "selection" / "selection.json"
     select(protocol, {"shared": shared, "single": single}, output)
     manifest = json.loads(output.read_text())
     assert "single" not in manifest["selections"]["open1_close2"]["individual_metrics"]
@@ -293,7 +305,7 @@ def test_selection_rejects_protocol_data_hash_mismatch(tmp_path: Path) -> None:
     protocol = tmp_path / "protocol.json"
     write_protocol(protocol, ["candidate"], "wrong-data-hash")
     with pytest.raises(RuntimeError, match="data manifest hash"):
-        select(protocol, {"candidate": candidate}, tmp_path / "selection.json")
+        select(protocol, {"candidate": candidate}, tmp_path / "selection" / "selection.json")
 
 
 def test_evaluate_requires_test_completion_audit_and_writes_aggregate_audit(

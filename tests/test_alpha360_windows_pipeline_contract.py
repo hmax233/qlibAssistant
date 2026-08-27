@@ -1,10 +1,4 @@
-"""Read-only contract checks for the Windows Alpha360 experiment pipeline.
-
-The production scripts are intentionally not modified by this review.  Tests
-marked strict xfail describe confirmed contract gaps: they keep the desired
-behaviour executable and will turn into XPASS failures once production is
-fixed, at which point the marker should be removed.
-"""
+"""Executable contracts for the resumable Windows Alpha360 pipeline."""
 
 from __future__ import annotations
 
@@ -16,7 +10,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from script.select_alpha360_probabilistic_ensemble import evaluate, select
+from script.select_alpha360_probabilistic_ensemble import evaluate, select, sha256
+from tests.test_select_alpha360_probabilistic_ensemble import write_protocol, write_run
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -178,24 +173,27 @@ def test_selector_evaluate_failure_does_not_poison_rerun_directory(tmp_path: Pat
     assert not output.exists()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Selection CSV is committed before the manifest, so a crash leaves an unrestartable collision",
-)
 def test_selector_selection_publish_is_transactional_and_rerunnable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     candidate = tmp_path / "candidate"
-    write_candidate(candidate, test=False)
+    data_manifest = tmp_path / "data_manifest.json"
+    data_manifest.write_text("{}", encoding="utf-8")
+    actual = np.array([-0.03, 0.00, 0.03, -0.02, 0.01, 0.04])
+    write_run(candidate, actual, actual, data_manifest)
     protocol = tmp_path / "protocol.json"
-    protocol.write_text(json.dumps({"horizons": list(HORIZONS)}), encoding="utf-8")
+    write_protocol(protocol, ["candidate"], sha256(data_manifest))
     manifest = tmp_path / "selection" / "selection_manifest.json"
     original = Path.write_text
     failed = False
 
     def fail_manifest_once(self: Path, *args, **kwargs):
         nonlocal failed
-        if self == manifest and not failed:
+        if (
+            self.name == manifest.name
+            and self.parent.name.startswith(".selection.staging-")
+            and not failed
+        ):
             failed = True
             raise OSError("simulated manifest publication failure")
         return original(self, *args, **kwargs)
@@ -203,6 +201,8 @@ def test_selector_selection_publish_is_transactional_and_rerunnable(
     monkeypatch.setattr(Path, "write_text", fail_manifest_once)
     with pytest.raises(OSError, match="publication failure"):
         select(protocol, {"candidate": candidate}, manifest)
+    assert not manifest.parent.exists()
+    assert not list(tmp_path.glob(".selection.staging-*"))
     # A transaction either publishes both files or permits an automatic retry.
     select(protocol, {"candidate": candidate}, manifest)
     assert manifest.is_file()
@@ -223,10 +223,6 @@ def test_selector_enforces_frozen_protocol_against_every_candidate() -> None:
     assert "optimization" in configuration
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="selection_ready is trusted without authenticating configuration, protocol, status, or artifacts",
-)
 def test_powershell_selection_ready_resume_validates_candidate_contract() -> None:
     text = source(WINDOWS_PIPELINE)
     begin = text.index("if (Test-Path $Status)")
@@ -243,36 +239,24 @@ def test_powershell_selection_ready_resume_validates_candidate_contract() -> Non
         assert required in skip_block
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="E0 is skipped on one CSV alone; its audit manifest and hashes are not checked",
-)
 def test_powershell_e0_resume_authenticates_complete_selection_candidate() -> None:
     text = source(WINDOWS_PIPELINE)
-    begin = text.index("if (-not (Test-Path (Join-Path $E0Candidate")
+    begin = text.index("# E0 resume is accepted")
     end = text.index("foreach ($Experiment in $Experiments)", begin)
     block = text[begin:end]
     assert "materialization_manifest.json" in block
     assert "sha256" in block.lower()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Existing candidate Test CSVs are skipped without checking their audit/summary or manifest hash",
-)
 def test_powershell_test_resume_authenticates_all_required_artifacts() -> None:
     text = source(WINDOWS_PIPELINE)
     begin = text.index("foreach ($Experiment in $Experiments)", text.index("materializing_selected_test"))
-    end = text.index("if (-not (Test-Path (Join-Path $TestEvaluation", begin)
+    end = text.index("$AggregateReady = $false", begin)
     block = text[begin:end]
     for required in ("test_access.json", "test_summary.csv", "selection_manifest_sha256"):
         assert required in block
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="materializing_selected_test reports test_read=true before any Test file is actually opened",
-)
 def test_pipeline_status_distinguishes_authorized_test_access_from_completed_read() -> None:
     text = source(WINDOWS_PIPELINE)
     begin = text.index("status='materializing_selected_test'")
@@ -282,14 +266,11 @@ def test_pipeline_status_distinguishes_authorized_test_access_from_completed_rea
     assert "test_read=$false" in block
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Final test_ready trusts aggregate test_predictions.csv without summary/hash/audit preflight",
-)
 def test_powershell_test_ready_requires_complete_aggregate_artifact_set() -> None:
     text = source(WINDOWS_PIPELINE)
-    begin = text.index("if (-not (Test-Path (Join-Path $TestEvaluation")
-    end = text.index("Write-PipelineStatus @{", begin)
+    begin = text.index("$AggregateReady = $false")
+    end = text.index("status='test_ready'", begin)
     block = text[begin:end]
     assert "test_summary.csv" in block
     assert "evaluated_selection_manifest.json" in block
+    assert "test_completion_audit.json" in block
