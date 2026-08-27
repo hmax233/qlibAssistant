@@ -43,6 +43,9 @@ FIXED_REFERENCE_STAGING_NAME = "fixed_reference_summary.csv"
 FIXED_REFERENCE_EXPECTED_SHA256 = (
     "32db848d16978ff6a3f275931c22d85bd86790ba4510ed1044436d4fd30b67c0"
 )
+PROTOCOL_SOURCE = (
+    ROOT / "script/alpha360_experiments/fixed_fold3_probabilistic_cross_market_v1.json"
+)
 WATCHDOG_TARGETS = (
     {
         "key": "base",
@@ -516,6 +519,180 @@ def fetch_artifacts(staging: Path) -> None:
         checked([*scp_base(), source, str(epoch_directory / f"{experiment}.csv")])
 
 
+def copy_remote_file(remote_path: str, destination: Path) -> None:
+    """Copy one authenticated Windows path without weakening SSH host checks."""
+
+    normalized = str(remote_path).replace("\\", "/")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    checked([*scp_base(), f"{USER}@{HOST}:{normalized}", str(destination)])
+
+
+def copy_authenticated_reference(reference: dict, destination: Path, label: str) -> dict:
+    if not isinstance(reference, dict):
+        raise ValueError(f"Missing evidence reference for {label}")
+    path = reference.get("path")
+    expected = reference.get("sha256")
+    if not isinstance(path, str) or not isinstance(expected, str):
+        raise ValueError(f"Incomplete evidence reference for {label}")
+    copy_remote_file(path, destination)
+    actual = file_sha256(destination)
+    if actual != expected:
+        raise RuntimeError(f"Evidence hash mismatch for {label}")
+    evidence_root = next(
+        (parent for parent in destination.parents if parent.name == "evidence"), None
+    )
+    local_path = (
+        str(Path("evidence") / destination.relative_to(evidence_root))
+        if evidence_root is not None else str(destination)
+    )
+    return {
+        "remote_path": path,
+        "local_path": local_path,
+        "sha256": actual,
+        "size": destination.stat().st_size,
+    }
+
+
+def selected_component_names(selection: dict) -> set[str]:
+    selections = selection.get("selections")
+    if not isinstance(selections, dict) or not selections:
+        raise ValueError("Selection manifest has no horizon selections")
+    names: set[str] = set()
+    for horizon, body in selections.items():
+        components = body.get("selected_components") if isinstance(body, dict) else None
+        if not isinstance(components, list) or not components:
+            raise ValueError(f"Selection manifest has no components for {horizon}")
+        names.update(str(value) for value in components)
+    return names
+
+
+def stage_evidence_bundle(staging: Path, status: dict) -> dict:
+    """Build a locally auditable protocol/config/checkpoint/Test-audit bundle."""
+
+    selection = read_json(staging / "selection_manifest.json")
+    evidence = staging / "evidence"
+    evidence.mkdir()
+    protocol_destination = evidence / "frozen_protocol.json"
+    shutil.copy2(PROTOCOL_SOURCE, protocol_destination)
+    protocol_hash = file_sha256(protocol_destination)
+    if protocol_hash != selection.get("protocol_sha256"):
+        raise RuntimeError("Local frozen protocol differs from the remote Selection freeze")
+
+    candidate_freeze = selection.get("candidate_freeze")
+    candidate_paths = selection.get("candidates")
+    if not isinstance(candidate_freeze, dict) or not isinstance(candidate_paths, dict):
+        raise ValueError("Selection manifest is missing candidate evidence")
+    selected = selected_component_names(selection)
+    status_selected = {str(value) for value in status.get("selected_candidates", [])}
+    if selected != status_selected:
+        raise RuntimeError("Selected candidates differ between status and Selection manifest")
+
+    records: dict[str, dict] = {}
+    data_manifest_records: dict[str, dict] = {}
+    for name, freeze in sorted(candidate_freeze.items()):
+        if not isinstance(freeze, dict):
+            raise ValueError(f"Invalid candidate freeze for {name}")
+        candidate_record = {
+            "candidate_manifest": copy_authenticated_reference(
+                freeze.get("candidate_manifest"),
+                evidence / "candidate_manifests" / f"{name}.json",
+                f"{name} candidate manifest",
+            ),
+            "configuration": copy_authenticated_reference(
+                freeze.get("configuration"),
+                evidence / "configurations" / f"{name}.json",
+                f"{name} configuration",
+            ),
+        }
+        data_reference = freeze.get("data_manifest")
+        data_hash = data_reference.get("sha256") if isinstance(data_reference, dict) else None
+        if not isinstance(data_hash, str):
+            raise ValueError(f"Missing data manifest hash for {name}")
+        if data_hash not in data_manifest_records:
+            data_manifest_records[data_hash] = copy_authenticated_reference(
+                data_reference,
+                evidence / "data_manifests" / f"{data_hash}.json",
+                f"{name} data manifest",
+            )
+        candidate_record["data_manifest_sha256"] = data_hash
+
+        if name in selected:
+            candidate_directory = candidate_paths.get(name)
+            if not isinstance(candidate_directory, str):
+                raise ValueError(f"Missing candidate directory for selected component {name}")
+            candidate_directory = candidate_directory.rstrip("/\\")
+            audit_directory = evidence / "test_audits" / name
+            audit_filenames = (
+                ("test_materialization_manifest.json",)
+                if name == "E0_joint_three_leg"
+                else ("test_completion_audit.json",)
+            )
+            for filename in audit_filenames:
+                destination = audit_directory / filename
+                copy_remote_file(candidate_directory + "\\" + filename, destination)
+            test_audit = read_json(audit_directory / audit_filenames[0])
+            expected_horizons = sorted(
+                horizon for horizon, body in selection["selections"].items()
+                if name in body["selected_components"]
+            )
+            actual_horizons = sorted(
+                test_audit.get("selected_horizons", test_audit.get("horizons", []))
+            )
+            if name == "E0_joint_three_leg":
+                if (
+                    test_audit.get("command") != "evaluate-test"
+                    or test_audit.get("test_read") is not True
+                ):
+                    raise ValueError("E0 Test materialization audit is incomplete")
+            elif (
+                test_audit.get("status") != "test_complete"
+                or test_audit.get("test_read") is not True
+                or test_audit.get("candidate_name") != name
+            ):
+                raise ValueError(f"Test completion audit is incomplete for {name}")
+            if actual_horizons != expected_horizons:
+                raise RuntimeError(f"Test audit horizons differ from Selection for {name}")
+            checkpoints = freeze.get("checkpoints")
+            if not isinstance(checkpoints, dict):
+                raise ValueError(f"Missing checkpoint freeze for {name}")
+            candidate_record["selected_checkpoints"] = {}
+            for horizon, body in selection["selections"].items():
+                if name not in body["selected_components"]:
+                    continue
+                candidate_record["selected_checkpoints"][horizon] = copy_authenticated_reference(
+                    checkpoints.get(horizon),
+                    evidence / "checkpoints" / name / f"{horizon}.pt",
+                    f"{name}/{horizon} checkpoint",
+                )
+            candidate_record["test_audits"] = {
+                filename: {
+                    "local_path": str(
+                        Path("evidence/test_audits") / name / filename
+                    ),
+                    "sha256": file_sha256(audit_directory / filename),
+                    "size": (audit_directory / filename).stat().st_size,
+                }
+                for filename in audit_filenames
+            }
+        records[name] = candidate_record
+
+    bundle = {
+        "status": "verified",
+        "protocol": {
+            "local_path": "evidence/frozen_protocol.json",
+            "sha256": protocol_hash,
+            "size": protocol_destination.stat().st_size,
+        },
+        "selected_candidates": sorted(selected),
+        "candidates": records,
+        "data_manifests": data_manifest_records,
+    }
+    (evidence / "evidence_index.json").write_text(
+        json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return bundle
+
+
 def stage_fixed_reference(staging: Path) -> dict:
     """Copy and authenticate the fixed external history after Test completion."""
 
@@ -683,6 +860,7 @@ def main() -> int:
         (staging / "local_lockbox_validation.json").write_text(
             json.dumps(lockbox_audit, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        evidence_bundle = stage_evidence_bundle(staging, status)
         fixed_reference = stage_fixed_reference(staging)
         mainboard_fallback = run_backtest(staging, "mainboard", True)
         all_board_fallback = run_backtest(staging, "all", True)
@@ -701,6 +879,7 @@ def main() -> int:
             "status": "complete",
             "remote_status": status,
             "lockbox_validation": lockbox_audit,
+            "evidence_bundle": evidence_bundle,
             "fixed_reference": fixed_reference,
             "reports": {
                 name: str(path.relative_to(staging)) for name, path in reports.items()

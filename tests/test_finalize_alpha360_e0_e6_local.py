@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,71 @@ def test_stage_fixed_reference_missing_or_duplicate_destination_fails_closed(
     with pytest.raises(FileExistsError):
         module.stage_fixed_reference(staging)
     assert destination.read_text(encoding="utf-8") == "preexisting"
+
+
+def test_stage_evidence_bundle_copies_and_authenticates_selected_checkpoint_audits(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    module = load_finalizer_module()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    protocol = tmp_path / "protocol.json"
+    protocol.write_text('{"schema_version":1}', encoding="utf-8")
+    monkeypatch.setattr(module, "PROTOCOL_SOURCE", protocol)
+    horizons = ["open1_close2", "close1_open2", "open1_open2", "close1_close2"]
+    remote_payloads = {
+        "E:/candidate/selection_candidate_manifest.json": b'{"status":"selection_complete"}',
+        "E:/candidate/configuration.json": b'{"epochs":50}',
+        "E:/data/manifest.json": b'{"schema_version":1}',
+    }
+    for horizon in horizons:
+        remote_payloads[f"E:/candidate/best_{horizon}.pt"] = f"weights-{horizon}".encode()
+    remote_payloads["E:/candidate/test_completion_audit.json"] = json.dumps({
+        "status": "test_complete",
+        "test_read": True,
+        "candidate_name": "candidate",
+        "selected_horizons": horizons,
+    }).encode()
+
+    def reference(path: str) -> dict:
+        return {"path": path, "sha256": hashlib.sha256(remote_payloads[path]).hexdigest()}
+
+    selection = {
+        "protocol_sha256": hashlib.sha256(protocol.read_bytes()).hexdigest(),
+        "candidates": {"candidate": "E:\\candidate"},
+        "candidate_freeze": {
+            "candidate": {
+                "candidate_manifest": reference("E:/candidate/selection_candidate_manifest.json"),
+                "configuration": reference("E:/candidate/configuration.json"),
+                "data_manifest": reference("E:/data/manifest.json"),
+                "checkpoints": {
+                    horizon: reference(f"E:/candidate/best_{horizon}.pt")
+                    for horizon in horizons
+                },
+            }
+        },
+        "selections": {
+            horizon: {"selected_components": ["candidate"]} for horizon in horizons
+        },
+    }
+    (staging / "selection_manifest.json").write_text(
+        json.dumps(selection), encoding="utf-8"
+    )
+
+    def fake_copy(remote_path: str, destination: Path) -> None:
+        key = remote_path.replace("\\", "/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(remote_payloads[key])
+
+    monkeypatch.setattr(module, "copy_remote_file", fake_copy)
+    bundle = module.stage_evidence_bundle(
+        staging, {"selected_candidates": ["candidate"]}
+    )
+    assert bundle["status"] == "verified"
+    assert bundle["selected_candidates"] == ["candidate"]
+    assert set(bundle["candidates"]["candidate"]["selected_checkpoints"]) == set(horizons)
+    assert (staging / "evidence/evidence_index.json").is_file()
+    assert (staging / "evidence/test_audits/candidate/test_completion_audit.json").is_file()
 
 
 def test_fixed_reference_is_staged_only_after_test_ready_gate_and_recorded() -> None:
