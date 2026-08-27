@@ -50,7 +50,6 @@ RULES = (
 class Position:
     instrument: str
     shares: int
-    cash: float
     entry_value: float
     buy_fee: float
     entry_date: pd.Timestamp
@@ -391,8 +390,10 @@ def attempt_exit(
     sell_notional = position.shares * sell_price
     sell_fee = commission(sell_notional, rate, minimum)
     proceeds = sell_notional - sell_fee
-    final_cash = position.cash + proceeds
-    starting_cash = position.cash + position.entry_value + position.buy_fee
+    # Slot.cash is the single source of truth for uninvested cash.  Keeping a
+    # second copy on Position makes marked equity count the residual twice.
+    final_cash = slot.cash + proceeds
+    starting_cash = slot.cash + position.entry_value + position.buy_fee
     trade_returns.append(final_cash / starting_cash - 1.0)
     counters["delayed_exit_trades"] += int(event_number > position.scheduled_exit_event)
     counters["completed_exit_trades"] += 1
@@ -542,9 +543,10 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
                     continue
                 buy_value = shares * buy_price
                 buy_fee = commission(buy_value, rate, minimum)
+                slot.cash -= buy_value + buy_fee
                 slot.position = Position(
                     instrument=candidate.instrument, shares=shares,
-                    cash=slot.cash - buy_value - buy_fee, entry_value=buy_value,
+                    entry_value=buy_value,
                     buy_fee=buy_fee, entry_date=entry_date, scheduled_exit=scheduled_exit,
                     scheduled_exit_event=scheduled_exit_event,
                     exit_phase=exit_phase, last_price=raw_buy,

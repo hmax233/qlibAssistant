@@ -7,6 +7,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "script"))
 from evaluate_alpha360_uncertainty_horizons import (
     benchmark_cumulative,
+    commission,
     excludes_star_and_chinext,
     prepare_rule,
     simulate,
@@ -66,6 +67,37 @@ def test_state_machine_carries_limit_down_position_without_future_entry_scan():
     # again at that day's close before succeeding on the next event.
     assert result["blocked_sell_down_limit_attempts"] == 2
     assert result["unresolved_exit"] == 0
+
+
+def test_flat_market_marked_equity_conserves_cash_after_buy():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    index = pd.MultiIndex.from_product(
+        [calendar, ["SH600000"]], names=["trade_date", "instrument"]
+    )
+    prices = pd.DataFrame({"open": 10.0, "close": 10.0}, index=index)
+    limits = pd.DataFrame({"up_limit": 11.0, "down_limit": 9.0}, index=index)
+    predictions = pd.DataFrame({
+        "datetime": [calendar[0]],
+        "instrument": ["SH600000"],
+        "close1_close2_expected_return": [0.02],
+        "close1_close2_return_std": [0.03],
+        "close1_close2_probability_positive": [0.60],
+    })
+    capital = 100000.0
+    rate = 0.000235
+    daily, result = simulate(
+        predictions, prices, limits, calendar, "close1_close2", "mean_all",
+        1, False, 0.0, capital, rate, 5.0,
+    )
+
+    shares = 9900
+    one_side_fee = commission(shares * 10.0, rate, 5.0)
+    assert abs(daily.iloc[0]["equity_mark"] - (capital - one_side_fee)) < 1e-9
+    assert abs(result["final_equity"] - (capital - 2.0 * one_side_fee)) < 1e-9
+    assert daily["equity_mark"].max() <= capital
+    assert result["max_drawdown_marked"] > -0.001
 
 
 def test_unresolved_future_exit_does_not_cancel_the_historical_buy():
