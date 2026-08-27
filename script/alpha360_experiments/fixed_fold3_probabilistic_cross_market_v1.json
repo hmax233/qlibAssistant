@@ -53,7 +53,7 @@
       "outputs": "four A-share independent Gaussian heads",
       "same_calendar_day_us_close_allowed": false,
       "selection_rule": "one valid-RankIC checkpoint per horizon",
-      "data_manifest_sha256": "33c10dd1d70037e4015644fe7467badce58f3c169e914d337ca43413edc071cd"
+      "data_manifest_sha256": "2af99158114e891e657c8c74259e1ad63416024a189eed8c1c47d026e5237094"
     }
   ],
   "optimization": {
