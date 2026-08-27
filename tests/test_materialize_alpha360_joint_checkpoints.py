@@ -21,7 +21,10 @@ from script.materialize_alpha360_joint_checkpoints import (
     materialize_selection,
     sha256,
 )
-from script.select_alpha360_probabilistic_ensemble import evaluate as evaluate_ensemble
+from script.select_alpha360_probabilistic_ensemble import (
+    evaluate as evaluate_ensemble,
+    select as select_ensemble,
+)
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -95,6 +98,14 @@ def make_fixture(tmp_path: Path, include_test_files: bool = True) -> tuple[Path,
         "model": asdict(config),
         "data_manifest_sha256": sha256(data / "manifest.json"),
         "segments": segments,
+        "seed": 20260827,
+        "epochs": 50,
+        "early_stopping": False,
+        "date_batch_size": 4,
+        "learning_rate": 0.0003,
+        "min_learning_rate": 0.000001,
+        "warmup_epochs": 3,
+        "warmup_start_factor": 1 / 3,
         "feature_count": 360,
         "target_scale": 100.0,
         "model_code_sha256": "model-code-test-hash",
@@ -244,22 +255,42 @@ def test_existing_selector_evaluate_reads_test_from_same_candidate_directory(
     candidate = tmp_path / "joint-candidate"
     materialize_selection(run, data, candidate, threads=1)
     candidate_csv = candidate / "selection_valid_predictions.csv"
-    manifest = tmp_path / "frozen_selection.json"
-    write_json(
-        manifest,
-        {
-            "schema_version": 1,
-            "selection_split": "selection_valid",
-            "test_files_read": False,
-            "candidates": {"joint": str(candidate)},
-            "input_sha256": {
-                "joint:selection_valid_predictions": sha256(candidate_csv),
-            },
-            "selections": {
-                horizon: {"selected_components": ["joint"]} for horizon in HORIZON_NAMES
-            },
+    # Give the tiny deterministic fixture a nonconstant, correctly ordered
+    # Selection score so the real selector can freeze the E0 candidate.
+    frame = pd.read_csv(candidate_csv)
+    for horizon in HORIZON_NAMES:
+        variance = frame[f"{horizon}_log_variance"]
+        frame[f"{horizon}_log_mean"] = (
+            np.log1p(frame[f"{horizon}_actual_return"]) - 0.5 * variance
+        )
+        frame[f"{horizon}_expected_return"] = frame[f"{horizon}_actual_return"]
+    frame.to_csv(candidate_csv, index=False)
+    candidate_audit_path = candidate / "materialization_manifest.json"
+    candidate_audit = json.loads(candidate_audit_path.read_text())
+    candidate_audit["prediction_output"]["sha256"] = sha256(candidate_csv)
+    write_json(candidate_audit_path, candidate_audit)
+
+    protocol = tmp_path / "protocol.json"
+    configuration = json.loads((run / "configuration.json").read_text())
+    write_json(protocol, {
+        "segments": configuration["segments"],
+        "data_manifest_sha256": configuration["data_manifest_sha256"],
+        "horizons": list(HORIZON_NAMES),
+        "experiments": [{"id": "joint"}],
+        "optimization": {
+            "epochs": configuration["epochs"],
+            "early_stopping": configuration["early_stopping"],
+            "learning_rate": configuration["learning_rate"],
+            "minimum_learning_rate": configuration["min_learning_rate"],
+            "warmup_epochs": configuration["warmup_epochs"],
+            "warmup_start_factor": configuration["warmup_start_factor"],
+            "date_batch_size": configuration["date_batch_size"],
+            "seed": configuration["seed"],
+            "target_scale": configuration["target_scale"],
         },
-    )
+    })
+    manifest = tmp_path / "selection" / "frozen_selection.json"
+    select_ensemble(protocol, {"joint": candidate}, manifest)
     evaluate_test(run, data, candidate, manifest, "joint", threads=1)
     ensemble_output = tmp_path / "ensemble-evaluation"
     # The tiny fixture intentionally emits a constant score across two stocks;
