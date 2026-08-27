@@ -157,50 +157,93 @@ def write_strict_directory(
             ).iloc[-1] - 1.0
             for benchmark in ("CSI300", "CSI1000")
         }
-        common = {
-            "horizon": horizon,
-            "topk": 1,
-            "fallback": True,
-            "slippage_bps_each_side": slippage,
-            "signal_days": 4,
-            "active_signal_days": 4,
-            "completed_trades": 4,
-            "mean_trade_return": 0.01,
-            "final_equity": capital,
-            "blocked_buy_up_limit": 0,
-            "blocked_buy_missing": 0,
-            "too_expensive": 0,
-            "delayed_exit_trades": 0,
-            "skipped_busy_slots": 0,
-            "filtered_cash_slots": 0,
-            "unresolved_exit": 0,
-            "split": "test",
-            "CSI1000_gross_cumulative": benchmark_values["CSI1000"],
-            "CSI300_gross_cumulative": benchmark_values["CSI300"],
-        }
-        baseline = {
-            **common,
-            "rule": "mean_all",
-            "net_cumulative": baseline_net,
-            "trade_win_rate": 0.50,
-            "max_drawdown_marked": -0.10,
-            "final_equity": capital * (1 + baseline_net),
-            "net_excess_vs_CSI1000": (1 + baseline_net) / (1 + benchmark_values["CSI1000"]) - 1,
-            "net_excess_vs_CSI300": (1 + baseline_net) / (1 + benchmark_values["CSI300"]) - 1,
-        }
-        selected = {
-            **common,
-            "rule": rule,
-            "net_cumulative": selected_net,
-            "trade_win_rate": 0.55,
-            "max_drawdown_marked": -0.07,
-            "final_equity": capital * (1 + selected_net),
-            "net_excess_vs_CSI1000": (1 + selected_net) / (1 + benchmark_values["CSI1000"]) - 1,
-            "net_excess_vs_CSI300": (1 + selected_net) / (1 + benchmark_values["CSI300"]) - 1,
-        }
-        baseline_rows.append(baseline)
-        selected_rows.append(selected)
-        for kind, terminal in (("baseline", baseline_net), ("selected", selected_net)):
+        def execution_fields(topk: int, bps: float) -> dict:
+            return {
+                "horizon": horizon,
+                "topk": topk,
+                "fallback": True,
+                "slippage_bps_each_side": bps,
+                "signal_days": 4,
+                "active_signal_days": 4,
+                "completed_trades": 4 * topk,
+                "mean_trade_return": 0.01,
+                "net_sharpe_rf0": 1.20,
+                "total_commission": 20.0 * topk,
+                "average_daily_turnover": 0.40,
+                "annualized_turnover": 100.8,
+                "average_gross_exposure": 0.80,
+                "max_gross_exposure": 1.0,
+                "average_max_name_concentration": 0.50 / topk,
+                "max_name_concentration": 0.80 / topk,
+                "blocked_buy_up_limit": 1,
+                "blocked_buy_missing": 2,
+                "blocked_buy_suspended": 3,
+                "too_expensive": 4,
+                "fallback_replacements": 5,
+                "delayed_exit_trades": 6,
+                "blocked_sell_down_limit_attempts": 7,
+                "blocked_sell_missing_attempts": 8,
+                "blocked_sell_suspended_attempts": 9,
+                "completed_exit_trades": 4 * topk,
+                "skipped_busy_slots": 0,
+                "filtered_cash_slots": 10,
+                "unresolved_exit": 0,
+                "split": "test",
+                "CSI1000_gross_cumulative": benchmark_values["CSI1000"],
+                "CSI300_gross_cumulative": benchmark_values["CSI300"],
+            }
+
+        baseline_at_reporting_slippage = None
+        for topk in (1, 3, 5, 10):
+            for bps in (0.0, 5.0):
+                sensitivity_net = baseline_net + (5.0 - bps) / 5000 + (topk - 1) / 10000
+                baseline = {
+                    **execution_fields(topk, bps),
+                    "rule": "mean_all",
+                    "net_cumulative": sensitivity_net,
+                    "trade_win_rate": 0.50,
+                    "max_drawdown_marked": -0.10,
+                    "final_equity": capital * (1 + sensitivity_net),
+                    "net_excess_vs_CSI1000": (
+                        (1 + sensitivity_net) / (1 + benchmark_values["CSI1000"]) - 1
+                    ),
+                    "net_excess_vs_CSI300": (
+                        (1 + sensitivity_net) / (1 + benchmark_values["CSI300"]) - 1
+                    ),
+                }
+                baseline_rows.append(baseline)
+                if topk == 1 and bps == slippage:
+                    baseline_at_reporting_slippage = baseline
+
+        selected_at_reporting_slippage = None
+        for bps in (0.0, 5.0):
+            selected_net_at_bps = selected_net + (5.0 - bps) / 5000
+            selected = {
+                **execution_fields(1, bps),
+                "rule": rule,
+                "net_cumulative": selected_net_at_bps,
+                "trade_win_rate": 0.55,
+                "net_sharpe_rf0": 1.40,
+                "max_drawdown_marked": -0.07,
+                "final_equity": capital * (1 + selected_net_at_bps),
+                "net_excess_vs_CSI1000": (
+                    (1 + selected_net_at_bps) / (1 + benchmark_values["CSI1000"]) - 1
+                ),
+                "net_excess_vs_CSI300": (
+                    (1 + selected_net_at_bps) / (1 + benchmark_values["CSI300"]) - 1
+                ),
+            }
+            selected_rows.append(selected)
+            if bps == slippage:
+                selected_at_reporting_slippage = selected
+
+        assert baseline_at_reporting_slippage is not None
+        assert selected_at_reporting_slippage is not None
+        for kind, result in (
+            ("baseline", baseline_at_reporting_slippage),
+            ("selected", selected_at_reporting_slippage),
+        ):
+            terminal = result["net_cumulative"]
             curve = pd.DataFrame({
                 "datetime": signal_dates,
                 "entry_date": signal_dates,
@@ -356,6 +399,8 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert {path.name for path in output.iterdir()} == {
         "concise_summary.csv",
         "model_selection.csv",
+        "strict_execution_summary.csv",
+        "topk_slippage_sensitivity.csv",
         "fixed_reference_comparison.csv",
         "prediction_metrics_comparison.png",
         "strategy_equity_curves.png",
@@ -367,6 +412,8 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert summary.loc[0, "mainboard_selection_rule"] == "frozen_rule_0"
     assert summary.loc[0, "mainboard_selection_rule_test_net_cumulative"] == pytest.approx(0.03)
     assert summary.loc[0, "all_selection_rule_test_net_cumulative"] == pytest.approx(0.033)
+    assert summary[["selection_days", "test_days"]].eq(4).all().all()
+    assert summary[["selection_rows", "test_rows"]].eq(12).all().all()
     comparison = pd.read_csv(output / "fixed_reference_comparison.csv")
     assert len(comparison) == 1
     assert comparison.loc[0, "horizon"] == "close1_close2"
@@ -384,11 +431,33 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert comparison.loc[0, "alpha360_completed_trades"] == 4
     assert comparison.loc[0, "fixed_reference_completed_trades"] == 4
     for column in (
+        "selection_rank_icir", "test_rank_icir",
+        "selection_coverage_50", "selection_coverage_80", "selection_coverage_95",
         "test_coverage_50", "test_coverage_80", "test_coverage_95",
         "test_top1_win_rate", "test_top3_mean_return", "test_top5_cumulative",
-        "test_top10_stock_win_rate",
+        "selection_top1_stock_win_rate", "test_top10_stock_win_rate",
     ):
         assert column in summary
+    strict_summary = pd.read_csv(output / "strict_execution_summary.csv")
+    assert len(strict_summary) == 16
+    assert set(strict_summary["result_type"]) == {"top1_baseline", "selected_rule"}
+    assert set(strict_summary["board_variant"]) == {"mainboard", "all"}
+    for column in (
+        "net_sharpe_rf0", "completed_trades", "total_commission",
+        "average_daily_turnover", "average_gross_exposure", "max_gross_exposure",
+        "average_max_name_concentration", "max_name_concentration",
+        "blocked_buy_up_limit", "blocked_buy_missing", "blocked_buy_suspended",
+        "too_expensive", "fallback_replacements", "delayed_exit_trades",
+        "blocked_sell_down_limit_attempts", "blocked_sell_missing_attempts",
+        "blocked_sell_suspended_attempts", "unresolved_exit",
+        "CSI300_gross_cumulative", "net_excess_vs_CSI300",
+        "CSI1000_gross_cumulative", "net_excess_vs_CSI1000",
+    ):
+        assert column in strict_summary
+    sensitivity = pd.read_csv(output / "topk_slippage_sensitivity.csv")
+    assert len(sensitivity) == 64
+    assert set(sensitivity["topk"]) == {1, 3, 5, 10}
+    assert set(sensitivity["slippage_bps_each_side"]) == {0.0, 5.0}
     model_selection = pd.read_csv(output / "model_selection.csv")
     selected = model_selection.loc[
         model_selection["record_type"].eq("ensemble_alternative")
@@ -405,10 +474,24 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert "Test is opened only after model components and trading rules are frozen" in method
     assert "universe-level survivorship bias" in method
     assert "epoch 50 actually trains at about `1.33e-6`" in method
+    assert "old startup verifier hashed the Test partition bytes" in method
+    assert "does not mean every listed A-share" in method
+    assert "multiple-comparison/Selection overfitting" in method
+    assert "Stamp tax is fixed at zero" in method
+    assert "No block bootstrap" in method
     assert "100" in method
     assert "STAR and ChiNext excluded" in method
     assert "Calibration and frictionless ranking diagnostics" in method
-    assert "Top1 win/mean/cum" in method
+    assert "Frictionless Top-K ranking diagnostics" in method
+    assert "Stock win" in method
+    assert "Sel/Test RankICIR" in method
+    assert "Coverage 50/80/95" in method
+    assert "Performance, costs, and benchmarks" in method
+    assert "Exposure, concentration, and execution diagnostics" in method
+    assert "Executable Top-K x slippage sensitivity" in method
+    assert "top1_baseline" in method and "selected_rule" in method
+    assert "Fallback/cash" in method and "Delayed exits" in method
+    assert "CSI300" in method and "CSI1000" in method
     assert "does not participate in model Selection" in method
     assert "old Fixed implementation searched at most through rank 20" in method
     assert "close1_close2" in method
@@ -464,6 +547,33 @@ def test_unresolved_test_position_fails_atomically(
     frame.loc[0, "unresolved_exit"] = 1
     frame.to_csv(path, index=False)
     with pytest.raises(ValueError, match="unresolved positions"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_incomplete_topk_slippage_grid_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["mainboard"] / "test_baseline_four_horizons.csv"
+    frame = pd.read_csv(path)
+    drop = (
+        frame["horizon"].eq("open1_close2")
+        & frame["topk"].eq(10)
+        & frame["slippage_bps_each_side"].eq(0.0)
+    )
+    frame.loc[~drop].to_csv(path, index=False)
+    with pytest.raises(ValueError, match="sensitivity grid mismatch"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_missing_strict_execution_metric_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["all"] / "test_selected_uncertainty_rules.csv"
+    frame = pd.read_csv(path).drop(columns=["total_commission"])
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="missing columns"):
         run_report(complete_fixture)
     assert not complete_fixture["output"].exists()
 

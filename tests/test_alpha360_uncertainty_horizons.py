@@ -2,11 +2,13 @@ from pathlib import Path
 import sys
 
 import pandas as pd
+import pytest
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "script"))
 from evaluate_alpha360_uncertainty_horizons import (
     benchmark_cumulative,
+    benchmark_statistics,
     commission,
     excludes_star_and_chinext,
     prepare_rule,
@@ -150,6 +152,39 @@ def test_overlapping_horizon_benchmark_uses_two_half_capital_sleeves():
     result = benchmark_cumulative(index, calendar[:2], calendar, "open1_close2", "CSI1000")
     # Sleeve A earns 10%, sleeve B earns 20%; total initial capital earns 15%.
     assert abs(result - 0.15) < 1e-12
+
+
+def test_benchmark_fails_closed_when_a_required_index_row_is_missing():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    index = pd.DataFrame({
+        "datetime": calendar[:2],
+        "index": ["CSI1000"] * 2,
+        "open": [100.0, 101.0],
+        "close": [100.0, 101.0],
+    })
+    with pytest.raises(RuntimeError, match="missing benchmark rows"):
+        benchmark_cumulative(
+            index, calendar[:1], calendar, "close1_close2", "CSI1000"
+        )
+
+
+def test_benchmark_statistics_reports_requested_and_equity_days():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    index = pd.DataFrame({
+        "datetime": calendar,
+        "index": ["CSI300"] * 3,
+        "open": [100.0, 101.0, 102.0],
+        "close": [100.0, 101.0, 102.0],
+    })
+    result = benchmark_statistics(
+        index, [calendar[0], calendar[0]], calendar, "close1_close2", "CSI300"
+    )
+    assert result["requested_signal_days"] == 1
+    assert result["equity_curve_days"] == 2
 
 
 def test_fallback_walks_the_complete_ranking_beyond_top50():

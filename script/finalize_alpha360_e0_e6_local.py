@@ -13,15 +13,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 from datetime import datetime
 import hashlib
 import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import time
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -86,6 +89,30 @@ REMOTE_FILES = {
         "test_evaluation_e0_e6/evaluated_selection_manifest.json"
     ),
 }
+
+ARTIFACT_INDEX_NAME = "artifact_index.json"
+EXPECTED_EPOCHS = 50
+REPORT_REQUIRED_FILES = (
+    "concise_summary.csv",
+    "model_selection.csv",
+    "strict_execution_summary.csv",
+    "topk_slippage_sensitivity.csv",
+    "fixed_reference_comparison.csv",
+    "prediction_metrics_comparison.png",
+    "strategy_equity_curves.png",
+    "method_and_findings.md",
+)
+STRICT_BACKTEST_REQUIRED_FILES = (
+    "method.json",
+    "chosen_rule_manifest_pre_test.json",
+    "evaluated_rule_manifest.json",
+    "selection_valid_chosen_rules.csv",
+    "selection_valid_uncertainty_grid.csv",
+    "test_baseline_four_horizons.csv",
+    "test_selected_uncertainty_rules.csv",
+    "label_alignment.csv",
+    "uncertainty_selection_test_comparison.csv",
+)
 
 
 class RemoteWatchdogUnavailable(RuntimeError):
@@ -425,6 +452,197 @@ def read_json(path: Path) -> dict:
     return value
 
 
+def csv_row_count(path: Path) -> int:
+    """Count data records with the standard CSV parser, excluding the header."""
+
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.reader(stream)
+        try:
+            header = next(reader)
+        except StopIteration as error:
+            raise ValueError(f"CSV has no header: {path}") from error
+        if not header or not any(str(value).strip() for value in header):
+            raise ValueError(f"CSV has an empty header: {path}")
+        return sum(1 for row in reader if row)
+
+
+def read_csv_records(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        if not reader.fieldnames:
+            raise ValueError(f"CSV has no header: {path}")
+        return list(reader)
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    """Validate PNG framing/CRC and return non-zero IHDR dimensions."""
+
+    signature = b"\x89PNG\r\n\x1a\n"
+    width = height = None
+    saw_idat = saw_iend = False
+    with path.open("rb") as stream:
+        if stream.read(len(signature)) != signature:
+            raise ValueError(f"Invalid PNG signature: {path}")
+        first_chunk = True
+        while length_bytes := stream.read(4):
+            if len(length_bytes) != 4:
+                raise ValueError(f"Truncated PNG chunk length: {path}")
+            length = struct.unpack(">I", length_bytes)[0]
+            chunk_type = stream.read(4)
+            data = stream.read(length)
+            checksum = stream.read(4)
+            if len(chunk_type) != 4 or len(data) != length or len(checksum) != 4:
+                raise ValueError(f"Truncated PNG chunk: {path}")
+            expected_crc = struct.unpack(">I", checksum)[0]
+            actual_crc = zlib.crc32(data, zlib.crc32(chunk_type)) & 0xFFFFFFFF
+            if actual_crc != expected_crc:
+                raise ValueError(f"PNG CRC mismatch: {path}")
+            if first_chunk:
+                if chunk_type != b"IHDR" or length != 13:
+                    raise ValueError(f"PNG does not begin with IHDR: {path}")
+                width, height = struct.unpack(">II", data[:8])
+                if width <= 0 or height <= 0:
+                    raise ValueError(f"PNG has zero dimensions: {path}")
+                first_chunk = False
+            elif chunk_type == b"IDAT":
+                saw_idat = True
+            elif chunk_type == b"IEND":
+                if length != 0:
+                    raise ValueError(f"Invalid PNG IEND: {path}")
+                saw_iend = True
+                if stream.read(1):
+                    raise ValueError(f"PNG has trailing bytes after IEND: {path}")
+                break
+    if width is None or height is None or not saw_idat or not saw_iend:
+        raise ValueError(f"PNG is incomplete or unreadable: {path}")
+    return width, height
+
+
+def generated_stage(relative_path: str) -> str:
+    first = Path(relative_path).parts[0]
+    if first == "evidence":
+        return "offline_evidence"
+    if first == "epoch_metrics":
+        return "training_history"
+    if first.startswith("strict_backtest_"):
+        return "strict_backtest"
+    if first.startswith("report_"):
+        return "report"
+    if first == "training_curves":
+        return "training_curves"
+    if relative_path == FIXED_REFERENCE_STAGING_NAME:
+        return "fixed_reference"
+    if relative_path in {
+        "local_lockbox_validation.json",
+        "local_completion.json",
+        "local_prepublish_validation.json",
+    }:
+        return "finalization"
+    return "remote_lockbox"
+
+
+def artifact_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    return {
+        ".csv": "csv",
+        ".json": "json",
+        ".jsonl": "jsonl",
+        ".png": "png",
+        ".md": "markdown",
+        ".log": "log",
+        ".pt": "pytorch_checkpoint",
+    }.get(suffix, suffix.lstrip(".") or "binary")
+
+
+def build_artifact_index(staging: Path, core_artifacts: set[str]) -> dict:
+    """Index every published file except this self-referential index itself."""
+
+    staging = staging.expanduser().resolve()
+    index_path = staging / ARTIFACT_INDEX_NAME
+    if index_path.exists():
+        raise FileExistsError(index_path)
+    records: list[dict] = []
+    for path in sorted(value for value in staging.rglob("*") if value.is_file()):
+        relative = path.relative_to(staging).as_posix()
+        if relative == ARTIFACT_INDEX_NAME:
+            continue
+        record = {
+            "relative_path": relative,
+            "type": artifact_type(path),
+            "size": path.stat().st_size,
+            "sha256": file_sha256(path),
+            "core": relative in core_artifacts,
+            "generated_stage": generated_stage(relative),
+        }
+        if path.suffix.lower() == ".csv":
+            record["csv_rows"] = csv_row_count(path)
+        elif path.suffix.lower() == ".png":
+            width, height = png_dimensions(path)
+            record["png_width"] = width
+            record["png_height"] = height
+        records.append(record)
+    missing_core = sorted(core_artifacts - {record["relative_path"] for record in records})
+    if missing_core:
+        raise RuntimeError(f"Core artifacts are absent from artifact index: {missing_core}")
+    value = {
+        "schema_version": 1,
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "root": ".",
+        "coverage": (
+            "Every file recursively below the final directory at index creation time; "
+            "artifact_index.json excludes itself because a file cannot contain its own SHA256."
+        ),
+        "self_excluded": ARTIFACT_INDEX_NAME,
+        "file_count": len(records),
+        "core_artifact_count": sum(bool(record["core"]) for record in records),
+        "artifacts": records,
+    }
+    temporary = index_path.with_suffix(index_path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(index_path)
+    return value
+
+
+def validate_artifact_index(staging: Path) -> dict:
+    staging = staging.expanduser().resolve()
+    index_path = staging / ARTIFACT_INDEX_NAME
+    value = read_json(index_path)
+    artifacts = value.get("artifacts")
+    if not isinstance(artifacts, list):
+        raise ValueError("artifact_index.json has no artifacts list")
+    expected = {
+        path.relative_to(staging).as_posix()
+        for path in staging.rglob("*")
+        if path.is_file() and path != index_path
+    }
+    indexed = {record.get("relative_path") for record in artifacts if isinstance(record, dict)}
+    if indexed != expected or len(indexed) != len(artifacts):
+        raise RuntimeError("artifact_index.json does not exactly cover the final directory")
+    for record in artifacts:
+        relative = record["relative_path"]
+        path = (staging / relative).resolve()
+        if staging not in path.parents or not path.is_file():
+            raise RuntimeError(f"Unsafe or missing artifact-index path: {relative}")
+        if record.get("size") != path.stat().st_size:
+            raise RuntimeError(f"Artifact size changed after indexing: {relative}")
+        if record.get("sha256") != file_sha256(path):
+            raise RuntimeError(f"Artifact hash changed after indexing: {relative}")
+        if path.suffix.lower() == ".csv" and record.get("csv_rows") != csv_row_count(path):
+            raise RuntimeError(f"Artifact CSV row count changed after indexing: {relative}")
+        if path.suffix.lower() == ".png":
+            width, height = png_dimensions(path)
+            if (record.get("png_width"), record.get("png_height")) != (width, height):
+                raise RuntimeError(f"Artifact PNG dimensions changed after indexing: {relative}")
+    if value.get("file_count") != len(artifacts):
+        raise RuntimeError("artifact_index.json file_count is incorrect")
+    return {
+        "status": "verified",
+        "artifact_index_sha256": file_sha256(index_path),
+        "indexed_files": len(artifacts),
+        "core_artifacts": sum(bool(record.get("core")) for record in artifacts),
+    }
+
+
 def verify_downloaded_reference(reference: dict | None, path: Path, label: str) -> None:
     if not isinstance(reference, dict) or not isinstance(reference.get("sha256"), str):
         raise ValueError(f"Missing authenticated reference for {label}")
@@ -603,6 +821,11 @@ def stage_evidence_bundle(staging: Path, status: dict) -> dict:
                 evidence / "configurations" / f"{name}.json",
                 f"{name} configuration",
             ),
+            "selection_valid_predictions": copy_authenticated_reference(
+                freeze.get("selection_valid_predictions"),
+                evidence / "selection_valid_predictions" / f"{name}.csv",
+                f"{name} Selection-valid predictions",
+            ),
         }
         data_reference = freeze.get("data_manifest")
         data_hash = data_reference.get("sha256") if isinstance(data_reference, dict) else None
@@ -615,6 +838,17 @@ def stage_evidence_bundle(staging: Path, status: dict) -> dict:
                 f"{name} data manifest",
             )
         candidate_record["data_manifest_sha256"] = data_hash
+
+        checkpoints = freeze.get("checkpoints")
+        if not isinstance(checkpoints, dict) or not checkpoints:
+            raise ValueError(f"Missing checkpoint freeze for {name}")
+        candidate_record["all_checkpoints"] = {}
+        for horizon, reference in sorted(checkpoints.items()):
+            candidate_record["all_checkpoints"][horizon] = copy_authenticated_reference(
+                reference,
+                evidence / "checkpoints" / name / f"{horizon}.pt",
+                f"{name}/{horizon} checkpoint",
+            )
 
         if name in selected:
             candidate_directory = candidate_paths.get(name)
@@ -665,17 +899,12 @@ def stage_evidence_bundle(staging: Path, status: dict) -> dict:
             }
             if audit_checkpoints != expected_checkpoint_hashes:
                 raise RuntimeError(f"Test audit checkpoints differ from Selection for {name}")
-            checkpoints = freeze.get("checkpoints")
-            if not isinstance(checkpoints, dict):
-                raise ValueError(f"Missing checkpoint freeze for {name}")
             candidate_record["selected_checkpoints"] = {}
             for horizon, body in selection["selections"].items():
                 if name not in body["selected_components"]:
                     continue
-                candidate_record["selected_checkpoints"][horizon] = copy_authenticated_reference(
-                    checkpoints.get(horizon),
-                    evidence / "checkpoints" / name / f"{horizon}.pt",
-                    f"{name}/{horizon} checkpoint",
+                candidate_record["selected_checkpoints"][horizon] = (
+                    candidate_record["all_checkpoints"][horizon]
                 )
             candidate_record["test_audits"] = {
                 filename: {
@@ -803,6 +1032,291 @@ def build_training_curves(staging: Path) -> Path:
     return output
 
 
+def require_nonempty_file(path: Path, label: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing {label}: {path}")
+    if path.stat().st_size <= 0:
+        raise ValueError(f"Empty {label}: {path}")
+
+
+def validate_epoch_histories(staging: Path) -> set[str]:
+    epoch_directory = staging / "epoch_metrics"
+    expected_names = {f"{name}.csv" for name in REMOTE_EPOCH_METRICS}
+    actual_names = {path.name for path in epoch_directory.glob("*.csv") if path.is_file()}
+    if actual_names != expected_names:
+        raise RuntimeError(
+            f"Epoch histories differ from the seven registered experiments: "
+            f"expected {sorted(expected_names)}, got {sorted(actual_names)}"
+        )
+    core: set[str] = set()
+    expected_epochs = list(range(1, EXPECTED_EPOCHS + 1))
+    for name in sorted(expected_names):
+        path = epoch_directory / name
+        records = read_csv_records(path)
+        if len(records) != EXPECTED_EPOCHS or "epoch" not in (records[0] if records else {}):
+            raise ValueError(f"{name} must contain exactly {EXPECTED_EPOCHS} epoch rows")
+        epochs: list[int] = []
+        for record in records:
+            value = float(record["epoch"])
+            if not value.is_integer():
+                raise ValueError(f"{name} contains a non-integral epoch: {record['epoch']}")
+            epochs.append(int(value))
+        if epochs != expected_epochs:
+            raise ValueError(f"{name} epochs must be contiguous 1..{EXPECTED_EPOCHS}")
+        core.add(path.relative_to(staging).as_posix())
+    return core
+
+
+def _require_zero_unresolved(path: Path, label: str) -> list[dict[str, str]]:
+    records = read_csv_records(path)
+    if not records:
+        raise ValueError(f"Core strict summary is empty: {path}")
+    if "unresolved_exit" not in records[0]:
+        raise ValueError(f"{label} lacks unresolved_exit")
+    for row_number, record in enumerate(records, start=2):
+        try:
+            value = float(record["unresolved_exit"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"{label} has invalid unresolved_exit at row {row_number}") from error
+        if value != 0.0:
+            raise RuntimeError(
+                f"{label} has unresolved exits at row {row_number}: {record['unresolved_exit']}"
+            )
+    return records
+
+
+def validate_strict_backtest(
+    staging: Path,
+    directory: Path,
+    board_variant: str,
+    fallback: bool,
+) -> set[str]:
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Missing strict backtest directory: {directory}")
+    core: set[str] = set()
+    for filename in STRICT_BACKTEST_REQUIRED_FILES:
+        path = directory / filename
+        require_nonempty_file(path, f"strict backtest artifact {filename}")
+        if path.suffix.lower() == ".csv" and csv_row_count(path) <= 0:
+            raise ValueError(f"Core strict backtest CSV has no records: {path}")
+        core.add(path.relative_to(staging).as_posix())
+
+    method = read_json(directory / "method.json")
+    expected_parameters = {
+        "board_variant": board_variant,
+        "fallback": fallback,
+        "capital": 100000.0,
+        "commission_rate_each_side": 0.000235,
+        "minimum_commission": 5.0,
+        "lot_size": 100,
+        "diagnostic_test_grid_generated": False,
+    }
+    for key, expected in expected_parameters.items():
+        if method.get(key) != expected:
+            raise RuntimeError(
+                f"{directory.name} method mismatch for {key}: "
+                f"expected {expected!r}, got {method.get(key)!r}"
+            )
+    pretest_path = directory / "chosen_rule_manifest_pre_test.json"
+    evaluated_path = directory / "evaluated_rule_manifest.json"
+    pretest = read_json(pretest_path)
+    evaluated = read_json(evaluated_path)
+    if pretest.get("test_opened") is not False or evaluated.get("test_opened") is not True:
+        raise RuntimeError(f"{directory.name} does not preserve the pre-Test rule freeze")
+    if evaluated.get("pretest_rule_manifest_sha256") != file_sha256(pretest_path):
+        raise RuntimeError(f"{directory.name} evaluated manifest does not authenticate pre-Test rules")
+
+    baseline_path = directory / "test_baseline_four_horizons.csv"
+    selected_path = directory / "test_selected_uncertainty_rules.csv"
+    baseline = _require_zero_unresolved(baseline_path, f"{directory.name} baseline")
+    selected = _require_zero_unresolved(selected_path, f"{directory.name} selected rules")
+    expected_baseline = {
+        (horizon, topk, slippage)
+        for horizon in (
+            "open1_close2", "close1_open2", "open1_open2", "close1_close2"
+        )
+        for topk in (1, 3, 5, 10)
+        for slippage in (0.0, 5.0)
+    }
+    actual_baseline = {
+        (row["horizon"], int(float(row["topk"])), float(row["slippage_bps_each_side"]))
+        for row in baseline
+    }
+    if actual_baseline != expected_baseline or len(baseline) != len(expected_baseline):
+        raise RuntimeError(f"{directory.name} lacks the complete TopK x 0/5bps strict matrix")
+    expected_selected = {
+        (horizon, slippage)
+        for horizon in (
+            "open1_close2", "close1_open2", "open1_open2", "close1_close2"
+        )
+        for slippage in (0.0, 5.0)
+    }
+    actual_selected = {
+        (row["horizon"], float(row["slippage_bps_each_side"])) for row in selected
+    }
+    if actual_selected != expected_selected or len(selected) != len(expected_selected):
+        raise RuntimeError(f"{directory.name} lacks the complete selected-rule 0/5bps matrix")
+    return core
+
+
+def validate_report(staging: Path, directory: Path, execution_policy: str) -> set[str]:
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Missing {execution_policy} report directory: {directory}")
+    core: set[str] = set()
+    for filename in REPORT_REQUIRED_FILES:
+        path = directory / filename
+        require_nonempty_file(path, f"{execution_policy} report artifact {filename}")
+        if path.suffix.lower() == ".csv" and csv_row_count(path) <= 0:
+            raise ValueError(f"Core report CSV has no records: {path}")
+        if path.suffix.lower() == ".png":
+            png_dimensions(path)
+        core.add(path.relative_to(staging).as_posix())
+    strict_summary = _require_zero_unresolved(
+        directory / "strict_execution_summary.csv",
+        f"{execution_policy} report strict execution summary",
+    )
+    if len(strict_summary) != 16:
+        raise RuntimeError(f"{execution_policy} strict execution summary must contain 16 rows")
+    return core
+
+
+def validate_offline_evidence(staging: Path) -> set[str]:
+    selection = read_json(staging / "selection_manifest.json")
+    evidence_path = staging / "evidence/evidence_index.json"
+    evidence = read_json(evidence_path)
+    if evidence.get("status") != "verified":
+        raise ValueError("Offline evidence bundle is not verified")
+    frozen = selection.get("candidate_freeze")
+    records = evidence.get("candidates")
+    if not isinstance(frozen, dict) or not isinstance(records, dict) or set(records) != set(frozen):
+        raise RuntimeError("Offline evidence does not contain every frozen candidate")
+    core = {evidence_path.relative_to(staging).as_posix()}
+
+    def verify_reference(reference: object, label: str) -> Path:
+        if not isinstance(reference, dict):
+            raise ValueError(f"Offline evidence lacks {label}")
+        local_path = reference.get("local_path")
+        expected_hash = reference.get("sha256")
+        if not isinstance(local_path, str) or not isinstance(expected_hash, str):
+            raise ValueError(f"Offline evidence reference is incomplete for {label}")
+        path = (staging / local_path).resolve()
+        if staging not in path.parents:
+            raise RuntimeError(f"Offline evidence path escapes final directory for {label}")
+        require_nonempty_file(path, f"offline evidence {label}")
+        if file_sha256(path) != expected_hash:
+            raise RuntimeError(f"Offline evidence hash mismatch for {label}")
+        core.add(path.relative_to(staging).as_posix())
+        return path
+
+    verify_reference(evidence.get("protocol"), "frozen protocol")
+    data_manifests = evidence.get("data_manifests")
+    if not isinstance(data_manifests, dict) or not data_manifests:
+        raise ValueError("Offline evidence lacks data manifests")
+    for data_hash, reference in data_manifests.items():
+        path = verify_reference(reference, f"data manifest {data_hash}")
+        if file_sha256(path) != data_hash:
+            raise RuntimeError(f"Offline data manifest key/hash mismatch: {data_hash}")
+
+    for name, freeze in frozen.items():
+        record = records[name]
+        verify_reference(record.get("candidate_manifest"), f"{name} candidate manifest")
+        verify_reference(record.get("configuration"), f"{name} configuration")
+        prediction_path = verify_reference(
+            record.get("selection_valid_predictions"),
+            f"{name} Selection-valid predictions",
+        )
+        if csv_row_count(prediction_path) <= 0:
+            raise ValueError(f"Offline Selection-valid predictions are empty for {name}")
+        if file_sha256(prediction_path) != freeze["selection_valid_predictions"]["sha256"]:
+            raise RuntimeError(f"Offline Selection-valid prediction hash mismatch for {name}")
+        checkpoints = record.get("all_checkpoints")
+        frozen_checkpoints = freeze.get("checkpoints")
+        if not isinstance(checkpoints, dict) or not isinstance(frozen_checkpoints, dict):
+            raise ValueError(f"Offline evidence lacks complete checkpoints for {name}")
+        if set(checkpoints) != set(frozen_checkpoints):
+            raise RuntimeError(f"Offline checkpoint set differs from Selection freeze for {name}")
+        for horizon, reference in checkpoints.items():
+            checkpoint_path = verify_reference(reference, f"{name}/{horizon} checkpoint")
+            if file_sha256(checkpoint_path) != frozen_checkpoints[horizon]["sha256"]:
+                raise RuntimeError(f"Offline checkpoint hash mismatch for {name}/{horizon}")
+        test_audits = record.get("test_audits", {})
+        if not isinstance(test_audits, dict):
+            raise ValueError(f"Offline Test audit map is invalid for {name}")
+        for filename, reference in test_audits.items():
+            verify_reference(reference, f"{name} Test audit {filename}")
+    return core
+
+
+def validate_final_staging(staging: Path) -> dict:
+    """Fail closed before atomic publication of any incomplete final delivery."""
+
+    staging = staging.expanduser().resolve()
+    core: set[str] = set()
+    top_level_core = (
+        "selection_manifest.json",
+        "selection_valid_ensemble_predictions.csv",
+        "test_summary.csv",
+        "test_predictions.csv",
+        "test_completion_audit.json",
+        "evaluated_selection_manifest.json",
+        "local_lockbox_validation.json",
+        "local_completion.json",
+        FIXED_REFERENCE_STAGING_NAME,
+    )
+    for filename in top_level_core:
+        path = staging / filename
+        require_nonempty_file(path, f"core final artifact {filename}")
+        if path.suffix.lower() == ".csv" and csv_row_count(path) <= 0:
+            raise ValueError(f"Core CSV has no records: {path}")
+        core.add(filename)
+
+    lockbox = read_json(staging / "local_lockbox_validation.json")
+    completion = read_json(staging / "local_completion.json")
+    if lockbox.get("status") != "verified" or completion.get("status") != "complete":
+        raise RuntimeError("Local lockbox/completion state is not publishable")
+    core.update(validate_offline_evidence(staging))
+    core.update(validate_epoch_histories(staging))
+
+    strict_specs = (
+        ("strict_backtest_mainboard_fallback", "mainboard", True),
+        ("strict_backtest_all_fallback", "all", True),
+        ("strict_backtest_mainboard_leave_cash", "mainboard", False),
+        ("strict_backtest_all_leave_cash", "all", False),
+    )
+    for directory_name, variant, fallback in strict_specs:
+        core.update(validate_strict_backtest(
+            staging, staging / directory_name, variant, fallback
+        ))
+
+    core.update(validate_report(staging, staging / "report_fallback", "fallback"))
+    core.update(validate_report(staging, staging / "report_leave_cash", "leave_cash"))
+    training_required = (
+        "training_curve_summary.csv", "training_curves.png", "training_curves.md"
+    )
+    for filename in training_required:
+        path = staging / "training_curves" / filename
+        require_nonempty_file(path, f"training-curve artifact {filename}")
+        if path.suffix.lower() == ".csv" and csv_row_count(path) != 7:
+            raise RuntimeError("Training curve summary must contain exactly seven experiments")
+        if path.suffix.lower() == ".png":
+            png_dimensions(path)
+        core.add(path.relative_to(staging).as_posix())
+
+    png_files = sorted(staging.rglob("*.png"))
+    if not png_files:
+        raise RuntimeError("Final delivery contains no PNG evidence")
+    for path in png_files:
+        png_dimensions(path)
+    return {
+        "status": "verified",
+        "epoch_histories": len(REMOTE_EPOCH_METRICS),
+        "strict_backtests": len(strict_specs),
+        "reports": 2,
+        "png_files": len(png_files),
+        "core_artifacts": sorted(core),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -904,11 +1418,23 @@ def main() -> int:
                 "all_leave_cash": str(all_board_leave_cash.relative_to(staging)),
             },
             "training_curves": str(training_curves.relative_to(staging)),
+            "prepublish_validation": "local_prepublish_validation.json",
+            "artifact_index": ARTIFACT_INDEX_NAME,
             "completed": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         (staging / "local_completion.json").write_text(
             json.dumps(completion, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        delivery_validation = validate_final_staging(staging)
+        validation_path = staging / "local_prepublish_validation.json"
+        validation_path.write_text(
+            json.dumps(delivery_validation, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        core_artifacts = set(delivery_validation["core_artifacts"])
+        core_artifacts.add(validation_path.relative_to(staging).as_posix())
+        build_artifact_index(staging, core_artifacts)
+        validate_artifact_index(staging)
         staging.replace(output)
     except Exception:
         failed = output.parent / f"{output.name}_failed_{time.strftime('%Y%m%d_%H%M%S')}"

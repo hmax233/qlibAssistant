@@ -162,6 +162,26 @@ def render(histories: dict[str, pd.DataFrame], output: Path) -> pd.DataFrame:
             f"{row.mean_epoch_seconds:.1f} | {row.best_valid_nll:.6f} "
             f"({int(row.best_valid_nll_epoch)}) | {row.final_learning_rate:.2e} |"
         )
+    lines.extend([
+        "",
+        "## Best validation Rank IC by experiment and horizon",
+        "",
+        "A dash means the experiment does not emit that horizon.",
+        "",
+        "| Experiment | Horizon | Best Valid Rank IC | Epoch |",
+        "|---|---|---:|---:|",
+    ])
+    for row in summary.itertuples(index=False):
+        for horizon in HORIZONS:
+            rank_ic = getattr(row, f"{horizon}_best_rank_ic")
+            epoch = getattr(row, f"{horizon}_best_rank_ic_epoch")
+            if pd.isna(rank_ic) or pd.isna(epoch):
+                lines.append(f"| {row.experiment} | {HORIZON_LABELS[horizon]} | — | — |")
+            else:
+                lines.append(
+                    f"| {row.experiment} | {HORIZON_LABELS[horizon]} | "
+                    f"{float(rank_ic):.6f} | {int(epoch)} |"
+                )
     lines.extend(["", "![Training curves](training_curves.png)", ""])
     (output / "training_curves.md").write_text("\n".join(lines), encoding="utf-8")
     return summary

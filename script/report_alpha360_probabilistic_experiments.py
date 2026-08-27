@@ -52,6 +52,40 @@ TOPK_METRICS = tuple(
 )
 PREDICTION_METRICS = (*CORE_PREDICTION_METRICS, *CALIBRATION_METRICS, *TOPK_METRICS)
 SUMMARY_METRICS = ("days", "rows", "components", *PREDICTION_METRICS)
+SENSITIVITY_TOPKS = (1, 3, 5, 10)
+SENSITIVITY_SLIPPAGE_BPS = (0.0, 5.0)
+STRICT_EXECUTION_METRICS = (
+    "signal_days",
+    "active_signal_days",
+    "completed_trades",
+    "net_cumulative",
+    "trade_win_rate",
+    "mean_trade_return",
+    "max_drawdown_marked",
+    "net_sharpe_rf0",
+    "total_commission",
+    "average_daily_turnover",
+    "annualized_turnover",
+    "average_gross_exposure",
+    "max_gross_exposure",
+    "average_max_name_concentration",
+    "max_name_concentration",
+    "blocked_buy_up_limit",
+    "blocked_buy_missing",
+    "blocked_buy_suspended",
+    "too_expensive",
+    "fallback_replacements",
+    "filtered_cash_slots",
+    "delayed_exit_trades",
+    "blocked_sell_down_limit_attempts",
+    "blocked_sell_missing_attempts",
+    "blocked_sell_suspended_attempts",
+    "unresolved_exit",
+    "CSI300_gross_cumulative",
+    "net_excess_vs_CSI300",
+    "CSI1000_gross_cumulative",
+    "net_excess_vs_CSI1000",
+)
 FIXED_REFERENCE_REQUIRED_COLUMNS = {
     "buy_time",
     "exit_time",
@@ -603,38 +637,53 @@ def load_strict_backtest(
         "rule",
         "topk",
         "slippage_bps_each_side",
-        "signal_days",
-        "net_cumulative",
-        "trade_win_rate",
-        "max_drawdown_marked",
-        "completed_trades",
-        "unresolved_exit",
-        "CSI1000_gross_cumulative",
-        "net_excess_vs_CSI1000",
-        "CSI300_gross_cumulative",
-        "net_excess_vs_CSI300",
+        *STRICT_EXECUTION_METRICS,
     }
-    baseline = _read_csv(
+    baseline_matrix = _read_csv(
         directory / "test_baseline_four_horizons.csv",
         f"{variant} Test baseline",
         common_summary_columns,
     )
-    selected = _read_csv(
+    selected_matrix = _read_csv(
         directory / "test_selected_uncertainty_rules.csv",
         f"{variant} Test selection-rule",
         common_summary_columns,
     )
-    if (pd.to_numeric(baseline["unresolved_exit"], errors="coerce") != 0).any():
+    if (pd.to_numeric(baseline_matrix["unresolved_exit"], errors="coerce") != 0).any():
         raise ValueError(f"{variant} Test baseline contains unresolved positions")
-    if (pd.to_numeric(selected["unresolved_exit"], errors="coerce") != 0).any():
+    if (pd.to_numeric(selected_matrix["unresolved_exit"], errors="coerce") != 0).any():
         raise ValueError(f"{variant} Test selection-rule contains unresolved positions")
-    baseline = baseline.loc[
-        baseline["topk"].eq(1)
-        & np.isclose(baseline["slippage_bps_each_side"], slippage)
+    sensitivity = baseline_matrix.loc[
+        baseline_matrix["topk"].isin(SENSITIVITY_TOPKS)
+        & baseline_matrix["slippage_bps_each_side"].isin(SENSITIVITY_SLIPPAGE_BPS)
     ].copy()
-    selected = selected.loc[
-        selected["topk"].eq(1)
-        & np.isclose(selected["slippage_bps_each_side"], slippage)
+    sensitivity_keys = sensitivity[["horizon", "topk", "slippage_bps_each_side"]].copy()
+    if sensitivity_keys.duplicated().any():
+        raise ValueError(f"{variant} Test baseline sensitivity grid contains duplicate rows")
+    expected_sensitivity = {
+        (horizon, topk, slippage_bps)
+        for horizon in HORIZONS
+        for topk in SENSITIVITY_TOPKS
+        for slippage_bps in SENSITIVITY_SLIPPAGE_BPS
+    }
+    actual_sensitivity = {
+        (str(row.horizon), int(row.topk), float(row.slippage_bps_each_side))
+        for row in sensitivity_keys.itertuples(index=False)
+    }
+    if actual_sensitivity != expected_sensitivity:
+        missing = sorted(expected_sensitivity - actual_sensitivity)
+        extra = sorted(actual_sensitivity - expected_sensitivity)
+        raise ValueError(
+            f"{variant} Test baseline sensitivity grid mismatch: "
+            f"missing={missing}, extra={extra}"
+        )
+    baseline = baseline_matrix.loc[
+        baseline_matrix["topk"].eq(1)
+        & np.isclose(baseline_matrix["slippage_bps_each_side"], slippage)
+    ].copy()
+    selected = selected_matrix.loc[
+        selected_matrix["topk"].eq(1)
+        & np.isclose(selected_matrix["slippage_bps_each_side"], slippage)
     ].copy()
     _exact_horizons(baseline["horizon"], f"{variant} filtered Test Top1 baseline")
     _exact_horizons(selected["horizon"], f"{variant} filtered Test selection-rule")
@@ -690,6 +739,9 @@ def load_strict_backtest(
         "chosen": chosen,
         "baseline": baseline,
         "selected": selected,
+        "baseline_matrix": baseline_matrix,
+        "selected_matrix": selected_matrix,
+        "sensitivity": sensitivity,
         "daily": daily,
     }
 
@@ -816,6 +868,10 @@ def build_concise_summary(
             "horizon_label": HORIZON_LABELS[horizon],
             "selected_components": "+".join(selection["selected_components"]),
             "component_count": expected_components,
+            "selection_days": int(selection_metrics["days"]),
+            "selection_rows": int(selection_metrics["rows"]),
+            "test_days": int(test_metrics["days"]),
+            "test_rows": int(test_metrics["rows"]),
         }
         for metric in PREDICTION_METRICS:
             row[f"selection_{metric}"] = selection_metrics[metric]
@@ -846,6 +902,77 @@ def build_concise_summary(
             })
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def build_strict_execution_summary(
+    strict: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    """Return normalized executable Top1 baseline/selected-rule rows."""
+
+    rows: list[dict[str, Any]] = []
+    for variant in ("mainboard", "all"):
+        data = strict[variant]
+        execution_policy = "fallback" if data["method"]["fallback"] else "leave_cash"
+        for result_type, frame in (
+            ("top1_baseline", data["baseline"]),
+            ("selected_rule", data["selected"]),
+        ):
+            for horizon in HORIZONS:
+                source = frame.loc[horizon]
+                row = {
+                    "board_variant": variant,
+                    "execution_policy": execution_policy,
+                    "result_type": result_type,
+                    "horizon": horizon,
+                    "horizon_label": HORIZON_LABELS[horizon],
+                    "rule": source["rule"],
+                    "topk": int(source["topk"]),
+                    "slippage_bps_each_side": float(source["slippage_bps_each_side"]),
+                }
+                for metric in STRICT_EXECUTION_METRICS:
+                    row[metric] = source[metric]
+                rows.append(row)
+    result = pd.DataFrame(rows)
+    if len(result) != 2 * 2 * len(HORIZONS):
+        raise RuntimeError("Strict execution summary does not contain the expected 16 rows")
+    return result
+
+
+def build_topk_slippage_sensitivity(
+    strict: dict[str, dict[str, Any]],
+) -> pd.DataFrame:
+    """Return the complete friction-aware baseline TopK x 0/5 bps grid."""
+
+    rows: list[dict[str, Any]] = []
+    for variant in ("mainboard", "all"):
+        data = strict[variant]
+        execution_policy = "fallback" if data["method"]["fallback"] else "leave_cash"
+        ordered = data["sensitivity"].sort_values(
+            ["horizon", "topk", "slippage_bps_each_side"]
+        )
+        for source in ordered.itertuples(index=False):
+            row = {
+                "board_variant": variant,
+                "execution_policy": execution_policy,
+                "result_type": "mean_all_baseline",
+                "horizon": source.horizon,
+                "horizon_label": HORIZON_LABELS[source.horizon],
+                "rule": source.rule,
+                "topk": int(source.topk),
+                "slippage_bps_each_side": float(source.slippage_bps_each_side),
+            }
+            for metric in STRICT_EXECUTION_METRICS:
+                row[metric] = getattr(source, metric)
+            rows.append(row)
+    result = pd.DataFrame(rows)
+    expected_rows = 2 * len(HORIZONS) * len(SENSITIVITY_TOPKS) * len(
+        SENSITIVITY_SLIPPAGE_BPS
+    )
+    if len(result) != expected_rows:
+        raise RuntimeError(
+            f"TopK/slippage sensitivity contains {len(result)} rows, expected {expected_rows}"
+        )
+    return result
 
 
 def plot_prediction_metrics(summary: pd.DataFrame, output: Path) -> None:
@@ -935,6 +1062,8 @@ def write_method_and_findings(
     test_predictions: Path,
     index_cache: Path,
     strict: dict[str, dict[str, Any]],
+    strict_summary: pd.DataFrame,
+    sensitivity: pd.DataFrame,
     fixed_comparison: pd.DataFrame,
     fixed_reference: dict[str, Any],
 ) -> None:
@@ -952,6 +1081,17 @@ def write_method_and_findings(
         "",
         "- E6 uses a bounded current-S&P-500 approximation for its US stock tokens. This has universe-level survivorship bias, so E6 is exploratory cross-market evidence rather than a point-in-time, unbiased US OOS experiment.",
         "- E0--E5 record `minimum_learning_rate=1e-6`, but scheduler step ordering means epoch 50 actually trains at about `1.33e-6` and reaches `1e-6` only after that epoch. E6 was corrected before training so epoch 50 itself uses `1e-6`.",
+        "- E0 was migrated to the lockbox code after epoch 43. Before migration, the old startup verifier hashed the Test partition bytes. There is no evidence that Test inference, labels, metrics, or backtests were produced or used for selection before the freeze, but this run must not be described as never having read any Test byte. E1--E6 were byte-locked from their training start.",
+        "- `all` means every CSI1000 name supplied by the prediction file, including STAR and ChiNext; it does not mean every listed A-share. `mainboard` means CSI1000 after excluding STAR and ChiNext.",
+        "- Test is one continuous held-out interval, not several independent market regimes. E0--E6 candidates, ensemble alternatives, and trading rules were compared on one Selection-valid interval, so multiple-comparison/Selection overfitting remains possible.",
+        "- Test results are descriptive only. They cannot be used to change components, thresholds, ranking rules, or execution policy without creating a new experiment and a new untouched Test interval.",
+        "- Mixture coverage uses moment-matched Gaussian intervals rather than exact Gaussian-mixture quantiles.",
+        "- Execution uses daily open/close prices plus fixed slippage. It enforces exact daily limits and suspension, but cannot model queue position, intraday liquidity, partial fills, volume participation, or market impact; a non-one-word limit price is not a guarantee of a real fill.",
+        "- Stamp tax is fixed at zero by the requested protocol, which overstates net proceeds relative to an account that pays it.",
+        "- The 100,000-yuan, 100-share-lot Top1 accounts are highly concentrated and exposed to single-name event risk.",
+        "- The legacy Fixed fallback reference only searches its first 20 names, whereas the new fallback engine walks the complete supplied ranking, so fallback comparisons are approximate; leave-cash is the cleaner execution-policy comparison.",
+        "- Frictionless Top-K cumulative returns are diagnostics, not executable account returns, particularly for overlapping horizons.",
+        "- No block bootstrap, confidence interval, or formal significance test is claimed; a positive result over this Test window alone is not proof of persistent alpha.",
         "",
         "## Strict execution assumptions",
         "",
@@ -972,15 +1112,19 @@ def write_method_and_findings(
     lines.extend([
         "## Frozen model components and predictive metrics",
         "",
-        "| Horizon | Components | Sel RankIC | Test RankIC | Sel NLL | Test NLL | Sel MAE | Test MAE | Sel Brier | Test Brier |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Horizon | Components | Sel days/rows | Test days/rows | Sel/Test RankIC | Sel/Test RankICIR | Sel/Test NLL | Sel/Test MAE | Sel/Test Brier |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in summary.itertuples(index=False):
         lines.append(
-            f"| {row.horizon} | {row.selected_components} | {row.selection_rank_ic:.4f} | "
-            f"{row.test_rank_ic:.4f} | {row.selection_nll:.4f} | {row.test_nll:.4f} | "
-            f"{row.selection_mae:.4f} | {row.test_mae:.4f} | "
-            f"{row.selection_brier:.4f} | {row.test_brier:.4f} |"
+            f"| {row.horizon} | {row.selected_components} | "
+            f"{int(row.selection_days)}/{int(row.selection_rows)} | "
+            f"{int(row.test_days)}/{int(row.test_rows)} | "
+            f"{row.selection_rank_ic:.4f} / {row.test_rank_ic:.4f} | "
+            f"{row.selection_rank_icir:.4f} / {row.test_rank_icir:.4f} | "
+            f"{row.selection_nll:.4f} / {row.test_nll:.4f} | "
+            f"{row.selection_mae:.4f} / {row.test_mae:.4f} | "
+            f"{row.selection_brier:.4f} / {row.test_brier:.4f} |"
         )
     lines.extend([
         "",
@@ -990,43 +1134,110 @@ def write_method_and_findings(
         "Coverage is exact for a single Gaussian and moment-matched for a Gaussian mixture. "
         "Top-K cumulative return below is a frictionless daily diagnostic; the strict account table is the executable result.",
         "",
-        "| Horizon | Test direction acc. | Cov. 50/80/95 | Top1 win/mean/cum | Top3 win/mean/cum | Top5 win/mean/cum | Top10 win/mean/cum |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Horizon | Split | Days | Rows | Direction acc. | Coverage 50/80/95 |",
+        "|---|---|---:|---:|---:|---:|",
     ])
     for row in summary.itertuples(index=False):
-        lines.append(
-            f"| {row.horizon} | {_percent(row.test_direction_accuracy)} | "
-            f"{_percent(row.test_coverage_50)} / {_percent(row.test_coverage_80)} / "
-            f"{_percent(row.test_coverage_95)} | "
-            f"{_percent(row.test_top1_win_rate)} / {_percent(row.test_top1_mean_return)} / "
-            f"{_percent(row.test_top1_cumulative)} | "
-            f"{_percent(row.test_top3_win_rate)} / {_percent(row.test_top3_mean_return)} / "
-            f"{_percent(row.test_top3_cumulative)} | "
-            f"{_percent(row.test_top5_win_rate)} / {_percent(row.test_top5_mean_return)} / "
-            f"{_percent(row.test_top5_cumulative)} | "
-            f"{_percent(row.test_top10_win_rate)} / {_percent(row.test_top10_mean_return)} / "
-            f"{_percent(row.test_top10_cumulative)} |"
-        )
+        for split, prefix in (("Selection-valid", "selection"), ("Test", "test")):
+            lines.append(
+                f"| {row.horizon} | {split} | {int(getattr(row, prefix + '_days'))} | "
+                f"{int(getattr(row, prefix + '_rows'))} | "
+                f"{_percent(getattr(row, prefix + '_direction_accuracy'))} | "
+                f"{_percent(getattr(row, prefix + '_coverage_50'))} / "
+                f"{_percent(getattr(row, prefix + '_coverage_80'))} / "
+                f"{_percent(getattr(row, prefix + '_coverage_95'))} |"
+            )
+    lines.extend([
+        "",
+        "### Frictionless Top-K ranking diagnostics",
+        "",
+        "`Portfolio win` is the fraction of positive daily equal-weight Top-K portfolios; "
+        "`stock win` is the fraction of positive individual selected stock returns.",
+        "",
+        "| Horizon | Split | K | Portfolio win | Stock win | Mean return | Cumulative |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ])
+    for row in summary.itertuples(index=False):
+        for split, prefix in (("Selection-valid", "selection"), ("Test", "test")):
+            for topk in (1, 3, 5, 10):
+                lines.append(
+                    f"| {row.horizon} | {split} | {topk} | "
+                    f"{_percent(getattr(row, f'{prefix}_top{topk}_win_rate'))} | "
+                    f"{_percent(getattr(row, f'{prefix}_top{topk}_stock_win_rate'))} | "
+                    f"{_percent(getattr(row, f'{prefix}_top{topk}_mean_return'))} | "
+                    f"{_percent(getattr(row, f'{prefix}_top{topk}_cumulative'))} |"
+                )
     lines.extend([
         "",
         "## Strict Test observations (descriptive, never used for selection)",
         "",
-        "| Horizon | Mainboard rule/net/win/DD | All-pool rule/net/win/DD | Mainboard excess CSI1000/CSI300 | All-pool excess CSI1000/CSI300 |",
-        "|---|---|---|---|---|",
+        "Both the executable Top1 baseline and the uncertainty rule frozen on Selection-valid "
+        "are shown at the pre-registered reporting slippage.",
+        "",
+        "### Performance, costs, and benchmarks",
+        "",
+        "| Board | Result | Horizon | Rule | Net | Win | DD | Sharpe | Trades | Fees | Daily turnover | CSI300 | Excess | CSI1000 | Excess |",
+        "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ])
-    for row in summary.itertuples(index=False):
+    for row in strict_summary.itertuples(index=False):
         lines.append(
-            f"| {row.horizon} | {row.mainboard_selection_rule}: "
-            f"{_percent(row.mainboard_selection_rule_test_net_cumulative)} / "
-            f"{_percent(row.mainboard_selection_rule_test_win_rate)} / "
-            f"{_percent(row.mainboard_selection_rule_test_max_drawdown)} | "
-            f"{row.all_selection_rule}: {_percent(row.all_selection_rule_test_net_cumulative)} / "
-            f"{_percent(row.all_selection_rule_test_win_rate)} / "
-            f"{_percent(row.all_selection_rule_test_max_drawdown)} | "
-            f"{_percent(row.mainboard_selection_rule_excess_vs_CSI1000)} / "
-            f"{_percent(row.mainboard_selection_rule_excess_vs_CSI300)} | "
-            f"{_percent(row.all_selection_rule_excess_vs_CSI1000)} / "
-            f"{_percent(row.all_selection_rule_excess_vs_CSI300)} |"
+            f"| {row.board_variant} | {row.result_type} | {row.horizon} | {row.rule} | "
+            f"{_percent(row.net_cumulative)} | {_percent(row.trade_win_rate)} | "
+            f"{_percent(row.max_drawdown_marked)} | {float(row.net_sharpe_rf0):.3f} | "
+            f"{int(row.completed_trades)} | {float(row.total_commission):.2f} | "
+            f"{_percent(row.average_daily_turnover)} | "
+            f"{_percent(row.CSI300_gross_cumulative)} | "
+            f"{_percent(row.net_excess_vs_CSI300)} | "
+            f"{_percent(row.CSI1000_gross_cumulative)} | "
+            f"{_percent(row.net_excess_vs_CSI1000)} |"
+        )
+    lines.extend([
+        "",
+        "### Exposure, concentration, and execution diagnostics",
+        "",
+        "Buy blocks are `up-limit / missing quote-or-limit / suspended / too expensive`; "
+        "sell blocks are `down-limit / missing quote / suspended`.",
+        "",
+        "| Board | Result | Horizon | Active/signal | Exposure avg/max | Name concentration avg/max | Buy blocks | Fallback/cash | Delayed exits | Sell blocks | Unresolved |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in strict_summary.itertuples(index=False):
+        lines.append(
+            f"| {row.board_variant} | {row.result_type} | {row.horizon} | "
+            f"{int(row.active_signal_days)}/{int(row.signal_days)} | "
+            f"{_percent(row.average_gross_exposure)} / {_percent(row.max_gross_exposure)} | "
+            f"{_percent(row.average_max_name_concentration)} / "
+            f"{_percent(row.max_name_concentration)} | "
+            f"{int(row.blocked_buy_up_limit)} / {int(row.blocked_buy_missing)} / "
+            f"{int(row.blocked_buy_suspended)} / {int(row.too_expensive)} | "
+            f"{int(row.fallback_replacements)} / {int(row.filtered_cash_slots)} | "
+            f"{int(row.delayed_exit_trades)} | "
+            f"{int(row.blocked_sell_down_limit_attempts)} / "
+            f"{int(row.blocked_sell_missing_attempts)} / "
+            f"{int(row.blocked_sell_suspended_attempts)} | "
+            f"{int(row.unresolved_exit)} |"
+        )
+    lines.extend([
+        "",
+        "### Executable Top-K x slippage sensitivity (mean-score baseline)",
+        "",
+        "This is the strict `mean_all` baseline grid, not a post-Test search for a new rule. "
+        "It reports every pre-generated Top1/3/5/10 account at 0 and 5 bps each side.",
+        "",
+        "| Board | Horizon | TopK | bps/side | Net | Win | DD | Sharpe | Trades | Fees | CSI300 | Excess | CSI1000 | Excess |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in sensitivity.itertuples(index=False):
+        lines.append(
+            f"| {row.board_variant} | {row.horizon} | {int(row.topk)} | "
+            f"{float(row.slippage_bps_each_side):g} | {_percent(row.net_cumulative)} | "
+            f"{_percent(row.trade_win_rate)} | {_percent(row.max_drawdown_marked)} | "
+            f"{float(row.net_sharpe_rf0):.3f} | {int(row.completed_trades)} | "
+            f"{float(row.total_commission):.2f} | "
+            f"{_percent(row.CSI300_gross_cumulative)} | "
+            f"{_percent(row.net_excess_vs_CSI300)} | "
+            f"{_percent(row.CSI1000_gross_cumulative)} | "
+            f"{_percent(row.net_excess_vs_CSI1000)} |"
         )
     lines.extend([
         "",
@@ -1084,7 +1295,10 @@ def write_method_and_findings(
         lines.append(f"| {label} | `{sha256(path)}` |")
     lines.extend([
         "",
-        "Generated files: `concise_summary.csv`, `model_selection.csv`, `fixed_reference_comparison.csv`, `prediction_metrics_comparison.png`, and `strategy_equity_curves.png`.",
+        "Generated files: `concise_summary.csv`, `model_selection.csv`, "
+        "`strict_execution_summary.csv`, `topk_slippage_sensitivity.csv`, "
+        "`fixed_reference_comparison.csv`, `prediction_metrics_comparison.png`, "
+        "and `strategy_equity_curves.png`.",
         "",
     ])
     output.write_text("\n".join(lines), encoding="utf-8")
@@ -1174,10 +1388,18 @@ def generate_report(
         )
         summary = build_concise_summary(manifest, test_summary, strict)
         model_selection = build_model_selection(manifest)
+        strict_summary = build_strict_execution_summary(strict)
+        sensitivity = build_topk_slippage_sensitivity(strict)
         index, calendar = load_index_cache(index_cache_path)
         signal_dates = list(test_predictions["datetime"].drop_duplicates().sort_values())
         summary.to_csv(output_directory / "concise_summary.csv", index=False)
         model_selection.to_csv(output_directory / "model_selection.csv", index=False)
+        strict_summary.to_csv(
+            output_directory / "strict_execution_summary.csv", index=False
+        )
+        sensitivity.to_csv(
+            output_directory / "topk_slippage_sensitivity.csv", index=False
+        )
         fixed_comparison.to_csv(
             output_directory / "fixed_reference_comparison.csv", index=False
         )
@@ -1200,6 +1422,8 @@ def generate_report(
             test_predictions_path,
             index_cache_path,
             strict,
+            strict_summary,
+            sensitivity,
             fixed_comparison,
             fixed_reference,
         )

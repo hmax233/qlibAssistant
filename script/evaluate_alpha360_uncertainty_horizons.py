@@ -152,7 +152,15 @@ def benchmark_equity(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeInd
         i = calendar_pos[signal]
         entry_date, exit_date = calendar[i + 1], calendar[i + 2]
         if entry_date not in frame.index or exit_date not in frame.index:
-            continue
+            missing = [
+                date.strftime("%Y-%m-%d")
+                for date in (entry_date, exit_date)
+                if date not in frame.index
+            ]
+            raise RuntimeError(
+                f"{benchmark} is missing benchmark rows required by signal "
+                f"{signal.strftime('%Y-%m-%d')}: {missing}"
+            )
         sleeve = number % specification["sleeves"]
         entry_event = 2 * (i + 1) + (0 if specification["entry"] == "open" else 1)
         exit_event = 2 * (i + 2) + (0 if specification["exit"] == "open" else 1)
@@ -168,10 +176,16 @@ def benchmark_equity(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeInd
         date = calendar[event // 2]
         phase = "open" if event % 2 == 0 else "close"
         if date not in frame.index:
-            continue
+            raise RuntimeError(
+                f"{benchmark} is missing the {date.strftime('%Y-%m-%d')} "
+                f"row required at the {phase} event"
+            )
         price = float(frame.loc[date, phase])
         if not np.isfinite(price) or price <= 0:
-            continue
+            raise RuntimeError(
+                f"{benchmark} has an invalid {phase} price on "
+                f"{date.strftime('%Y-%m-%d')}: {price}"
+            )
         for sleeve_number in exits.get(event, []):
             sleeve = sleeves[sleeve_number]
             if sleeve["units"]:
@@ -200,12 +214,19 @@ def benchmark_equity(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeInd
 
 def benchmark_statistics(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
                          horizon: str, benchmark: str) -> dict[str, float]:
-    equity = benchmark_equity(index, signal_dates, calendar, horizon, benchmark)
+    unique_signal_dates = pd.DatetimeIndex(
+        sorted({pd.Timestamp(value) for value in signal_dates})
+    )
+    equity = benchmark_equity(
+        index, unique_signal_dates, calendar, horizon, benchmark
+    )
     with_initial = pd.concat([pd.Series([1.0]), equity], ignore_index=True)
     return {
         "gross_cumulative": float(equity.iloc[-1] - 1.0) if len(equity) else 0.0,
         "max_drawdown": drawdown(with_initial),
         "sharpe_rf0": annualized_sharpe(equity, 1.0),
+        "requested_signal_days": int(len(unique_signal_dates)),
+        "equity_curve_days": int(len(equity)),
     }
 
 
@@ -235,6 +256,18 @@ def attach_benchmarks(results: pd.DataFrame, predictions: pd.DataFrame,
         )
         results[f"{benchmark}_sharpe_rf0"] = results["horizon"].map(
             {horizon: metrics["sharpe_rf0"] for horizon, metrics in values.items()}
+        )
+        results[f"{benchmark}_requested_signal_days"] = results["horizon"].map(
+            {
+                horizon: metrics["requested_signal_days"]
+                for horizon, metrics in values.items()
+            }
+        )
+        results[f"{benchmark}_equity_curve_days"] = results["horizon"].map(
+            {
+                horizon: metrics["equity_curve_days"]
+                for horizon, metrics in values.items()
+            }
         )
         results[f"net_excess_vs_{benchmark}"] = (
             (1.0 + results["net_cumulative"])
