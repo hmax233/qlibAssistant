@@ -53,21 +53,15 @@ class Position:
     entry_value: float
     buy_fee: float
     entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
+    scheduled_exit: pd.Timestamp
     exit_phase: str
-    sell_price: float
-    sell_fee: float
-    delayed_days: int
+    last_price: float
 
 
 @dataclass
 class Slot:
     cash: float
     position: Position | None = None
-
-
-def phase_key(date: pd.Timestamp, phase: str) -> tuple[pd.Timestamp, int]:
-    return pd.Timestamp(date), 0 if phase == "open" else 1
 
 
 def drawdown(equity: pd.Series) -> float:
@@ -240,42 +234,57 @@ def limit(frame: pd.DataFrame, date: pd.Timestamp, instrument: str, field: str) 
     return float(value) if np.isfinite(value) else None
 
 
-def find_exit(prices, limits, calendar, calendar_pos, scheduled_date, instrument,
-              exit_phase, slippage_bps, rate, minimum, shares):
-    start = calendar_pos[scheduled_date]
-    for position in range(start, len(calendar)):
-        date = calendar[position]
-        raw_price = quote(prices, date, instrument, exit_phase)
-        down = limit(limits, date, instrument, "down_limit")
-        if raw_price is None or down is None:
-            continue
-        if raw_price > down + 0.005:
-            sell_price = raw_price * (1.0 - slippage_bps / 10000.0)
-            fee = commission(shares * sell_price, rate, minimum)
-            return date, sell_price, fee, position - start
-    return None
-
-
 def mark_slot(slot: Slot, date: pd.Timestamp, phase: str, prices: pd.DataFrame) -> float:
     if slot.position is None:
         return slot.cash
     position = slot.position
     marked = quote(prices, date, position.instrument, phase)
-    if marked is None:
-        marked = position.entry_value / position.shares
-    return position.cash + position.shares * marked
+    if marked is not None:
+        position.last_price = marked
+    return position.cash + position.shares * position.last_price
 
 
-def finalize_ready(slot: Slot, event: tuple[pd.Timestamp, int], trade_returns: list[float]):
+def attempt_exit(
+    slot: Slot,
+    date: pd.Timestamp,
+    phase: str,
+    prices: pd.DataFrame,
+    limits: pd.DataFrame,
+    calendar_pos: dict[pd.Timestamp, int],
+    slippage_bps: float,
+    rate: float,
+    minimum: float,
+    trade_returns: list[float],
+    counters: dict[str, int],
+) -> bool:
+    """Try one exit using only information available at this event."""
+
     position = slot.position
-    if position is None or phase_key(position.exit_date, position.exit_phase) > event:
-        return
-    proceeds = position.shares * position.sell_price - position.sell_fee
+    if position is None:
+        return False
+    if phase != position.exit_phase or date < position.scheduled_exit:
+        return False
+    raw_price = quote(prices, date, position.instrument, phase)
+    down = limit(limits, date, position.instrument, "down_limit")
+    if raw_price is None or down is None:
+        counters["blocked_sell_missing_attempts"] += 1
+        return False
+    position.last_price = raw_price
+    if raw_price <= down + 0.005:
+        counters["blocked_sell_down_limit_attempts"] += 1
+        return False
+    sell_price = raw_price * (1.0 - slippage_bps / 10000.0)
+    sell_fee = commission(position.shares * sell_price, rate, minimum)
+    proceeds = position.shares * sell_price - sell_fee
     final_cash = position.cash + proceeds
     starting_cash = position.cash + position.entry_value + position.buy_fee
     trade_returns.append(final_cash / starting_cash - 1.0)
+    delayed = calendar_pos[date] - calendar_pos[position.scheduled_exit]
+    counters["delayed_exit_trades"] += int(delayed > 0)
+    counters["completed_exit_trades"] += 1
     slot.cash = final_cash
     slot.position = None
+    return True
 
 
 def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFrame,
@@ -291,17 +300,35 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
     counters = {
         "blocked_buy_up_limit": 0, "blocked_buy_missing": 0, "too_expensive": 0,
         "delayed_exit_trades": 0, "skipped_busy_slots": 0, "filtered_cash_slots": 0,
-        "unresolved_exit": 0,
+        "blocked_sell_missing_attempts": 0, "blocked_sell_down_limit_attempts": 0,
+        "completed_exit_trades": 0, "unresolved_exit": 0,
     }
     grouped = list(predictions.groupby("datetime", sort=True))
+    last_processed_event: int | None = None
+
+    def advance_to(event_number: int) -> None:
+        """Advance chronologically; never inspect an event before it occurs."""
+
+        nonlocal last_processed_event
+        if last_processed_event is None:
+            last_processed_event = event_number - 1
+        for number in range(last_processed_event + 1, event_number + 1):
+            event_date = calendar[number // 2]
+            event_phase = "open" if number % 2 == 0 else "close"
+            for slot_group in slot_groups:
+                for slot in slot_group:
+                    attempt_exit(
+                        slot, event_date, event_phase, prices, limits, calendar_pos,
+                        slippage_bps, rate, minimum, trade_returns, counters,
+                    )
+        last_processed_event = event_number
+
     for signal_number, (signal, group) in enumerate(grouped):
         signal = pd.Timestamp(signal)
         i = calendar_pos[signal]
         entry_date, scheduled_exit = calendar[i + 1], calendar[i + 2]
-        event = phase_key(entry_date, entry_phase)
-        for slot_group in slot_groups:
-            for slot in slot_group:
-                finalize_ready(slot, event, trade_returns)
+        entry_event_number = 2 * calendar_pos[entry_date] + (0 if entry_phase == "open" else 1)
+        advance_to(entry_event_number)
         assigned = slot_groups[signal_number % sleeves]
         ranked = prepare_rule(group, horizon, rule)
         candidates = list(ranked.head(max(50, topk * 5)).itertuples(index=False))
@@ -341,23 +368,11 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
                     continue
                 buy_value = shares * buy_price
                 buy_fee = commission(buy_value, rate, minimum)
-                exit_result = find_exit(
-                    prices, limits, calendar, calendar_pos, scheduled_exit,
-                    candidate.instrument, exit_phase, slippage_bps, rate, minimum, shares,
-                )
-                if exit_result is None:
-                    counters["unresolved_exit"] += 1
-                    if not fallback:
-                        break
-                    continue
-                exit_date, sell_price, sell_fee, delayed = exit_result
-                counters["delayed_exit_trades"] += int(delayed > 0)
                 slot.position = Position(
                     instrument=candidate.instrument, shares=shares,
                     cash=slot.cash - buy_value - buy_fee, entry_value=buy_value,
-                    buy_fee=buy_fee, entry_date=entry_date, exit_date=exit_date,
-                    exit_phase=exit_phase, sell_price=sell_price, sell_fee=sell_fee,
-                    delayed_days=delayed,
+                    buy_fee=buy_fee, entry_date=entry_date, scheduled_exit=scheduled_exit,
+                    exit_phase=exit_phase, last_price=raw_buy,
                 )
                 used.add(candidate.instrument)
                 bought = True
@@ -374,12 +389,19 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
             "active_positions": sum(slot.position is not None for sg in slot_groups for slot in sg),
         })
 
-    # Realize every remaining position at its precomputed first executable exit.
-    final_event = (pd.Timestamp.max, 1)
-    for slot_group in slot_groups:
-        for slot in slot_group:
-            finalize_ready(slot, final_event, trade_returns)
-    final_equity = sum(slot.cash for slot_group in slot_groups for slot in slot_group)
+    # After the final signal, continue the same chronological state machine
+    # through the available calendar. Positions still blocked at the data end
+    # remain open and are marked, never retrospectively rejected at entry.
+    if last_processed_event is not None:
+        advance_to(2 * len(calendar) - 1)
+    counters["unresolved_exit"] = sum(
+        slot.position is not None for slot_group in slot_groups for slot in slot_group
+    )
+    final_date = calendar[-1]
+    final_equity = sum(
+        mark_slot(slot, final_date, "close", prices)
+        for slot_group in slot_groups for slot in slot_group
+    )
     daily = pd.DataFrame(rows).set_index("datetime")
     if len(daily):
         daily.iloc[-1, daily.columns.get_loc("equity_mark")] = final_equity
@@ -510,6 +532,10 @@ def parse_args():
     parser.add_argument("--minimum-active-days", type=int, default=30)
     parser.add_argument("--topks", nargs="+", type=int, default=[1, 3, 5, 10])
     parser.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--diagnostic-test-grid", action="store_true",
+        help="Explicitly opt into a full Test rule grid; never use it for selection.",
+    )
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
@@ -541,8 +567,10 @@ def main():
         robust_chosen, frames["test"], prices, limits, calendar, args, output, "robust"
     )
     robust_test = attach_benchmarks(robust_test, frames["test"], index, calendar)
-    test_grid = uncertainty_grid("test", frames["test"], prices, limits, calendar, args)
-    test_grid = attach_benchmarks(test_grid, frames["test"], index, calendar)
+    test_grid = None
+    if args.diagnostic_test_grid:
+        test_grid = uncertainty_grid("test", frames["test"], prices, limits, calendar, args)
+        test_grid = attach_benchmarks(test_grid, frames["test"], index, calendar)
     alignment = pd.concat([
         label_alignment(split, frame, prices, calendar) for split, frame in frames.items()
     ], ignore_index=True)
@@ -581,7 +609,8 @@ def main():
     selection_grid.to_csv(output / "selection_valid_uncertainty_grid.csv", index=False)
     chosen.to_csv(output / "selection_valid_chosen_rules.csv", index=False)
     chosen_test.to_csv(output / "test_selected_uncertainty_rules.csv", index=False)
-    test_grid.to_csv(output / "test_uncertainty_grid_diagnostic_only.csv", index=False)
+    if test_grid is not None:
+        test_grid.to_csv(output / "test_uncertainty_grid_diagnostic_only.csv", index=False)
     alignment.to_csv(output / "label_alignment.csv", index=False)
     comparison.to_csv(output / "uncertainty_selection_test_comparison.csv", index=False)
     robust_chosen.to_csv(output / "valid_selection_robust_chosen_rules.csv", index=False)
@@ -595,8 +624,9 @@ def main():
         "minimum_commission": args.minimum_commission, "stamp_tax": "omitted per user preference",
         "fallback": args.fallback, "lot_size": 100,
         "overlap": "open1_close2 uses two independent 50% temporal sleeves",
-        "limit_down_exit": "carry to first later same-phase executable quote",
-        "test_warning": "Test has previously been viewed; diagnostic grid is not used for rule selection",
+        "limit_down_exit": "chronological state machine retries later same-phase events; no future exit scan at entry",
+        "diagnostic_test_grid_generated": args.diagnostic_test_grid,
+        "test_warning": "A full Test rule grid is disabled by default and is never used for rule selection",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print("BASELINE TEST")
     print(baseline.to_string(index=False))
