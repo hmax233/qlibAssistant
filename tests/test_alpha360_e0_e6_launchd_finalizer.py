@@ -15,7 +15,7 @@ def test_launchd_finalizer_is_short_lived_and_self_unloads() -> None:
     assert "while" not in source
     assert "nohup" not in source
     assert "launchctl bootout" in source
-    assert "status -eq 3" in source
+    assert "exit_code -eq 3" in source
 
 
 def test_launchd_interval_is_thirty_minutes_and_low_priority() -> None:
