@@ -1,0 +1,142 @@
+{
+  "protocol_version": 1,
+  "protocol_name": "alpha360_fixed_fold3_probabilistic_six_model_v1",
+  "frozen_at": "2026-08-28",
+  "universe": "csi1000 point-in-time constituents",
+  "segments": {
+    "train": ["2015-04-17", "2025-04-16"],
+    "valid": ["2025-04-17", "2025-09-16"],
+    "selection_valid": ["2025-09-17", "2026-02-16"],
+    "test": ["2026-02-17", "2026-07-17"]
+  },
+  "data_manifest_sha256": "74cb79e5309bb397766996ef86dc80dffb4fc98938202c80db2bb25d9ce3adea",
+  "horizons": [
+    "open1_close2",
+    "close1_open2",
+    "open1_open2",
+    "close1_close2"
+  ],
+  "experiments": [
+    {
+      "id": "E0_joint_three_leg",
+      "model": "joint_three_leg_gaussian",
+      "outputs": "three means and a full 3x3 covariance; four horizons are derived"
+    },
+    {
+      "id": "E1_shared_four_head",
+      "model": "shared_backbone_four_independent_gaussian_heads",
+      "outputs": "one mean and one standard deviation per horizon"
+    },
+    {
+      "id": "E2_single_open1_close2",
+      "model": "independent_single_horizon_gaussian",
+      "horizon": "open1_close2"
+    },
+    {
+      "id": "E3_single_close1_open2",
+      "model": "independent_single_horizon_gaussian",
+      "horizon": "close1_open2"
+    },
+    {
+      "id": "E4_single_open1_open2",
+      "model": "independent_single_horizon_gaussian",
+      "horizon": "open1_open2"
+    },
+    {
+      "id": "E5_single_close1_close2",
+      "model": "independent_single_horizon_gaussian",
+      "horizon": "close1_close2"
+    }
+  ],
+  "architecture": {
+    "alpha_features": 360,
+    "lookback_days": 60,
+    "model_width": 64,
+    "temporal_layers": 2,
+    "cross_section_layers": 2,
+    "attention_heads": 4,
+    "feedforward_width": 256,
+    "stock_embedding_width": 64,
+    "stock_embedding_trainable": true,
+    "output_head_width": 128,
+    "dropout": 0.1,
+    "temporal_pooling": "learned attention pooling"
+  },
+  "optimization": {
+    "epochs": 50,
+    "early_stopping": false,
+    "optimizer": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "warmup_epochs": 3,
+    "warmup_start_factor": 0.3333333333333333,
+    "scheduler_after_warmup": "CosineAnnealingLR",
+    "minimum_learning_rate": 0.000001,
+    "date_batch_size": 4,
+    "gradient_accumulation": false,
+    "gradient_clipping": false,
+    "seed": 20260827,
+    "target_scale": 100.0
+  },
+  "checkpoint_selection": {
+    "split": "valid",
+    "rule": "For every model and horizon, retain the epoch with the highest daily cross-sectional RankIC for that horizon.",
+    "test_access": "forbidden"
+  },
+  "ensemble_selection": {
+    "split": "selection_valid",
+    "candidate_models_per_horizon": [
+      "E0 horizon-specific valid checkpoint",
+      "E1 horizon-specific valid checkpoint",
+      "matching E2-E5 single-horizon valid checkpoint"
+    ],
+    "candidate_combinations": [
+      "best eligible single model",
+      "equal-weight best two eligible models",
+      "equal-weight all eligible models"
+    ],
+    "eligibility": "selection_valid RankIC must be finite and greater than zero",
+    "primary_metric": "selection_valid daily cross-sectional RankIC",
+    "tie_breakers": [
+      "higher selection_valid RankICIR",
+      "lower selection_valid Gaussian NLL",
+      "fewer component models"
+    ],
+    "mixture_moments": "For an equal-weight Gaussian mixture, mean is average component mean; variance is average(var + mean^2) minus mixture_mean^2; P(return>0) is average component probability.",
+    "test_access": "forbidden until a selected-ensemble manifest with component hashes is written"
+  },
+  "final_evaluation": {
+    "split": "test",
+    "read_once_after_selection_freeze": true,
+    "prediction_metrics": [
+      "NLL",
+      "MAE",
+      "Brier score",
+      "50/80/95 percent interval coverage",
+      "daily RankIC",
+      "RankICIR",
+      "top1/top3/top5/top10 realized return and win rate"
+    ],
+    "strict_backtest_requirements": [
+      "point-in-time universe",
+      "no use of test labels for model or ensemble selection",
+      "exclude suspended and limit-up unbuyable entries",
+      "limit-down unsellable positions remain held",
+      "report fallback-to-next-tradable and leave-cash variants separately",
+      "report gross and transaction-cost-adjusted results",
+      "report CSI300 and CSI1000 benchmark returns",
+      "report max drawdown, Sharpe, turnover and return concentration",
+      "report results with and without STAR/ChiNext exclusions"
+    ]
+  },
+  "cross_market_extension": {
+    "id": "E6_a_us_shared_cross_section",
+    "status": "gated_on_us_data_permission_and_asof_alignment_audit",
+    "a_share_temporal_encoder": "independent weights",
+    "us_temporal_encoder": "independent weights",
+    "market_embedding": true,
+    "cross_market_attention_universe": "CSI1000 plus a bounded liquid US universe; do not use all US listings in quadratic attention",
+    "output_universe": "CSI1000 only",
+    "leakage_rule": "US features must be aligned as-of the latest US close available before the Chinese signal timestamp; never join same-calendar-day US close if it occurs later."
+  }
+}
