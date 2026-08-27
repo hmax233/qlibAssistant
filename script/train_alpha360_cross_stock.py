@@ -71,6 +71,7 @@ def pad_date_batches(batches):
 # Explicit provenance for the Windows status-file sharing repair. This is not a
 # general permission to resume after arbitrary training-code changes.
 PRE_IO_REPAIR_SCRIPT_SHA256 = "a61606f4d5375914ebaf64e649cdcf65f6f84f634ea91b1eb7d67dd91f7ce7b2"
+PRE_BLIND_PROTOCOL_SCRIPT_SHA256 = "226583474480d059a04c20fc5c81b351806e8f2d01d267fb1a0fe55a3c766a27"
 
 
 def replace_with_retry(source: Path, destination: Path, attempts: int = 20) -> None:
@@ -319,8 +320,12 @@ class DateStore:
         self.mean, self.std = normalizer["mean"], normalizer["std"]
         self.id_to_code = {value: key for key, value in json.loads((directory / "stock_ids.json").read_text()).items()}
 
-    def verify_parts(self):
+    def verify_parts(self, splits=None):
+        """Hash only explicitly authorized partitions when ``splits`` is set."""
+        allowed = None if splits is None else ({splits} if isinstance(splits, str) else set(splits))
         for part in self.manifest["parts"]:
+            if allowed is not None and part["split"] not in allowed:
+                continue
             for name, expected in part["sha256"].items():
                 if file_hash(self.directory / name) != expected:
                     raise RuntimeError(f"Input hash mismatch: {name}")
@@ -381,7 +386,9 @@ def train(args) -> None:
     torch.manual_seed(args.seed)
     store = DateStore(args.data)
     print("Verifying dataset hashes...", flush=True)
-    store.verify_parts()
+    # The held-out Test arrays remain unopened until an immutable ensemble
+    # selection manifest exists.  Training may verify only pre-Test splits.
+    store.verify_parts({"train", "valid", "selection_valid"})
     config = Alpha360TransformerConfig(stock_embedding_width=args.stock_embedding_width)
     model = Alpha360CrossStockTransformer(store.manifest["stock_count"], config).to(device)
     optimizer = torch.optim.AdamW(
@@ -412,7 +419,7 @@ def train(args) -> None:
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "feature_count": 360, "target_scale": config.target_scale,
-        "test_policy": "not used for early stopping; evaluate once after best-valid checkpoint",
+        "test_policy": "locked; train mode never verifies, loads, or evaluates test arrays",
         "execution": "open/close labels only; no fill/fee/backtest claims",
         "script_sha256": file_hash(Path(__file__)),
         "model_code_sha256": file_hash(ROOT / "roll" / "alpha360_cross_stock.py"),
@@ -429,9 +436,13 @@ def train(args) -> None:
                     "scheduler", "selection_metric", "date_batch_size",
                     "script_sha256", "model_code_sha256"):
             if old_config[key] != configuration[key]:
-                if (key == "script_sha256" and args.resume_io_repair
-                        and old_config[key] == PRE_IO_REPAIR_SCRIPT_SHA256):
-                    continue
+                if key == "script_sha256":
+                    if (args.resume_io_repair
+                            and old_config[key] == PRE_IO_REPAIR_SCRIPT_SHA256):
+                        continue
+                    if (args.resume_blind_protocol_migration
+                            and old_config[key] == PRE_BLIND_PROTOCOL_SCRIPT_SHA256):
+                        continue
                 raise RuntimeError(f"Resume configuration mismatch: {key}")
         state = torch.load(args.output / "last_checkpoint.pt", map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
@@ -447,12 +458,23 @@ def train(args) -> None:
             "previous_script_sha256": old_config["script_sha256"],
             "current_script_sha256": configuration["script_sha256"],
             "io_repair": bool(args.resume_io_repair),
-            "note": "atomic publication retry; model, data, optimizer and loss unchanged",
+            "blind_protocol_migration": bool(args.resume_blind_protocol_migration),
+            "note": (
+                "blind protocol migration: model, data, optimizer and loss unchanged; "
+                "automatic held-out Test evaluation removed"
+                if args.resume_blind_protocol_migration else
+                "atomic publication retry; model, data, optimizer and loss unchanged"
+            ),
         }]
         if args.resume_io_repair:
             archive = args.output / "configuration_before_io_repair.json"
             if archive.exists():
                 raise FileExistsError("I/O repair was already recorded; use ordinary --resume")
+            write_json(archive, old_config)
+        if args.resume_blind_protocol_migration:
+            archive = args.output / "configuration_before_blind_protocol_migration.json"
+            if archive.exists():
+                raise FileExistsError("Blind-protocol migration was already recorded")
             write_json(archive, old_config)
         torch.set_rng_state(state["torch_rng"].cpu())
         if device.type == "cuda":
@@ -643,7 +665,7 @@ def train(args) -> None:
     best_state = torch.load(args.output / selected_filename, map_location=device, weights_only=False)
     model.load_state_dict(best_state["model"])
     summary = []
-    for split in ("valid", "selection_valid", "test"):
+    for split in ("valid", "selection_valid"):
         write_json(args.output / "status.json", {"status": "final_evaluation", "split": split, "pid": os.getpid()})
         summary.append({"split": split, **evaluate(split, collect=True)})
     pd.DataFrame(summary).to_csv(args.output / "summary.csv", index=False)
@@ -655,6 +677,8 @@ def train(args) -> None:
         "elapsed_seconds": previous_epoch_seconds + time.monotonic() - started,
         "elapsed_basis": "completed epochs plus final attempt/evaluation; excludes failed partial epoch and downtime",
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "test_read": False,
+        "test_policy": "locked until the frozen ensemble selection manifest exists",
         "backtest": "not performed; predictions/metrics are not tradable PnL",
     })
     print("TRAINING COMPLETED", flush=True)
@@ -691,10 +715,18 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--resume-io-repair", action="store_true",
                         help="Explicitly resume the identified pre-repair version after Windows atomic-write repair")
+    parser.add_argument(
+        "--resume-blind-protocol-migration", action="store_true",
+        help="Resume the pinned pre-migration checkpoint after removing automatic Test evaluation",
+    )
     parser.add_argument("--log-file", type=Path)
     args = parser.parse_args()
     if args.resume_io_repair and not args.resume:
         parser.error("--resume-io-repair requires --resume")
+    if args.resume_blind_protocol_migration and not args.resume:
+        parser.error("--resume-blind-protocol-migration requires --resume")
+    if args.resume_io_repair and args.resume_blind_protocol_migration:
+        parser.error("resume migrations are mutually exclusive")
     if args.mode in ("train", "pipeline") and args.output is None:
         parser.error("train/pipeline require --output")
     if min(args.epochs, args.export_days, args.date_batch_size, args.benchmark_days, args.warmup_epochs) < 1:

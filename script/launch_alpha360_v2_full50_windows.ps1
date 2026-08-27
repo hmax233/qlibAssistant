@@ -1,3 +1,4 @@
+param([switch]$ResumeBlindProtocolMigration)
 $ErrorActionPreference = 'Stop'
 
 $TaskName = 'Qlib_Alpha360_V2_Full50_260828'
@@ -10,6 +11,9 @@ $Log = Join-Path $Root 'train.log'
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     throw "Task $TaskName already exists; inspect it instead of starting a duplicate."
+}
+if ($ResumeBlindProtocolMigration -and -not (Test-Path (Join-Path $Output 'last_checkpoint.pt'))) {
+    throw 'Blind-protocol resume requested but last_checkpoint.pt is missing.'
 }
 
 $Arguments = @(
@@ -27,7 +31,11 @@ $Arguments = @(
     '--date-batch-size', '4',
     '--selection-metric', 'close1_close2_rank_ic',
     '--log-file', $Log
-) -join ' '
+)
+if ($ResumeBlindProtocolMigration) {
+    $Arguments += @('--resume', '--resume-blind-protocol-migration')
+}
+$Arguments = $Arguments -join ' '
 
 $Action = New-ScheduledTaskAction -Execute $Python -Argument $Arguments -WorkingDirectory $Root
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
@@ -42,7 +50,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Principal $Principal `
     -Settings $Settings `
-    -Description 'Alpha360 v2: trainable 64d stock embedding, MLP head, 3-epoch warmup, cosine decay, full 50 epochs.' | Out-Null
+    -Description 'Alpha360 v2 full 50 epochs; held-out Test remains locked until the frozen ensemble manifest.' | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State

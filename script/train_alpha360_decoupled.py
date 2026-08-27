@@ -83,8 +83,9 @@ class Trainer:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
         self.store = DateStore(args.data)
-        print("Verifying dataset hashes...", flush=True)
-        self.store.verify_parts()
+        if args.command == "train":
+            print("Verifying authorized pre-Test dataset hashes...", flush=True)
+            self.store.verify_parts({"train", "valid", "selection_valid"})
         self.config = Alpha360DecoupledConfig(stock_embedding_width=64, target_scale=args.target_scale)
         self.horizon_names = (HORIZON_NAMES if args.model_mode == "shared_four_head"
                               else (args.horizon,))
@@ -420,6 +421,10 @@ class Trainer:
         destination = self.args.output / "test_predictions.csv"
         if destination.exists():
             raise FileExistsError(destination)
+        # The frozen manifest and selected-horizon gate above must succeed
+        # before any held-out Test array is hashed or memory-mapped.
+        print("Selection manifest frozen; verifying held-out Test hashes...", flush=True)
+        self.store.verify_parts("test")
         frames, rows = [], []
         for name in selected_horizons:
             checkpoint = self.torch.load(
