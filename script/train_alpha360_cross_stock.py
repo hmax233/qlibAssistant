@@ -35,6 +35,39 @@ HORIZON_NAMES_FOR_CLI = (
     "open1_close2", "close1_open2", "open1_open2", "close1_close2",
 )
 
+
+def group_date_batches(iterator, batch_size):
+    """Group variable-size date cross-sections without mixing their stocks."""
+    group = []
+    for batch in iterator:
+        group.append(batch)
+        if len(group) == batch_size:
+            yield group
+            group = []
+    if group:
+        yield group
+
+
+def pad_date_batches(batches):
+    """Pad date cross-sections to [dates, max_stocks, ...] and return a mask."""
+    import numpy as np
+
+    if not batches:
+        raise ValueError("at least one date batch is required")
+    max_stocks = max(len(batch["stock_ids"]) for batch in batches)
+    feature_count = batches[0]["features"].shape[1]
+    features = np.zeros((len(batches), max_stocks, feature_count), dtype="float32")
+    labels = np.full((len(batches), max_stocks, 3), np.nan, dtype="float32")
+    stock_ids = np.zeros((len(batches), max_stocks), dtype="int64")
+    stock_mask = np.zeros((len(batches), max_stocks), dtype=bool)
+    for row, batch in enumerate(batches):
+        stocks = len(batch["stock_ids"])
+        features[row, :stocks] = batch["features"]
+        labels[row, :stocks] = batch["labels"]
+        stock_ids[row, :stocks] = batch["stock_ids"]
+        stock_mask[row, :stocks] = True
+    return features, stock_ids, labels, stock_mask
+
 # Explicit provenance for the Windows status-file sharing repair. This is not a
 # general permission to resume after arbitrary training-code changes.
 PRE_IO_REPAIR_SCRIPT_SHA256 = "a61606f4d5375914ebaf64e649cdcf65f6f84f634ea91b1eb7d67dd91f7ce7b2"
@@ -371,7 +404,7 @@ def train(args) -> None:
         "model": asdict(config), "data_manifest_sha256": file_hash(args.data / "manifest.json"),
         "segments": store.manifest["segments"], "seed": args.seed,
         "epochs": args.epochs, "early_stopping": False,
-        "gradient_accumulation_dates": args.accumulate_dates,
+        "date_batch_size": args.date_batch_size,
         "learning_rate": args.learning_rate, "min_learning_rate": args.min_learning_rate,
         "warmup_epochs": args.warmup_epochs, "warmup_start_factor": args.warmup_start_factor,
         "scheduler": "3-epoch linear warmup followed by cosine annealing",
@@ -393,7 +426,7 @@ def train(args) -> None:
         old_config = json.loads((args.output / "configuration.json").read_text())
         for key in ("model", "data_manifest_sha256", "seed", "learning_rate",
                     "min_learning_rate", "warmup_epochs", "warmup_start_factor",
-                    "scheduler", "selection_metric", "gradient_accumulation_dates",
+                    "scheduler", "selection_metric", "date_batch_size",
                     "script_sha256", "model_code_sha256"):
             if old_config[key] != configuration[key]:
                 if (key == "script_sha256" and args.resume_io_repair
@@ -431,21 +464,26 @@ def train(args) -> None:
     started = time.monotonic()
 
     def tensor_batch(batch):
-        return (
-            torch.from_numpy(batch["features"]).unsqueeze(0).to(device),
-            torch.from_numpy(batch["stock_ids"].astype("int64")).unsqueeze(0).to(device),
-            torch.from_numpy(batch["labels"]).unsqueeze(0).to(device) * config.target_scale,
-        )
+        features, ids, labels, mask = pad_date_batches([batch])
+        return (torch.from_numpy(features).to(device), torch.from_numpy(ids).to(device),
+                torch.from_numpy(labels).to(device) * config.target_scale,
+                torch.from_numpy(mask).to(device))
+
+    def tensor_date_batch(batches):
+        features, ids, labels, mask = pad_date_batches(batches)
+        return (torch.from_numpy(features).to(device), torch.from_numpy(ids).to(device),
+                torch.from_numpy(labels).to(device) * config.target_scale,
+                torch.from_numpy(mask).to(device))
 
     def evaluate(split, max_days=None, collect=False):
         model.eval()
         losses, day_rows, prediction_rows = [], [], []
         with torch.no_grad():
             for batch in store.iterate(split, max_days=max_days):
-                features, ids, labels = tensor_batch(batch)
+                features, ids, labels, mask = tensor_batch(batch)
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
-                    output = model(features, ids)
-                loss = joint_gaussian_nll(labels, output["leg_mean"], output["leg_cholesky"])
+                    output = model(features, ids, mask)
+                loss = joint_gaussian_nll(labels, output["leg_mean"], output["leg_cholesky"], mask)
                 if not torch.isfinite(loss):
                     raise RuntimeError(f"Nonfinite evaluation NLL: {split} {batch['date']}")
                 if np.isfinite(batch["labels"]).all(axis=1).any():
@@ -493,49 +531,38 @@ def train(args) -> None:
 
     def train_epoch(epoch, max_days=None):
         model.train()
-        optimizer.zero_grad(set_to_none=True)
         losses, duration, count = [], [], 0
-        pending = 0
         total_days = min(store.days("train"), max_days) if max_days else store.days("train")
-        for batch in store.iterate("train", seed=args.seed + epoch, max_days=max_days):
-            if not np.isfinite(batch["labels"]).all(axis=1).any():
+        iterator = store.iterate("train", seed=args.seed + epoch, max_days=max_days)
+        for batches in group_date_batches(iterator, args.date_batch_size):
+            usable = [batch for batch in batches if np.isfinite(batch["labels"]).all(axis=1).any()]
+            if not usable:
                 continue
             tick = time.monotonic()
-            features, ids, labels = tensor_batch(batch)
+            optimizer.zero_grad(set_to_none=True)
+            features, ids, labels, mask = tensor_date_batch(usable)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"):
-                output = model(features, ids)
-            loss = joint_gaussian_nll(labels, output["leg_mean"], output["leg_cholesky"])
+                output = model(features, ids, mask)
+            loss = joint_gaussian_nll(labels, output["leg_mean"], output["leg_cholesky"], mask)
             if not torch.isfinite(loss):
-                raise RuntimeError(f"Nonfinite training NLL at {batch['date']}")
-            scaler.scale(loss / args.accumulate_dates).backward()
-            pending += 1
-            if pending == args.accumulate_dates:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                pending = 0
-            count += 1
+                raise RuntimeError(f"Nonfinite training NLL at {[batch['date'] for batch in usable]}")
+            # Keep every date equally weighted when the final batch is smaller.
+            scaled_loss = loss * (len(usable) / args.date_batch_size)
+            scaler.scale(scaled_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            count += len(usable)
             losses.append(float(loss.detach()))
             duration.append(time.monotonic() - tick)
             if count % 25 == 0 or count == 1:
                 state = {"status": "training", "pid": os.getpid(), "epoch": epoch + 1,
-                         "date_batches": count, "date_batches_total": total_days,
-                         "recent_seconds_per_date": float(np.mean(duration[-20:])),
+                         "processed_dates": count, "training_dates_total": total_days,
+                         "date_batch_size": args.date_batch_size,
+                         "recent_seconds_per_date": float(np.sum(duration[-20:]) /
+                                                          min(count, 20 * args.date_batch_size)),
                          "updated": time.strftime("%Y-%m-%d %H:%M:%S")}
                 write_json(args.output / "status.json", state)
                 print("PROGRESS " + json.dumps(state), flush=True)
-        if pending:
-            scaler.unscale_(optimizer)
-            # Each date gets equal weight also in the final partial accumulation.
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    parameter.grad.mul_(args.accumulate_dates / pending)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
         if not losses:
             raise RuntimeError("No usable training labels")
         return float(np.mean(losses)), duration
@@ -547,10 +574,12 @@ def train(args) -> None:
         evaluate("valid", max_days=5)
         valid_seconds = (time.monotonic() - valid_started) / min(5, store.days("valid"))
         steady = float(np.median(durations[2:] or durations))
-        estimate = steady * store.days("train") + valid_seconds * store.days("valid")
+        train_steps = math.ceil(store.days("train") / args.date_batch_size)
+        estimate = steady * train_steps + valid_seconds * store.days("valid")
         write_json(args.output / "benchmark.json", {
-            "train_loss": loss, "timed_date_batches": len(durations),
-            "steady_seconds_per_date": steady, "valid_seconds_per_date": valid_seconds,
+            "train_loss": loss, "timed_optimizer_steps": len(durations),
+            "date_batch_size": args.date_batch_size,
+            "steady_seconds_per_optimizer_step": steady, "valid_seconds_per_date": valid_seconds,
             "estimated_epoch_seconds": estimate, "estimated_20_epochs_hours": estimate * 20 / 3600,
             "max_epochs_hours": estimate * args.epochs / 3600,
             "peak_cuda_memory_bytes": torch.cuda.max_memory_allocated() if device.type == "cuda" else None,
@@ -647,7 +676,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--learning-rate", type=float, default=0.0003)
-    parser.add_argument("--min-learning-rate", type=float, default=0.00002)
+    parser.add_argument("--min-learning-rate", type=float, default=0.000001)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--warmup-start-factor", type=float, default=1.0 / 3.0)
     parser.add_argument(
@@ -655,7 +684,7 @@ def main():
         choices=["nll_scaled_3leg", *[h + "_rank_ic" for h in HORIZON_NAMES_FOR_CLI]],
         default="close1_close2_rank_ic",
     )
-    parser.add_argument("--accumulate-dates", type=int, default=4)
+    parser.add_argument("--date-batch-size", type=int, default=4)
     parser.add_argument("--stock-embedding-width", type=int, default=64, help="0 disables identity for ablation")
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--benchmark-days", type=int, default=12)
@@ -668,7 +697,7 @@ def main():
         parser.error("--resume-io-repair requires --resume")
     if args.mode in ("train", "pipeline") and args.output is None:
         parser.error("train/pipeline require --output")
-    if min(args.epochs, args.export_days, args.accumulate_dates, args.benchmark_days, args.warmup_epochs) < 1:
+    if min(args.epochs, args.export_days, args.date_batch_size, args.benchmark_days, args.warmup_epochs) < 1:
         parser.error("counts must be positive")
     if args.warmup_epochs >= args.epochs:
         parser.error("warmup epochs must be smaller than total epochs")

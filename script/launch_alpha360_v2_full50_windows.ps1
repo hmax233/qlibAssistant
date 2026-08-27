@@ -20,10 +20,11 @@ $Arguments = @(
     '--threads', '4',
     '--epochs', '50',
     '--learning-rate', '0.0003',
-    '--min-learning-rate', '0.00002',
+    '--min-learning-rate', '0.000001',
     '--warmup-epochs', '3',
     '--warmup-start-factor', '0.3333333333333333',
     '--stock-embedding-width', '64',
+    '--date-batch-size', '4',
     '--selection-metric', 'close1_close2_rank_ic',
     '--log-file', $Log
 ) -join ' '

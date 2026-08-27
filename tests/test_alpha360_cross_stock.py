@@ -168,3 +168,21 @@ def test_nll_weights_dates_equally_not_stock_counts() -> None:
     first = joint_gaussian_nll(target[0], mean[0], factor[0])
     second = joint_gaussian_nll(target[1, :1], mean[1, :1], factor[1, :1])
     torch.testing.assert_close(actual, (first + second) / 2)
+
+
+def test_variable_date_cross_sections_are_padded_and_masked() -> None:
+    import numpy as np
+    from script.train_alpha360_cross_stock import pad_date_batches
+
+    batches = [
+        {"features": np.ones((3, 360), dtype="float32"),
+         "labels": np.ones((3, 3), dtype="float32"), "stock_ids": np.array([1, 2, 3])},
+        {"features": np.full((2, 360), 2, dtype="float32"),
+         "labels": np.full((2, 3), 2, dtype="float32"), "stock_ids": np.array([4, 5])},
+    ]
+    features, ids, labels, mask = pad_date_batches(batches)
+    assert features.shape == (2, 3, 360)
+    assert ids.tolist() == [[1, 2, 3], [4, 5, 0]]
+    assert mask.tolist() == [[True, True, True], [True, True, False]]
+    assert np.isnan(labels[1, 2]).all()
+    assert not features[1, 2].any()
