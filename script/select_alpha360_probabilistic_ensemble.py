@@ -66,7 +66,10 @@ def verify_reference(reference: dict, label: str, expected_path: Path | None = N
 def load_protocol(protocol: Path) -> tuple[dict, str]:
     protocol = protocol.expanduser().resolve()
     body = read_json(protocol)
-    required = {"segments", "data_manifest_sha256", "horizons", "experiments", "optimization"}
+    required = {
+        "segments", "data_manifest_sha256", "horizons", "experiments", "optimization",
+        "selection_scoring",
+    }
     missing = required - set(body)
     if missing:
         raise ValueError(f"Protocol missing required fields: {sorted(missing)}")
@@ -78,6 +81,91 @@ def load_protocol(protocol: Path) -> tuple[dict, str]:
     if len(experiment_ids) != len(body["experiments"]) or len(set(experiment_ids)) != len(experiment_ids):
         raise ValueError("Protocol experiment IDs are missing or duplicated")
     return body, sha256(protocol)
+
+
+def prediction_key_sha256(frame: pd.DataFrame) -> str:
+    """Hash sorted date/instrument keys with a cross-platform canonical encoding."""
+
+    keys = frame[KEYS].copy()
+    keys["datetime"] = pd.to_datetime(keys["datetime"]).dt.strftime("%Y-%m-%d")
+    keys["instrument"] = keys["instrument"].astype(str)
+    keys = keys.sort_values(KEYS).reset_index(drop=True)
+    payload = "".join(
+        keys["datetime"] + "," + keys["instrument"] + "\n"
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_selection_keys(
+    candidates: dict[str, Path], protocol_body: dict
+) -> tuple[pd.DataFrame, dict]:
+    """Freeze one identical, label-safe Selection row set for every candidate."""
+
+    policy = protocol_body.get("selection_scoring")
+    if not isinstance(policy, dict):
+        raise ValueError("Protocol selection_scoring must be an object")
+    required = {
+        "signal_start", "signal_end", "expected_days", "expected_rows",
+        "canonical_key_sha256",
+    }
+    missing = required - set(policy)
+    if missing:
+        raise ValueError(f"Protocol selection_scoring missing fields: {sorted(missing)}")
+    start = pd.Timestamp(policy["signal_start"])
+    end = pd.Timestamp(policy["signal_end"])
+    if start > end:
+        raise ValueError("selection_scoring signal_start is after signal_end")
+
+    canonical: pd.DataFrame | None = None
+    audit: dict[str, dict] = {}
+    for name, run in candidates.items():
+        path = run / "selection_valid_predictions.csv"
+        keys = pd.read_csv(path, usecols=KEYS)
+        if keys.duplicated(KEYS).any():
+            raise ValueError(f"{path} contains duplicate date/instrument rows")
+        keys["datetime"] = pd.to_datetime(keys["datetime"])
+        raw_start = keys["datetime"].min()
+        raw_end = keys["datetime"].max()
+        scoring = keys.loc[
+            keys["datetime"].between(start, end, inclusive="both"), KEYS
+        ].sort_values(KEYS).reset_index(drop=True)
+        if scoring.empty:
+            raise ValueError(f"{name} has no rows in the frozen Selection scoring range")
+        if canonical is None:
+            canonical = scoring
+        elif not canonical.equals(scoring):
+            raise RuntimeError(
+                f"Candidate {name!r} does not have the identical frozen Selection key set"
+            )
+        audit[name] = {
+            "raw_rows": int(len(keys)),
+            "raw_days": int(keys["datetime"].nunique()),
+            "raw_start": raw_start.strftime("%Y-%m-%d"),
+            "raw_end": raw_end.strftime("%Y-%m-%d"),
+            "scored_rows": int(len(scoring)),
+            "scored_days": int(scoring["datetime"].nunique()),
+            "excluded_rows_outside_scoring_range": int(len(keys) - len(scoring)),
+        }
+    assert canonical is not None
+    actual = {
+        "signal_start": canonical["datetime"].min().strftime("%Y-%m-%d"),
+        "signal_end": canonical["datetime"].max().strftime("%Y-%m-%d"),
+        "days": int(canonical["datetime"].nunique()),
+        "rows": int(len(canonical)),
+        "canonical_key_sha256": prediction_key_sha256(canonical),
+    }
+    expected = {
+        "signal_start": str(policy["signal_start"]),
+        "signal_end": str(policy["signal_end"]),
+        "days": int(policy["expected_days"]),
+        "rows": int(policy["expected_rows"]),
+        "canonical_key_sha256": str(policy["canonical_key_sha256"]),
+    }
+    if actual != expected:
+        raise RuntimeError(
+            f"Frozen Selection key set mismatch: expected {expected}, got {actual}"
+        )
+    return canonical, {**actual, "candidate_audit": audit}
 
 
 def _configuration_value(configuration: dict, *names: str):
@@ -337,6 +425,21 @@ def validate_frozen_selection_manifest(
         if expected_prediction_hash != current["selection_valid_predictions"]["sha256"]:
             raise RuntimeError(f"Candidate {name!r} Selection prediction hash is not frozen")
         normalized[name] = current
+    current_keys, current_key_audit = canonical_selection_keys(candidates, protocol_body)
+    if manifest.get("selection_scoring_keys") != current_key_audit:
+        raise RuntimeError("Frozen Selection scoring key set changed after ensemble selection")
+    selected_prediction_path = Path(
+        manifest.get("selection_valid_ensemble_predictions", "")
+    ).expanduser().resolve()
+    selected_prediction = pd.read_csv(selected_prediction_path, usecols=KEYS)
+    selected_prediction["datetime"] = pd.to_datetime(selected_prediction["datetime"])
+    selected_prediction = selected_prediction.sort_values(KEYS).reset_index(drop=True)
+    if not current_keys.equals(selected_prediction):
+        raise RuntimeError("Selected ensemble predictions do not use the frozen Selection keys")
+    if sha256(selected_prediction_path) != manifest.get(
+        "selection_valid_ensemble_predictions_sha256"
+    ):
+        raise RuntimeError("Selected ensemble prediction hash changed after freeze")
     selected_candidates: set[str] = set()
     for horizon in HORIZONS:
         selection = selections[horizon]
@@ -463,13 +566,21 @@ def supports_horizon(run: Path, split: str, horizon: str) -> bool:
 
 
 def align_components(
-    candidates: dict[str, Path], split: str, horizon: str, component_names: list[str]
+    candidates: dict[str, Path], split: str, horizon: str, component_names: list[str],
+    required_keys: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Path]]:
     merged: pd.DataFrame | None = None
     paths: dict[str, Path] = {}
     actual_column = f"{horizon}_actual_return"
     for name in component_names:
         frame, path = load_prediction(candidates[name], split, horizon)
+        if required_keys is not None:
+            frame = required_keys.merge(frame, on=KEYS, how="left", validate="one_to_one")
+            value_columns = [column for column in required_columns(horizon) if column not in KEYS]
+            if frame[value_columns].isna().all(axis=1).any():
+                raise RuntimeError(
+                    f"Candidate {name!r} lacks rows from the frozen Selection key set"
+                )
         paths[name] = path
         renamed = frame.rename(columns={
             f"{horizon}_log_mean": f"{name}__mean",
@@ -614,12 +725,16 @@ def score(frame: pd.DataFrame, component_frame: pd.DataFrame, names: list[str]) 
     return result
 
 
-def ranked_candidate_names(candidates: dict[str, Path], horizon: str) -> tuple[list[str], dict[str, dict]]:
+def ranked_candidate_names(
+    candidates: dict[str, Path], horizon: str, required_keys: pd.DataFrame
+) -> tuple[list[str], dict[str, dict]]:
     metrics: dict[str, dict] = {}
     for name in candidates:
         if not supports_horizon(candidates[name], "selection_valid", horizon):
             continue
-        source, _ = align_components(candidates, "selection_valid", horizon, [name])
+        source, _ = align_components(
+            candidates, "selection_valid", horizon, [name], required_keys
+        )
         prediction = mixture_predictions(source, [name])
         metrics[name] = score(prediction, source, [name])
     eligible = [name for name, metric in metrics.items()
@@ -658,6 +773,7 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
         name: validate_candidate_manifest(name, path, protocol_body)
         for name, path in candidates.items()
     }
+    selection_keys, selection_key_audit = canonical_selection_keys(candidates, protocol_body)
     selections: dict[str, dict] = {}
     file_hashes: dict[str, str] = {
         f"{name}:selection_valid_predictions": value["selection_valid_predictions"]["sha256"]
@@ -665,7 +781,7 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
     }
     selected_prediction_frames: list[pd.DataFrame] = []
     for horizon in protocol_body["horizons"]:
-        eligible, individual = ranked_candidate_names(candidates, horizon)
+        eligible, individual = ranked_candidate_names(candidates, horizon, selection_keys)
         if not eligible:
             raise RuntimeError(f"No positive selection_valid RankIC candidate for {horizon}")
         groups = [eligible[:1]]
@@ -680,7 +796,9 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
         groups = unique_groups
         alternatives = []
         for names in groups:
-            source, paths = align_components(candidates, "selection_valid", horizon, names)
+            source, paths = align_components(
+                candidates, "selection_valid", horizon, names, selection_keys
+            )
             prediction = mixture_predictions(source, names)
             metrics = score(prediction, source, names)
             alternatives.append({"components": names, "metrics": metrics})
@@ -688,7 +806,7 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
                 file_hashes[f"{name}:selection_valid_predictions"] = sha256(path)
         selected = max(alternatives, key=combination_key)
         selected_source, _ = align_components(
-            candidates, "selection_valid", horizon, selected["components"]
+            candidates, "selection_valid", horizon, selected["components"], selection_keys
         )
         selected_prediction_frames.append(standardize_horizon(
             mixture_predictions(selected_source, selected["components"]), horizon
@@ -719,6 +837,7 @@ def select(protocol: Path, candidates: dict[str, Path], output: Path) -> None:
             "protocol_segments": protocol_body["segments"],
             "protocol_data_manifest_sha256": protocol_body["data_manifest_sha256"],
             "selection_split": "selection_valid",
+            "selection_scoring_keys": selection_key_audit,
             "test_files_read": False,
             "candidates": {name: str(path) for name, path in candidates.items()},
             "candidate_freeze": candidate_freeze,

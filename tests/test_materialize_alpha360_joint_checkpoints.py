@@ -23,6 +23,7 @@ from script.materialize_alpha360_joint_checkpoints import (
 )
 from script.select_alpha360_probabilistic_ensemble import (
     evaluate as evaluate_ensemble,
+    prediction_key_sha256,
     select as select_ensemble,
 )
 
@@ -287,6 +288,13 @@ def test_existing_selector_evaluate_reads_test_from_same_candidate_directory(
             "date_batch_size": configuration["date_batch_size"],
             "seed": configuration["seed"],
             "target_scale": configuration["target_scale"],
+        },
+        "selection_scoring": {
+            "signal_start": str(pd.to_datetime(frame["datetime"]).min().date()),
+            "signal_end": str(pd.to_datetime(frame["datetime"]).max().date()),
+            "expected_days": int(pd.to_datetime(frame["datetime"]).nunique()),
+            "expected_rows": int(len(frame)),
+            "canonical_key_sha256": prediction_key_sha256(frame),
         },
     })
     manifest = tmp_path / "selection" / "frozen_selection.json"

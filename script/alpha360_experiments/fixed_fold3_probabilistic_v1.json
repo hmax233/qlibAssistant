@@ -83,6 +83,15 @@
     "rule": "For every model and horizon, retain the epoch with the highest daily cross-sectional RankIC for that horizon.",
     "test_access": "forbidden"
   },
+  "selection_scoring": {
+    "signal_start": "2025-09-17",
+    "signal_end": "2026-02-11",
+    "expected_days": 98,
+    "expected_rows": 98000,
+    "canonical_key_sha256": "50803d9c3c1a56c979766be1a781f4e9e9c712885681857558923cf15473ab9e",
+    "key_policy": "All candidates are scored on exactly these identical date/instrument keys.",
+    "boundary_reason": "2026-02-11 is the final signal date whose T+2 realized label remains before the held-out Test period; later legacy E0 rows are audited but excluded."
+  },
   "ensemble_selection": {
     "split": "selection_valid",
     "candidate_models_per_horizon": [

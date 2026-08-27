@@ -11,6 +11,7 @@ from script.select_alpha360_probabilistic_ensemble import (
     evaluate,
     exact_mixture_nll,
     mixture_predictions,
+    prediction_key_sha256,
     select,
     sha256,
 )
@@ -53,12 +54,20 @@ def candidate_frame(signal: np.ndarray, actual: np.ndarray) -> pd.DataFrame:
 
 
 def write_protocol(path: Path, candidate_names: list[str], data_hash: str) -> None:
+    keys = candidate_frame(np.zeros(6), np.zeros(6))[["datetime", "instrument"]]
     path.write_text(json.dumps({
         "segments": SEGMENTS,
         "data_manifest_sha256": data_hash,
         "horizons": list(HORIZONS),
         "experiments": [{"id": name} for name in candidate_names],
         "optimization": OPTIMIZATION,
+        "selection_scoring": {
+            "signal_start": "2026-01-01",
+            "signal_end": "2026-01-02",
+            "expected_days": 2,
+            "expected_rows": 6,
+            "canonical_key_sha256": prediction_key_sha256(keys),
+        },
     }), encoding="utf-8")
 
 
@@ -256,6 +265,40 @@ def test_selection_never_reads_test_before_manifest(tmp_path: Path) -> None:
         assert name in metrics
     selection_predictions = pd.read_csv(output.parent / "selection_valid_ensemble_predictions.csv")
     assert all(f"{horizon}_expected_return" in selection_predictions for horizon in HORIZONS)
+
+
+def test_selection_excludes_legacy_rows_crossing_the_test_label_boundary(
+    tmp_path: Path,
+) -> None:
+    actual = np.array([-0.03, 0.00, 0.03, -0.02, 0.01, 0.04])
+    e0, strict = tmp_path / "E0_joint_three_leg", tmp_path / "strict"
+    data_manifest = tmp_path / "data_manifest.json"
+    data_manifest.write_text("{}", encoding="utf-8")
+    write_joint_e0_run(e0, actual, actual, data_manifest)
+    write_run(strict, actual, actual, data_manifest)
+
+    selection_path = e0 / "selection_valid_predictions.csv"
+    frame = pd.read_csv(selection_path)
+    extra = frame.iloc[:3].copy()
+    extra["datetime"] = "2026-02-12"
+    pd.concat([frame, extra], ignore_index=True).to_csv(selection_path, index=False)
+    audit_path = e0 / "materialization_manifest.json"
+    audit = json.loads(audit_path.read_text())
+    audit["prediction_output"] = reference(selection_path)
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    protocol = tmp_path / "protocol.json"
+    write_protocol(protocol, ["E0_joint_three_leg", "strict"], sha256(data_manifest))
+    output = tmp_path / "selection" / "selection_manifest.json"
+    select(protocol, {"E0_joint_three_leg": e0, "strict": strict}, output)
+    manifest = json.loads(output.read_text())
+    e0_audit = manifest["selection_scoring_keys"]["candidate_audit"]["E0_joint_three_leg"]
+    assert e0_audit["raw_rows"] == 9
+    assert e0_audit["scored_rows"] == 6
+    assert e0_audit["excluded_rows_outside_scoring_range"] == 3
+    selected = pd.read_csv(output.parent / "selection_valid_ensemble_predictions.csv")
+    assert len(selected) == 6
+    assert selected["datetime"].max() == "2026-01-02"
 
 
 def test_selection_refuses_overwrite(tmp_path: Path) -> None:
