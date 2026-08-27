@@ -49,6 +49,13 @@ def test_cross_market_protocol_freezes_all_seven_candidates_and_e6_data() -> Non
     assert optimization["gradient_accumulation"] is False
     assert optimization["gradient_clipping"] is False
     assert optimization["minimum_learning_rate"] == 1e-6
+    scoring = protocol["selection_scoring"]
+    assert scoring["canonical_key_sha256"] == (
+        "aece545199bca9bd0bb331a160ed390e8577d12e37f8f76be4625c5bc87670e1"
+    )
+    assert scoring["checksum_amendment"]["previous_erroneous_sha256"] == (
+        "50803d9c3c1a56c979766be1a781f4e9e9c712885681857558923cf15473ab9e"
+    )
 
 
 def test_e6_worker_waits_for_selection_and_freezes_before_test() -> None:

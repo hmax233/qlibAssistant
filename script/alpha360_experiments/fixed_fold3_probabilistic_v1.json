@@ -88,9 +88,15 @@
     "signal_end": "2026-02-11",
     "expected_days": 98,
     "expected_rows": 98000,
-    "canonical_key_sha256": "50803d9c3c1a56c979766be1a781f4e9e9c712885681857558923cf15473ab9e",
+    "canonical_key_sha256": "aece545199bca9bd0bb331a160ed390e8577d12e37f8f76be4625c5bc87670e1",
     "key_policy": "All candidates are scored on exactly these identical date/instrument keys.",
-    "boundary_reason": "2026-02-11 is the final signal date whose T+2 realized label remains before the held-out Test period; later legacy E0 rows are audited but excluded."
+    "boundary_reason": "2026-02-11 is the final signal date whose T+2 realized label remains before the held-out Test period; later legacy E0 rows are audited but excluded.",
+    "checksum_amendment": {
+      "amended_at": "2026-08-28T06:45:00+08:00",
+      "previous_erroneous_sha256": "50803d9c3c1a56c979766be1a781f4e9e9c712885681857558923cf15473ab9e",
+      "reason": "The preregistered checksum was manually copied incorrectly. Before any Test access, E0 v1, E0 v2, and all E1-E5 candidates were independently recomputed with the frozen canonical encoder and all produced the amended hash.",
+      "evidence": "98 dates, exactly 1000 instruments per date, 98000 keys, and 1103 unique instruments across dynamic CSI1000 membership. Dates, rows, universe policy, labels, models, metrics, and selection rules were not changed."
+    }
   },
   "ensemble_selection": {
     "split": "selection_valid",
