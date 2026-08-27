@@ -145,7 +145,6 @@ def render(histories: dict[str, pd.DataFrame], output: Path) -> pd.DataFrame:
         axis.grid(alpha=0.2)
     handles, labels = axes[0, 0].get_legend_handles_labels()
     figure.legend(handles, labels, loc="outside upper center", ncol=4)
-    figure.suptitle("Alpha360 E0–E6 training and validation curves", fontsize=16)
     figure.savefig(output / "training_curves.png", dpi=160)
     plt.close(figure)
 
