@@ -1,0 +1,68 @@
+{
+  "protocol_version": 1,
+  "protocol_name": "alpha360_fixed_fold3_probabilistic_cross_market_v1",
+  "frozen_at": "2026-08-28",
+  "purpose": "Pre-register the E6 A+US candidate before any E0-E5 held-out Test result is inspected.",
+  "a_share_universe": "csi1000 point-in-time constituents",
+  "us_input_universe": "bounded current S&P 500 universe with survivorship bias disclosed",
+  "segments": {
+    "train": ["2015-04-17", "2025-04-16"],
+    "valid": ["2025-04-17", "2025-09-16"],
+    "selection_valid": ["2025-09-17", "2026-02-16"],
+    "test": ["2026-02-17", "2026-07-17"]
+  },
+  "horizons": [
+    "open1_close2",
+    "close1_open2",
+    "open1_open2",
+    "close1_close2"
+  ],
+  "additional_experiment": {
+    "id": "E6_a_us_four_head",
+    "model": "independent_A_and_US_temporal_encoders_then_cross_market_attention",
+    "outputs": "four A-share independent Gaussian heads",
+    "same_calendar_day_us_close_allowed": false,
+    "selection_rule": "one valid-RankIC checkpoint per horizon"
+  },
+  "optimization": {
+    "epochs": 50,
+    "early_stopping": false,
+    "optimizer": "AdamW",
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "warmup_epochs": 3,
+    "scheduler_after_warmup": "CosineAnnealingLR",
+    "minimum_learning_rate": 0.000001,
+    "date_batch_size": 4,
+    "gradient_accumulation": false,
+    "gradient_clipping": false,
+    "seed": 20260827
+  },
+  "ensemble_selection": {
+    "split": "selection_valid",
+    "candidate_models_per_horizon": [
+      "E0 horizon-specific valid checkpoint",
+      "E1 horizon-specific valid checkpoint",
+      "matching E2-E5 single-horizon valid checkpoint",
+      "E6 horizon-specific valid checkpoint"
+    ],
+    "candidate_combinations": [
+      "best eligible single model",
+      "equal-weight best two eligible models",
+      "equal-weight all eligible models"
+    ],
+    "eligibility": "selection_valid RankIC must be finite and greater than zero",
+    "primary_metric": "selection_valid daily cross-sectional RankIC",
+    "tie_breakers": [
+      "higher selection_valid RankICIR",
+      "lower selection_valid Gaussian NLL",
+      "fewer component models"
+    ],
+    "test_access": "forbidden until a new E0-E6 selection manifest with hashes is written"
+  },
+  "final_evaluation": {
+    "split": "test",
+    "read_once_after_selection_freeze": true,
+    "strict_backtest": "same execution, fee, slippage, limit and board rules as E0-E5"
+  }
+}
