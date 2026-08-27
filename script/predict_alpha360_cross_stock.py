@@ -84,7 +84,9 @@ def main(args):
     normalized = (features - normalizer["mean"]) / normalizer["std"]
     normalized[~np.isfinite(normalized)] = 0
     ids = np.asarray([stock_ids.get(code, 0) for code in codes], dtype="int64")
-    checkpoint = torch.load(args.run / "best_model.pt", map_location="cpu", weights_only=False)
+    checkpoint_name = args.checkpoint or status.get("selected_checkpoint") or "best_model.pt"
+    checkpoint_path = args.run / checkpoint_name
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = Alpha360TransformerConfig(**checkpoint["configuration"]["model"])
     model = Alpha360CrossStockTransformer(len(stock_ids), config)
     model.load_state_dict(checkpoint["model"])
@@ -116,7 +118,10 @@ def main(args):
         "uses_future_prices": False, "pool": args.pool, "stocks": len(frame), "mainboard_stocks": len(mainboard),
         "unknown_stock_ids": [code for code, idx in zip(codes, ids) if idx == 0],
         "unknown_identity_policy": "reserved all-zero embedding; explicitly flagged",
-        "checkpoint_sha256": file_hash(args.run / "best_model.pt"), "best_epoch": checkpoint["epoch"],
+        "checkpoint": checkpoint_name, "checkpoint_sha256": file_hash(checkpoint_path),
+        "best_epoch": checkpoint["epoch"],
+        "selection_metric": checkpoint.get("selection_metric"),
+        "selection_value": checkpoint.get("selection_value"),
         "segments": checkpoint["configuration"]["segments"], "device": args.device,
         "ranking_horizon": args.rank_horizon, "rank_key": "expected ordinary return",
         "caveat": "experimental, no event_guard/market gate/execution/cost filters; not a live buy instruction",
@@ -131,6 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--date", default="latest")
     parser.add_argument("--pool", default="csi1000")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--checkpoint", help="Checkpoint filename inside --run; defaults to status-selected checkpoint")
     parser.add_argument("--names-csv", type=Path)
     parser.add_argument("--rank-horizon", choices=["open1_close2", "close1_open2", "open1_open2", "close1_close2"], default="close1_close2")
     parser.add_argument("--output", type=Path, required=True)

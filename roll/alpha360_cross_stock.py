@@ -139,7 +139,8 @@ class Alpha360TransformerConfig:
     cross_section_layers: int = 2
     attention_heads: int = 4
     feedforward_width: int = 256
-    stock_embedding_width: int = 16
+    stock_embedding_width: int = 64
+    output_head_width: int = 128
     dropout: float = 0.10
     identity_seed: int = 20260827
     target_scale: float = 100.0
@@ -174,7 +175,7 @@ class Alpha360CrossStockTransformer(nn.Module):
         generator = torch.Generator(device="cpu").manual_seed(cfg.identity_seed)
         identity = torch.randn(stock_count + 1, cfg.stock_embedding_width, generator=generator) * 0.02
         identity[0].zero_()  # reserved for unknown/padding
-        self.stock_identity = nn.Embedding.from_pretrained(identity, freeze=True, padding_idx=0)
+        self.stock_identity = nn.Embedding.from_pretrained(identity, freeze=False, padding_idx=0)
         self.identity_fusion = nn.Sequential(
             nn.Linear(cfg.model_width + cfg.stock_embedding_width, cfg.model_width),
             nn.LayerNorm(cfg.model_width),
@@ -192,8 +193,13 @@ class Alpha360CrossStockTransformer(nn.Module):
         self.cross_section_encoder = nn.TransformerEncoder(
             cross_layer, num_layers=cfg.cross_section_layers, enable_nested_tensor=False
         )
-        self.output_norm = nn.LayerNorm(cfg.model_width)
-        self.distribution_head = nn.Linear(cfg.model_width, 9)
+        self.distribution_head = nn.Sequential(
+            nn.LayerNorm(cfg.model_width),
+            nn.Linear(cfg.model_width, cfg.output_head_width),
+            nn.GELU(),
+            nn.Dropout(cfg.dropout),
+            nn.Linear(cfg.output_head_width, 9),
+        )
 
     def forward(
         self,
@@ -217,7 +223,7 @@ class Alpha360CrossStockTransformer(nn.Module):
         stock_state = self.cross_section_encoder(
             stock_state, src_key_padding_mask=padding_mask
         )
-        raw = self.distribution_head(self.output_norm(stock_state))
+        raw = self.distribution_head(stock_state)
         # Keep small variances/covariances and the probability head in float32
         # even when the encoders use CUDA BF16/FP16 autocast.
         with torch.autocast(device_type=raw.device.type, enabled=False):

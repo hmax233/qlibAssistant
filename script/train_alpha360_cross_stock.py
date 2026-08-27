@@ -2,7 +2,7 @@
 """Export Alpha360, train a cross-stock probabilistic Transformer, or benchmark.
 
 Example: python script/train_alpha360_cross_stock.py pipeline --data DATA --output RUN
-The default is Fixed Fold3/120m, raw log-return targets, and frozen stock IDs.
+The default is Fixed Fold3/120m, raw log-return targets, and trainable stock IDs.
 This entry point never executes real trades or changes existing recorders.
 """
 
@@ -31,6 +31,9 @@ SEGMENTS = {
     "selection_valid": ["2025-09-17", "2026-02-16"],
     "test": ["2026-02-17", "2026-07-17"],
 }
+HORIZON_NAMES_FOR_CLI = (
+    "open1_close2", "close1_open2", "open1_open2", "close1_close2",
+)
 
 # Explicit provenance for the Windows status-file sharing repair. This is not a
 # general permission to resume after arbitrary training-code changes.
@@ -352,13 +355,27 @@ def train(args) -> None:
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate, weight_decay=1e-4,
     )
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=args.warmup_start_factor, end_factor=1.0,
+        total_iters=args.warmup_epochs,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - args.warmup_epochs, eta_min=args.min_learning_rate,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[args.warmup_epochs],
+    )
     amp_dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
     configuration = {
         "model": asdict(config), "data_manifest_sha256": file_hash(args.data / "manifest.json"),
         "segments": store.manifest["segments"], "seed": args.seed,
-        "epochs": args.epochs, "patience": args.patience, "gradient_accumulation_dates": args.accumulate_dates,
-        "learning_rate": args.learning_rate, "device": str(device),
+        "epochs": args.epochs, "early_stopping": False,
+        "gradient_accumulation_dates": args.accumulate_dates,
+        "learning_rate": args.learning_rate, "min_learning_rate": args.min_learning_rate,
+        "warmup_epochs": args.warmup_epochs, "warmup_start_factor": args.warmup_start_factor,
+        "scheduler": "3-epoch linear warmup followed by cosine annealing",
+        "selection_metric": args.selection_metric, "device": str(device),
         "gpu": torch.cuda.get_device_name(0) if device.type == "cuda" else None,
         "parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "feature_count": 360, "target_scale": config.target_scale,
@@ -370,10 +387,14 @@ def train(args) -> None:
         "autocast_dtype": str(amp_dtype) if device.type == "cuda" else "float32",
     }
     history, first_epoch, best, stale = [], 0, float("inf"), 0
+    best_rank_ic = {horizon: -float("inf") for horizon in HORIZON_NAMES}
     previous_epoch_seconds = 0.0
     if args.resume:
         old_config = json.loads((args.output / "configuration.json").read_text())
-        for key in ("model", "data_manifest_sha256", "seed", "learning_rate", "gradient_accumulation_dates", "script_sha256", "model_code_sha256"):
+        for key in ("model", "data_manifest_sha256", "seed", "learning_rate",
+                    "min_learning_rate", "warmup_epochs", "warmup_start_factor",
+                    "scheduler", "selection_metric", "gradient_accumulation_dates",
+                    "script_sha256", "model_code_sha256"):
             if old_config[key] != configuration[key]:
                 if (key == "script_sha256" and args.resume_io_repair
                         and old_config[key] == PRE_IO_REPAIR_SCRIPT_SHA256):
@@ -382,8 +403,10 @@ def train(args) -> None:
         state = torch.load(args.output / "last_checkpoint.pt", map_location=device, weights_only=False)
         model.load_state_dict(state["model"])
         optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
         scaler.load_state_dict(state["scaler"])
         first_epoch, best, stale = state["epoch"], state["best"], state["stale"]
+        best_rank_ic = state["best_rank_ic"]
         history = state["history"]
         previous_epoch_seconds = sum(row["epoch_seconds"] for row in history)
         configuration["resume_events"] = old_config.get("resume_events", []) + [{
@@ -538,33 +561,57 @@ def train(args) -> None:
 
     for epoch in range(first_epoch, args.epochs):
         epoch_started = time.monotonic()
+        epoch_learning_rate = optimizer.param_groups[0]["lr"]
         train_loss, _ = train_epoch(epoch)
         valid = evaluate("valid")
         improved = valid["nll_scaled_3leg"] < best
         if improved:
             best, stale = valid["nll_scaled_3leg"], 0
-            temporary = args.output / "best_model.pt.tmp"
-            torch.save({"model": model.state_dict(), "configuration": configuration, "epoch": epoch + 1}, temporary)
-            replace_with_retry(temporary, args.output / "best_model.pt")
+            payload = {"model": model.state_dict(), "configuration": configuration,
+                       "epoch": epoch + 1, "selection_metric": "nll_scaled_3leg",
+                       "selection_value": best}
+            for filename in ("best_model.pt", "best_nll_model.pt"):
+                temporary = args.output / (filename + ".tmp")
+                torch.save(payload, temporary)
+                replace_with_retry(temporary, args.output / filename)
         else:
             stale += 1
+        for horizon in HORIZON_NAMES:
+            key = horizon + "_rank_ic"
+            value = valid[key]
+            if np.isfinite(value) and value > best_rank_ic[horizon]:
+                best_rank_ic[horizon] = value
+                filename = f"best_{horizon}_rank_ic_model.pt"
+                temporary = args.output / (filename + ".tmp")
+                torch.save({"model": model.state_dict(), "configuration": configuration,
+                            "epoch": epoch + 1, "selection_metric": key,
+                            "selection_value": value}, temporary)
+                replace_with_retry(temporary, args.output / filename)
         history.append({"epoch": epoch + 1, "train_nll": train_loss, **valid,
+                        "learning_rate": epoch_learning_rate,
                         "epoch_seconds": time.monotonic() - epoch_started, "best_valid_nll": best})
+        scheduler.step()
         pd.DataFrame(history).to_csv(args.output / "epoch_metrics.csv", index=False)
         snapshot = {"epoch": epoch + 1, "model": model.state_dict(), "optimizer": optimizer.state_dict(),
-                    "scaler": scaler.state_dict(), "best": best, "stale": stale, "history": history,
+                    "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                    "best": best, "best_rank_ic": best_rank_ic, "stale": stale, "history": history,
                     "torch_rng": torch.get_rng_state(),
                     "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}
         temporary = args.output / "last_checkpoint.pt.tmp"
         torch.save(snapshot, temporary)
         replace_with_retry(temporary, args.output / "last_checkpoint.pt")
+        temporary = args.output / "last_model.pt.tmp"
+        torch.save({"model": model.state_dict(), "configuration": configuration,
+                    "epoch": epoch + 1, "selection_metric": "last_epoch",
+                    "selection_value": epoch + 1}, temporary)
+        replace_with_retry(temporary, args.output / "last_model.pt")
         print("EPOCH " + json.dumps(history[-1]), flush=True)
-        if stale >= args.patience or (args.output / "STOP_AFTER_EPOCH").exists():
-            if (args.output / "STOP_AFTER_EPOCH").exists():
-                write_json(args.output / "status.json", {"status": "paused", "epoch": epoch + 1, "resumable": True})
-                return
-            break
-    best_state = torch.load(args.output / "best_model.pt", map_location=device, weights_only=False)
+        if (args.output / "STOP_AFTER_EPOCH").exists():
+            write_json(args.output / "status.json", {"status": "paused", "epoch": epoch + 1, "resumable": True})
+            return
+    selected_filename = ("best_nll_model.pt" if args.selection_metric == "nll_scaled_3leg"
+                         else f"best_{args.selection_metric}_model.pt")
+    best_state = torch.load(args.output / selected_filename, map_location=device, weights_only=False)
     model.load_state_dict(best_state["model"])
     summary = []
     for split in ("valid", "selection_valid", "test"):
@@ -573,6 +620,9 @@ def train(args) -> None:
     pd.DataFrame(summary).to_csv(args.output / "summary.csv", index=False)
     write_json(args.output / "status.json", {
         "status": "completed", "best_epoch": best_state["epoch"],
+        "selected_checkpoint": selected_filename,
+        "selection_metric": best_state["selection_metric"],
+        "selection_value": best_state["selection_value"],
         "elapsed_seconds": previous_epoch_seconds + time.monotonic() - started,
         "elapsed_basis": "completed epochs plus final attempt/evaluation; excludes failed partial epoch and downtime",
         "finished": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -595,11 +645,18 @@ def main():
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--learning-rate", type=float, default=0.0003)
+    parser.add_argument("--min-learning-rate", type=float, default=0.00002)
+    parser.add_argument("--warmup-epochs", type=int, default=3)
+    parser.add_argument("--warmup-start-factor", type=float, default=1.0 / 3.0)
+    parser.add_argument(
+        "--selection-metric",
+        choices=["nll_scaled_3leg", *[h + "_rank_ic" for h in HORIZON_NAMES_FOR_CLI]],
+        default="close1_close2_rank_ic",
+    )
     parser.add_argument("--accumulate-dates", type=int, default=4)
-    parser.add_argument("--stock-embedding-width", type=int, default=16, help="0 disables identity for ablation")
+    parser.add_argument("--stock-embedding-width", type=int, default=64, help="0 disables identity for ablation")
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--benchmark-days", type=int, default=12)
     parser.add_argument("--resume", action="store_true")
@@ -611,8 +668,14 @@ def main():
         parser.error("--resume-io-repair requires --resume")
     if args.mode in ("train", "pipeline") and args.output is None:
         parser.error("train/pipeline require --output")
-    if min(args.epochs, args.patience, args.export_days, args.accumulate_dates, args.benchmark_days) < 1:
+    if min(args.epochs, args.export_days, args.accumulate_dates, args.benchmark_days, args.warmup_epochs) < 1:
         parser.error("counts must be positive")
+    if args.warmup_epochs >= args.epochs:
+        parser.error("warmup epochs must be smaller than total epochs")
+    if not 0 < args.min_learning_rate <= args.learning_rate:
+        parser.error("min learning rate must be in (0, learning rate]")
+    if not 0 < args.warmup_start_factor <= 1:
+        parser.error("warmup start factor must be in (0, 1]")
     if args.log_file:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
         stream = args.log_file.open("a", encoding="utf-8", buffering=1)

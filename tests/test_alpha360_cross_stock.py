@@ -68,7 +68,7 @@ def test_masked_nll_is_finite_and_differentiable() -> None:
     assert torch.isfinite(raw.grad).all()
 
 
-def test_model_is_permutation_equivariant_and_identity_is_frozen() -> None:
+def test_model_is_permutation_equivariant_and_identity_is_trainable() -> None:
     torch.manual_seed(7)
     model = small_model().eval()
     features = torch.randn(1, 5, 360)
@@ -77,7 +77,7 @@ def test_model_is_permutation_equivariant_and_identity_is_frozen() -> None:
     original = model(features, stock_ids)["leg_mean"]
     permuted = model(features[:, order], stock_ids[:, order])["leg_mean"]
     torch.testing.assert_close(permuted, original[:, order], atol=2e-6, rtol=2e-6)
-    assert model.stock_identity.weight.requires_grad is False
+    assert model.stock_identity.weight.requires_grad is True
 
 
 def test_model_forward_and_backward_shapes() -> None:
@@ -89,7 +89,8 @@ def test_model_forward_and_backward_shapes() -> None:
     assert output["horizon_covariance"].shape == (2, 6, 4, 4)
     target = torch.randn(2, 6, 3)
     joint_gaussian_nll(target, output["leg_mean"], output["leg_cholesky"]).backward()
-    assert model.distribution_head.weight.grad is not None
+    assert model.distribution_head[-1].weight.grad is not None
+    assert model.stock_identity.weight.grad is not None
 
 
 def test_nll_matches_pytorch_multivariate_normal() -> None:
@@ -146,7 +147,7 @@ def test_vectorized_features_never_read_future_and_follow_qlib_layout() -> None:
     np.testing.assert_array_equal(features, construct_alpha360(changed, [60, 61]))
 
 
-def test_checkpoint_preserves_frozen_stock_identity(tmp_path) -> None:
+def test_checkpoint_preserves_trainable_stock_identity(tmp_path) -> None:
     first = small_model().eval()
     path = tmp_path / "model.pt"
     torch.save(first.state_dict(), path)
