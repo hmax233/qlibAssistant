@@ -10,6 +10,7 @@ and delayed exits from limit-down are handled explicitly.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +67,14 @@ class Slot:
 
 def drawdown(equity: pd.Series) -> float:
     return float((equity / equity.cummax() - 1.0).min()) if len(equity) else 0.0
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024**2), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def load_inputs(args):
@@ -521,6 +530,9 @@ def select_robust_rules(valid: pd.DataFrame, selection: pd.DataFrame,
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, default=DEFAULT_RUN)
+    parser.add_argument("--valid-predictions", type=Path)
+    parser.add_argument("--selection-predictions", type=Path)
+    parser.add_argument("--test-predictions", type=Path)
     parser.add_argument("--daily-ohlc-cache", type=Path, default=DEFAULT_DAILY)
     parser.add_argument("--exact-limits", type=Path, default=DEFAULT_LIMITS)
     parser.add_argument("--index-cache", type=Path, default=DEFAULT_INDEX)
@@ -530,6 +542,7 @@ def parse_args():
     parser.add_argument("--slippage-bps", nargs="+", type=float, default=[0.0, 5.0])
     parser.add_argument("--selection-slippage-bps", type=float, default=5.0)
     parser.add_argument("--minimum-active-days", type=int, default=30)
+    parser.add_argument("--board-variant", choices=["mainboard", "all"], default="mainboard")
     parser.add_argument("--topks", nargs="+", type=int, default=[1, 3, 5, 10])
     parser.add_argument("--fallback", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -545,34 +558,70 @@ def main():
     prices, limits, index, calendar = load_inputs(args)
     output = args.output or ROOT / ".qlibAssistant/analysis" / f"alpha360_four_horizon_uncertainty_{time.strftime('%Y%m%d_%H%M%S')}"
     output.mkdir(parents=True, exist_ok=False)
-    frames = {}
-    for split in ("valid", "selection_valid", "test"):
-        frame = pd.read_csv(args.run / f"{split}_predictions.csv", parse_dates=["datetime"])
-        frame = frame.loc[frame["instrument"].map(mainboard)].copy()
-        frames[split] = frame
+    selection_path = args.selection_predictions or args.run / "selection_valid_predictions.csv"
+    test_path = args.test_predictions or args.run / "test_predictions.csv"
+    valid_path = args.valid_predictions
+    if valid_path is None and (args.run / "valid_predictions.csv").is_file():
+        valid_path = args.run / "valid_predictions.csv"
 
-    baseline = baseline_matrix("test", frames["test"], prices, limits, calendar, args, output)
-    baseline = attach_benchmarks(baseline, frames["test"], index, calendar)
-    valid_grid = uncertainty_grid("valid", frames["valid"], prices, limits, calendar, args)
-    valid_grid = attach_benchmarks(valid_grid, frames["valid"], index, calendar)
-    selection_grid = uncertainty_grid("selection_valid", frames["selection_valid"], prices, limits, calendar, args)
-    selection_grid = attach_benchmarks(selection_grid, frames["selection_valid"], index, calendar)
+    # Freeze all trading-rule choices before opening the held-out Test file.
+    selection_frame = pd.read_csv(selection_path, parse_dates=["datetime"])
+    if args.board_variant == "mainboard":
+        selection_frame = selection_frame.loc[selection_frame["instrument"].map(mainboard)].copy()
+    selection_grid = uncertainty_grid(
+        "selection_valid", selection_frame, prices, limits, calendar, args
+    )
+    selection_grid = attach_benchmarks(selection_grid, selection_frame, index, calendar)
     chosen = select_rules(selection_grid, args.selection_slippage_bps, args.minimum_active_days)
-    chosen_test = evaluate_chosen(chosen, frames["test"], prices, limits, calendar, args, output, "selection")
-    chosen_test = attach_benchmarks(chosen_test, frames["test"], index, calendar)
-    robust_chosen = select_robust_rules(
-        valid_grid, selection_grid, args.selection_slippage_bps, args.minimum_active_days
+    selection_grid.to_csv(output / "selection_valid_uncertainty_grid.csv", index=False)
+    chosen.to_csv(output / "selection_valid_chosen_rules.csv", index=False)
+    rule_manifest = {
+        "selection_predictions": str(selection_path.resolve()),
+        "selection_predictions_sha256": sha256(selection_path),
+        "selection_slippage_bps": args.selection_slippage_bps,
+        "minimum_active_days": args.minimum_active_days,
+        "chosen": chosen.to_dict(orient="records"),
+        "test_opened": False,
+    }
+    (output / "chosen_rule_manifest_pre_test.json").write_text(
+        json.dumps(rule_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    robust_test = evaluate_chosen(
-        robust_chosen, frames["test"], prices, limits, calendar, args, output, "robust"
+
+    # Only the frozen chosen rules are now evaluated on Test.
+    test_frame = pd.read_csv(test_path, parse_dates=["datetime"])
+    if args.board_variant == "mainboard":
+        test_frame = test_frame.loc[test_frame["instrument"].map(mainboard)].copy()
+    baseline = baseline_matrix("test", test_frame, prices, limits, calendar, args, output)
+    baseline = attach_benchmarks(baseline, test_frame, index, calendar)
+    chosen_test = evaluate_chosen(
+        chosen, test_frame, prices, limits, calendar, args, output, "selection"
     )
-    robust_test = attach_benchmarks(robust_test, frames["test"], index, calendar)
+    chosen_test = attach_benchmarks(chosen_test, test_frame, index, calendar)
+
+    valid_grid = robust_chosen = robust_test = robust_comparison = None
+    if valid_path is not None:
+        valid_frame = pd.read_csv(valid_path, parse_dates=["datetime"])
+        if args.board_variant == "mainboard":
+            valid_frame = valid_frame.loc[valid_frame["instrument"].map(mainboard)].copy()
+        valid_grid = uncertainty_grid("valid", valid_frame, prices, limits, calendar, args)
+        valid_grid = attach_benchmarks(valid_grid, valid_frame, index, calendar)
+        robust_chosen = select_robust_rules(
+            valid_grid, selection_grid, args.selection_slippage_bps, args.minimum_active_days
+        )
+        robust_test = evaluate_chosen(
+            robust_chosen, test_frame, prices, limits, calendar, args, output, "robust"
+        )
+        robust_test = attach_benchmarks(robust_test, test_frame, index, calendar)
     test_grid = None
     if args.diagnostic_test_grid:
-        test_grid = uncertainty_grid("test", frames["test"], prices, limits, calendar, args)
-        test_grid = attach_benchmarks(test_grid, frames["test"], index, calendar)
+        test_grid = uncertainty_grid("test", test_frame, prices, limits, calendar, args)
+        test_grid = attach_benchmarks(test_grid, test_frame, index, calendar)
+    alignment_frames = {"selection_valid": selection_frame, "test": test_frame}
+    if valid_path is not None:
+        alignment_frames["valid"] = valid_frame
     alignment = pd.concat([
-        label_alignment(split, frame, prices, calendar) for split, frame in frames.items()
+        label_alignment(split, frame, prices, calendar)
+        for split, frame in alignment_frames.items()
     ], ignore_index=True)
     baseline_top1 = baseline.loc[
         baseline["topk"].eq(1) & baseline["slippage_bps_each_side"].eq(args.selection_slippage_bps)
@@ -591,35 +640,44 @@ def main():
         selected_slippage, on=["horizon", "rule"]
     )
     comparison["test_net_change_vs_baseline"] = comparison["selected_test_net"] - comparison["baseline_test_net"]
-    robust_test_selected = robust_test.loc[
-        robust_test["slippage_bps_each_side"].eq(args.selection_slippage_bps)
-    ][["horizon", "rule", "net_cumulative", "active_signal_days", "trade_win_rate",
-       "max_drawdown_marked"]].rename(columns={
-        "net_cumulative": "test_net", "active_signal_days": "test_active_days",
-        "trade_win_rate": "test_win_rate", "max_drawdown_marked": "test_max_drawdown",
-    })
-    robust_comparison = robust_chosen.merge(baseline_top1, on="horizon").merge(
-        robust_test_selected, on=["horizon", "rule"]
-    )
-    robust_comparison["test_net_change_vs_baseline"] = (
-        robust_comparison["test_net"] - robust_comparison["baseline_test_net"]
-    )
+    if robust_test is not None:
+        robust_test_selected = robust_test.loc[
+            robust_test["slippage_bps_each_side"].eq(args.selection_slippage_bps)
+        ][["horizon", "rule", "net_cumulative", "active_signal_days", "trade_win_rate",
+           "max_drawdown_marked"]].rename(columns={
+            "net_cumulative": "test_net", "active_signal_days": "test_active_days",
+            "trade_win_rate": "test_win_rate", "max_drawdown_marked": "test_max_drawdown",
+        })
+        robust_comparison = robust_chosen.merge(baseline_top1, on="horizon").merge(
+            robust_test_selected, on=["horizon", "rule"]
+        )
+        robust_comparison["test_net_change_vs_baseline"] = (
+            robust_comparison["test_net"] - robust_comparison["baseline_test_net"]
+        )
     baseline.to_csv(output / "test_baseline_four_horizons.csv", index=False)
-    valid_grid.to_csv(output / "valid_uncertainty_grid.csv", index=False)
-    selection_grid.to_csv(output / "selection_valid_uncertainty_grid.csv", index=False)
-    chosen.to_csv(output / "selection_valid_chosen_rules.csv", index=False)
     chosen_test.to_csv(output / "test_selected_uncertainty_rules.csv", index=False)
     if test_grid is not None:
         test_grid.to_csv(output / "test_uncertainty_grid_diagnostic_only.csv", index=False)
     alignment.to_csv(output / "label_alignment.csv", index=False)
     comparison.to_csv(output / "uncertainty_selection_test_comparison.csv", index=False)
-    robust_chosen.to_csv(output / "valid_selection_robust_chosen_rules.csv", index=False)
-    robust_test.to_csv(output / "test_robust_uncertainty_rules.csv", index=False)
-    robust_comparison.to_csv(output / "robust_selection_test_comparison.csv", index=False)
+    if valid_grid is not None:
+        valid_grid.to_csv(output / "valid_uncertainty_grid.csv", index=False)
+        robust_chosen.to_csv(output / "valid_selection_robust_chosen_rules.csv", index=False)
+        robust_test.to_csv(output / "test_robust_uncertainty_rules.csv", index=False)
+        robust_comparison.to_csv(output / "robust_selection_test_comparison.csv", index=False)
+    rule_manifest.update({
+        "test_opened": True,
+        "test_predictions": str(test_path.resolve()),
+        "test_predictions_sha256": sha256(test_path),
+    })
+    (output / "evaluated_rule_manifest.json").write_text(
+        json.dumps(rule_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     (output / "method.json").write_text(json.dumps({
         "selection_policy": "choose highest 5bps net cumulative on Selection-valid, at least 30 active days; Test not used",
         "robust_policy": "maximize the worse 5bps net cumulative across Valid and Selection-valid, at least 30 active days in each; Test not used",
-        "rules": RULES, "horizons": HORIZONS, "mainboard_only": True,
+        "rules": RULES, "horizons": HORIZONS,
+        "board_variant": args.board_variant,
         "capital": args.capital, "commission_rate_each_side": args.commission_rate,
         "minimum_commission": args.minimum_commission, "stamp_tax": "omitted per user preference",
         "fallback": args.fallback, "lot_size": 100,
@@ -634,10 +692,11 @@ def main():
     print(chosen.to_string(index=False))
     print("\nCHOSEN RULES ON TEST")
     print(chosen_test.to_string(index=False))
-    print("\nROBUST VALID+SELECTION CHOSEN")
-    print(robust_chosen.to_string(index=False))
-    print("\nROBUST RULES ON TEST")
-    print(robust_test.to_string(index=False))
+    if robust_chosen is not None:
+        print("\nROBUST VALID+SELECTION CHOSEN")
+        print(robust_chosen.to_string(index=False))
+        print("\nROBUST RULES ON TEST")
+        print(robust_test.to_string(index=False))
     print(f"output={output}")
 
 
