@@ -60,6 +60,10 @@ def test_e6_worker_waits_for_selection_and_freezes_before_test() -> None:
     test_materialization = source.index("Materialize selected E0 Test horizons", authorize)
     aggregate = source.index("Evaluate frozen E0-E6 ensemble on Test", test_materialization)
     assert wait < train < freeze < authorize < test_materialization < aggregate
+    pretest_reauthentication = source.index(
+        "Re-authenticate E0-E6 freeze immediately before Test access", freeze
+    )
+    assert pretest_reauthentication < authorize < test_materialization
     assert "'--date-batch-size', '4'" in source
     assert "'--minimum-learning-rate', '0.000001'" in source
     assert "--gradient-clipping" not in source

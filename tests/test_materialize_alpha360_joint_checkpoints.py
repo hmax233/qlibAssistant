@@ -141,6 +141,66 @@ def expected_columns(horizons: tuple[str, ...] | list[str]) -> list[str]:
     return columns
 
 
+def freeze_joint_candidates(
+    tmp_path: Path,
+    run: Path,
+    data: Path,
+    preferred_horizons: dict[str, set[str]],
+) -> tuple[Path, dict[str, Path]]:
+    """Build a real, fully authenticated selector freeze for E0 fixtures."""
+
+    candidates: dict[str, Path] = {}
+    for name, preferred in preferred_horizons.items():
+        candidate = tmp_path / f"{name}-candidate"
+        materialize_selection(run, data, candidate, threads=1)
+        candidate_csv = candidate / "selection_valid_predictions.csv"
+        frame = pd.read_csv(candidate_csv)
+        for horizon in HORIZON_NAMES:
+            actual = frame[f"{horizon}_actual_return"]
+            variance = frame[f"{horizon}_log_variance"]
+            desired = actual if horizon in preferred else -actual
+            frame[f"{horizon}_log_mean"] = np.log1p(desired) - 0.5 * variance
+            frame[f"{horizon}_expected_return"] = desired
+        frame.to_csv(candidate_csv, index=False)
+        audit_path = candidate / "materialization_manifest.json"
+        audit = json.loads(audit_path.read_text())
+        audit["prediction_output"]["sha256"] = sha256(candidate_csv)
+        write_json(audit_path, audit)
+        candidates[name] = candidate
+
+    reference = next(iter(candidates.values()))
+    scoring = pd.read_csv(reference / "selection_valid_predictions.csv")
+    configuration = json.loads((run / "configuration.json").read_text())
+    protocol = tmp_path / "protocol.json"
+    write_json(protocol, {
+        "segments": configuration["segments"],
+        "data_manifest_sha256": configuration["data_manifest_sha256"],
+        "horizons": list(HORIZON_NAMES),
+        "experiments": [{"id": name} for name in candidates],
+        "optimization": {
+            "epochs": configuration["epochs"],
+            "early_stopping": configuration["early_stopping"],
+            "learning_rate": configuration["learning_rate"],
+            "minimum_learning_rate": configuration["min_learning_rate"],
+            "warmup_epochs": configuration["warmup_epochs"],
+            "warmup_start_factor": configuration["warmup_start_factor"],
+            "date_batch_size": configuration["date_batch_size"],
+            "seed": configuration["seed"],
+            "target_scale": configuration["target_scale"],
+        },
+        "selection_scoring": {
+            "signal_start": str(pd.to_datetime(scoring["datetime"]).min().date()),
+            "signal_end": str(pd.to_datetime(scoring["datetime"]).max().date()),
+            "expected_days": int(pd.to_datetime(scoring["datetime"]).nunique()),
+            "expected_rows": int(len(scoring)),
+            "canonical_key_sha256": prediction_key_sha256(scoring),
+        },
+    })
+    manifest = tmp_path / "selection" / "frozen_selection.json"
+    select_ensemble(protocol, candidates, manifest)
+    return manifest, candidates
+
+
 def test_selection_uses_a_distinct_checkpoint_for_each_horizon_and_audits_hashes(
     tmp_path: Path,
 ) -> None:
@@ -182,59 +242,37 @@ def test_selection_never_accesses_test_partition(tmp_path: Path) -> None:
 
 
 def test_evaluate_test_rejects_candidate_not_selected_before_test_access(tmp_path: Path) -> None:
-    manifest = tmp_path / "selection.json"
-    write_json(
-        manifest,
-        {
-            "selection_split": "selection_valid",
-            "test_files_read": False,
-            "candidates": {"joint": str(tmp_path / "missing-candidate")},
-            "input_sha256": {},
-            "selections": {
-                horizon: {"selected_components": ["some-other-candidate"]}
-                for horizon in HORIZON_NAMES
-            },
-        },
+    run, data = make_fixture(tmp_path, include_test_files=False)
+    manifest, candidates = freeze_joint_candidates(
+        tmp_path,
+        run,
+        data,
+        {"joint": set(), "other": set(HORIZON_NAMES)},
     )
     with pytest.raises(RuntimeError, match="not selected for any horizon"):
         evaluate_test(
-            tmp_path / "missing-run",
-            tmp_path / "missing-data",
-            tmp_path / "must-not-exist",
+            run,
+            data,
+            candidates["joint"],
             manifest,
             "joint",
             threads=1,
         )
-    assert not (tmp_path / "must-not-exist").exists()
+    assert not (candidates["joint"] / "test_predictions.csv").exists()
 
 
 def test_evaluate_test_reads_only_manifest_selected_horizons_and_preserves_format(
     tmp_path: Path,
 ) -> None:
     run, data = make_fixture(tmp_path)
-    candidate = tmp_path / "joint-candidate"
-    materialize_selection(run, data, candidate, threads=1)
-    candidate_csv = candidate / "selection_valid_predictions.csv"
     selected = ["open1_close2", "close1_close2"]
-    manifest = tmp_path / "frozen_selection.json"
-    write_json(
-        manifest,
-        {
-            "schema_version": 1,
-            "selection_split": "selection_valid",
-            "test_files_read": False,
-            "candidates": {"joint": str(candidate)},
-            "input_sha256": {
-                "joint:selection_valid_predictions": sha256(candidate_csv),
-            },
-            "selections": {
-                horizon: {
-                    "selected_components": ["joint"] if horizon in selected else ["other"]
-                }
-                for horizon in HORIZON_NAMES
-            },
-        },
+    manifest, candidates = freeze_joint_candidates(
+        tmp_path,
+        run,
+        data,
+        {"joint": set(selected), "other": set(HORIZON_NAMES) - set(selected)},
     )
+    candidate = candidates["joint"]
     audit = evaluate_test(run, data, candidate, manifest, "joint", threads=1)
     frame = pd.read_csv(candidate / "test_predictions.csv")
     assert list(frame.columns) == expected_columns(selected)
@@ -325,27 +363,13 @@ def test_materialization_never_overwrites_an_existing_output(tmp_path: Path) -> 
 
 def test_evaluate_test_rejects_checkpoint_changed_after_selection(tmp_path: Path) -> None:
     run, data = make_fixture(tmp_path)
-    candidate = tmp_path / "candidate"
-    materialize_selection(run, data, candidate, threads=1)
-    candidate_csv = candidate / "selection_valid_predictions.csv"
-    manifest = tmp_path / "selection.json"
-    write_json(
-        manifest,
-        {
-            "selection_split": "selection_valid",
-            "test_files_read": False,
-            "candidates": {"joint": str(candidate)},
-            "input_sha256": {
-                "joint:selection_valid_predictions": sha256(candidate_csv),
-            },
-            "selections": {
-                horizon: {"selected_components": ["joint"]} for horizon in HORIZON_NAMES
-            },
-        },
+    manifest, candidates = freeze_joint_candidates(
+        tmp_path, run, data, {"joint": set(HORIZON_NAMES)}
     )
+    candidate = candidates["joint"]
     checkpoint = run / "best_open1_close2_rank_ic_model.pt"
     checkpoint.write_bytes(checkpoint.read_bytes() + b"changed-after-selection")
-    with pytest.raises(RuntimeError, match="Checkpoint changed after selection"):
+    with pytest.raises(RuntimeError, match="hash mismatch|changed after selection"):
         evaluate_test(run, data, candidate, manifest, "joint", threads=1)
     assert not (candidate / "test_predictions.csv").exists()
     assert not (candidate / "test_materialization_manifest.json").exists()
@@ -358,24 +382,10 @@ def test_evaluate_test_refuses_existing_test_artifact_before_reading_test(
     tmp_path: Path, existing_name: str
 ) -> None:
     run, data = make_fixture(tmp_path, include_test_files=False)
-    candidate = tmp_path / "candidate"
-    materialize_selection(run, data, candidate, threads=1)
-    candidate_csv = candidate / "selection_valid_predictions.csv"
-    manifest = tmp_path / "selection.json"
-    write_json(
-        manifest,
-        {
-            "selection_split": "selection_valid",
-            "test_files_read": False,
-            "candidates": {"joint": str(candidate)},
-            "input_sha256": {
-                "joint:selection_valid_predictions": sha256(candidate_csv),
-            },
-            "selections": {
-                horizon: {"selected_components": ["joint"]} for horizon in HORIZON_NAMES
-            },
-        },
+    manifest, candidates = freeze_joint_candidates(
+        tmp_path, run, data, {"joint": set(HORIZON_NAMES)}
     )
+    candidate = candidates["joint"]
     existing = candidate / existing_name
     existing.write_text("preserve", encoding="utf-8")
     with pytest.raises(FileExistsError, match="existing test artifact"):

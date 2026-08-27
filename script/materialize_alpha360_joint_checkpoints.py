@@ -433,15 +433,24 @@ def validate_frozen_manifest(
     data: Path,
 ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     manifest_path = manifest_path.expanduser().resolve()
-    if not manifest_path.is_file():
-        raise FileNotFoundError(manifest_path)
-    manifest = read_json(manifest_path)
-    if manifest.get("selection_split") != "selection_valid":
-        raise ValueError("Manifest was not frozen from selection_valid")
-    if manifest.get("test_files_read") is not False:
-        raise ValueError("Manifest is not a pre-test frozen selection manifest")
+    # Authenticate the *complete* E0--E6 freeze before doing any candidate-
+    # local checks.  This must happen before DateStore construction because
+    # constructing a Test store verifies/hashes and then mmaps held-out parts.
+    # A weaker E0-only check could otherwise open Test and only discover a
+    # tampered protocol, another candidate, or a selected checkpoint later in
+    # the aggregate evaluation.
+    from script.select_alpha360_probabilistic_ensemble import (
+        validate_frozen_selection_manifest as validate_complete_freeze,
+    )
+
+    manifest, _, candidates, frozen_candidates = validate_complete_freeze(
+        manifest_path, require_test_artifacts=False
+    )
     selected = selected_horizons_for_candidate(manifest, candidate_name)
-    candidate_path = _candidate_path(manifest["candidates"][candidate_name])
+    candidate_path = candidates[candidate_name]
+    frozen_candidate = frozen_candidates[candidate_name]
+    if candidate_path != _candidate_path(manifest["candidates"][candidate_name]):
+        raise RuntimeError("Normalized candidate path disagrees with the frozen manifest")
     candidate_audit_path = candidate_path / "materialization_manifest.json"
     candidate_predictions = candidate_path / "selection_valid_predictions.csv"
     if not candidate_audit_path.is_file() or not candidate_predictions.is_file():
@@ -465,6 +474,15 @@ def validate_frozen_manifest(
     )
     if expected_prediction_hash != actual_prediction_hash:
         raise RuntimeError("Frozen selection manifest does not authenticate candidate predictions")
+    for horizon in selected:
+        selected_hashes = manifest["selections"][horizon].get(
+            "selected_checkpoint_sha256", {}
+        )
+        frozen_hash = frozen_candidate["checkpoints"][horizon]["sha256"]
+        if selected_hashes.get(candidate_name) != frozen_hash:
+            raise RuntimeError(
+                f"Frozen selection checkpoint mismatch for {candidate_name}/{horizon}"
+            )
     return manifest, selected, {
         "selection_manifest": {
             "path": str(manifest_path),

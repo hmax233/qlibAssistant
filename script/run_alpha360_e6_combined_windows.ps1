@@ -187,6 +187,12 @@ try {
             ForEach-Object { @($_.Value.selected_components) } |
             Sort-Object -Unique
     )
+    # Keep absence of a candidate Test audit distinct from an invalid freeze.
+    # This full preflight must pass immediately before any candidate is allowed
+    # to construct/hash/mmap the held-out Test store.
+    Invoke-CheckedPython @(
+        '-u', $Selector, 'validate-selection', '--manifest', $SelectionManifest
+    ) 'Re-authenticate E0-E6 freeze immediately before Test access'
     Write-PipelineStatus @{
         status='materializing_selected_test'; selected_candidates=$SelectedCandidates;
         selection_manifest=$SelectionManifest; test_access_authorized=$true;
