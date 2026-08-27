@@ -135,6 +135,27 @@ def _require_finite(value: Any, label: str) -> float:
     return result
 
 
+def _validate_execution_data_inputs(value: Any, label: str) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict) or set(value) != {"daily_ohlc", "exact_limits", "index_cache"}:
+        raise ValueError(f"{label} must freeze daily_ohlc, exact_limits, and index_cache")
+    normalized = {}
+    for name, reference in value.items():
+        if not isinstance(reference, dict):
+            raise ValueError(f"{label}/{name} must be an object")
+        missing = {"path", "sha256", "size", "rows", "start", "end"} - set(reference)
+        if missing:
+            raise ValueError(f"{label}/{name} missing {sorted(missing)}")
+        path = _require_file(Path(reference["path"]), f"{label}/{name}")
+        if sha256(path) != reference["sha256"] or path.stat().st_size != int(reference["size"]):
+            raise RuntimeError(f"{label}/{name} file identity changed after rule freeze")
+        if int(reference["rows"]) <= 0:
+            raise ValueError(f"{label}/{name} rows must be positive")
+        if pd.Timestamp(reference["start"]) > pd.Timestamp(reference["end"]):
+            raise ValueError(f"{label}/{name} date range is reversed")
+        normalized[name] = dict(reference)
+    return normalized
+
+
 def _strict_boolean_series(values: pd.Series, label: str) -> pd.Series:
     """Parse booleans without allowing truthy strings or missing values."""
 
@@ -549,6 +570,11 @@ def load_strict_backtest(
         raise ValueError(f"{variant} evaluated selection prediction hash mismatch")
     if evaluated.get("test_predictions_sha256") != sha256(test_predictions):
         raise ValueError(f"{variant} Test prediction hash mismatch")
+    execution_inputs = _validate_execution_data_inputs(
+        pre.get("execution_data_inputs"), f"{variant} pre-Test execution inputs"
+    )
+    if evaluated.get("execution_data_inputs") != pre.get("execution_data_inputs"):
+        raise RuntimeError(f"{variant} execution-data freeze changed after Test was opened")
     pre_chosen = _canonical_chosen(pre.get("chosen"), f"{variant} pre-Test manifest")
     evaluated_chosen = _canonical_chosen(
         evaluated.get("chosen"), f"{variant} evaluated manifest"
@@ -660,6 +686,7 @@ def load_strict_backtest(
         "rules": pre_chosen,
         "slippage": slippage,
         "capital": capital,
+        "execution_data_inputs": execution_inputs,
         "chosen": chosen,
         "baseline": baseline,
         "selected": selected,
@@ -1045,6 +1072,9 @@ def write_method_and_findings(
         "all pre-Test rule manifest": strict["all"]["directory"] / "chosen_rule_manifest_pre_test.json",
         "Fixed Ensemble external historical summary": fixed_reference["path"],
     }
+    for variant in ("mainboard", "all"):
+        for name, reference in strict[variant]["execution_data_inputs"].items():
+            audited[f"{variant} execution input: {name}"] = Path(reference["path"])
     for label, path in audited.items():
         lines.append(f"| {label} | `{sha256(path)}` |")
     lines.extend([

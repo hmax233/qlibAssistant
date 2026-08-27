@@ -224,6 +224,17 @@ def write_strict_directory(
         "selection_slippage_bps": slippage,
         "minimum_active_days": 1,
         "chosen": chosen_records,
+        "execution_data_inputs": {
+            name: {
+                "path": str(selection_predictions.resolve()),
+                "sha256": file_hash(selection_predictions),
+                "size": selection_predictions.stat().st_size,
+                "rows": len(test_frame),
+                "start": "2026-01-01",
+                "end": "2026-12-31",
+            }
+            for name in ("daily_ohlc", "exact_limits", "index_cache")
+        },
         "test_opened": False,
     }
     (path / "chosen_rule_manifest_pre_test.json").write_text(
