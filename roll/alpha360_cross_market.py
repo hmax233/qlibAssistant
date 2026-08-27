@@ -115,10 +115,19 @@ class MarketTemporalEncoder(nn.Module):
         sequence = self.feature_projection(sequence)
         sequence = sequence + self.time_position[None, None, :, :]
         sequence = sequence.reshape(batch * stocks, 60, -1)
-        sequence = self.temporal_encoder(sequence)
-        temporal_weight = torch.softmax(self.temporal_pool(sequence), dim=-2)
-        state = (sequence * temporal_weight).sum(dim=-2)
-        state = state.reshape(batch, stocks, -1)
+        flat_valid = stock_mask.reshape(-1)
+        # Do not run padded stock slots through either market's temporal
+        # Transformer.  Besides avoiding wasted work, this makes padding inert
+        # by construction rather than relying on a later overwrite.
+        flat_state = sequence.new_zeros((batch * stocks, sequence.shape[-1]))
+        if flat_valid.any():
+            valid_sequence = self.temporal_encoder(sequence[flat_valid])
+            temporal_weight = torch.softmax(
+                self.temporal_pool(valid_sequence), dim=-2
+            )
+            valid_state = (valid_sequence * temporal_weight).sum(dim=-2)
+            flat_state[flat_valid] = valid_state
+        state = flat_state.reshape(batch, stocks, -1)
 
         identity = self.stock_identity(stock_ids.long())
         state = self.identity_fusion(torch.cat((state, identity), dim=-1))
@@ -222,20 +231,30 @@ class Alpha360CrossMarketTransformer(nn.Module):
             raise ValueError(f"{market}_alpha360 must contain at least one stock slot")
         if stock_ids.shape != (batch, stocks):
             raise ValueError(f"{market}_stock_ids must have shape [B, N]")
+        if stock_ids.device != alpha360.device:
+            raise ValueError(f"{market}_stock_ids must be on the same device as features")
         if stock_mask is None:
-            return torch.ones(
+            valid = torch.ones(
                 (batch, stocks),
                 dtype=torch.bool,
                 device=alpha360.device,
             )
-        if stock_mask.shape != (batch, stocks):
-            raise ValueError(f"{market}_stock_mask must have shape [B, N]")
-        return stock_mask.to(device=alpha360.device, dtype=torch.bool)
+        else:
+            if stock_mask.shape != (batch, stocks):
+                raise ValueError(f"{market}_stock_mask must have shape [B, N]")
+            valid = stock_mask.to(device=alpha360.device, dtype=torch.bool)
+        ids = stock_ids.long()
+        if torch.any(ids[valid] <= 0):
+            raise ValueError(f"{market} valid stock IDs must be positive")
+        if torch.any(ids[~valid] != 0):
+            raise ValueError(f"{market} padded stock IDs must be zero")
+        return valid
 
     def _add_market_embedding(
         self,
         state: torch.Tensor,
         market_index: int,
+        stock_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch, stocks, _ = state.shape
         market_ids = torch.full(
@@ -245,7 +264,10 @@ class Alpha360CrossMarketTransformer(nn.Module):
             device=state.device,
         )
         market = self.market_embedding(market_ids)
-        return self.shared_token_projection(torch.cat((state, market), dim=-1))
+        token = self.shared_token_projection(torch.cat((state, market), dim=-1))
+        # Projection biases and the market embedding would otherwise make a
+        # padded state non-zero again before cross-market attention.
+        return token.masked_fill(~stock_mask.unsqueeze(-1), 0.0)
 
     def forward(
         self,
@@ -264,11 +286,13 @@ class Alpha360CrossMarketTransformer(nn.Module):
         us_valid = self._validate_market_inputs(
             "us", us_alpha360, us_stock_ids, us_stock_mask
         )
+        if not torch.all(a_valid.any(dim=1)):
+            raise ValueError("each date must contain at least one valid A-share")
 
         a_state = self.a_encoder(a_alpha360, a_stock_ids, a_valid)
         us_state = self.us_encoder(us_alpha360, us_stock_ids, us_valid)
-        a_token = self._add_market_embedding(a_state, 0)
-        us_token = self._add_market_embedding(us_state, 1)
+        a_token = self._add_market_embedding(a_state, 0, a_valid)
+        us_token = self._add_market_embedding(us_state, 1, us_valid)
 
         tokens = torch.cat((a_token, us_token), dim=1)
         valid = torch.cat((a_valid, us_valid), dim=1)

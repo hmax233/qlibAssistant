@@ -57,6 +57,37 @@ from script.train_alpha360_decoupled import (  # noqa: E402
 FORMAL_EPOCHS = 50
 TRAIN_SPLITS = ("train", "valid", "selection_valid")
 TEST_SPLIT = "test"
+SCHEDULER_DESCRIPTION = (
+    "3 training epochs of linear warmup, then cosine annealing; "
+    "the 50th training epoch uses eta_min"
+)
+
+
+def build_learning_rate_scheduler(torch_module, optimizer, args):
+    """Build the fixed 50-epoch schedule with eta_min used during epoch 50."""
+
+    # LinearLR exposes its initial start_factor immediately.  With three
+    # warmup training epochs, two transitions produce start -> midpoint ->
+    # base LR over epochs 1, 2, and 3.
+    warmup = torch_module.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=args.warmup_start_factor,
+        end_factor=1.0,
+        total_iters=args.warmup_epochs - 1,
+    )
+    # Epoch 4 is cosine step 0 and epoch 50 is step 46.  This endpoint choice
+    # ensures eta_min is an LR actually used for training, not merely reached
+    # by a scheduler.step() after all optimization has finished.
+    cosine = torch_module.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=FORMAL_EPOCHS - args.warmup_epochs - 1,
+        eta_min=args.minimum_learning_rate,
+    )
+    return torch_module.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[args.warmup_epochs],
+    )
 
 
 def atomic_csv(frame: pd.DataFrame, destination: Path) -> None:
@@ -89,6 +120,55 @@ def merge_prediction_columns(frames: list[pd.DataFrame]) -> pd.DataFrame:
     return result.sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
+def _validated_segment_bounds(manifest: dict[str, Any]) -> dict[str, tuple[pd.Timestamp, pd.Timestamp]]:
+    expected = (*TRAIN_SPLITS, TEST_SPLIT)
+    segments = manifest.get("segments", {})
+    if set(segments) != set(expected):
+        raise ValueError("E6 store must contain train/valid/selection_valid/test metadata")
+    bounds: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    previous_end: pd.Timestamp | None = None
+    for split in expected:
+        values = segments[split]
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            raise ValueError(f"Invalid E6 segment bounds for {split}")
+        start, end = (pd.Timestamp(value).normalize() for value in values)
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError(f"Invalid E6 segment bounds for {split}")
+        if previous_end is not None and start <= previous_end:
+            raise ValueError("E6 segments must be strictly ordered and non-overlapping")
+        bounds[split] = (start, end)
+        previous_end = end
+    return bounds
+
+
+def _validate_manifest_parts(manifest: dict[str, Any]) -> None:
+    bounds = _validated_segment_bounds(manifest)
+    prefixes: set[str] = set()
+    seen_dates: set[pd.Timestamp] = set()
+    split_counts = {split: 0 for split in bounds}
+    for part in manifest.get("parts", []):
+        prefix = str(part.get("prefix", ""))
+        split = part.get("split")
+        if not prefix or prefix in prefixes:
+            raise ValueError(f"Duplicate or empty E6 part prefix: {prefix!r}")
+        prefixes.add(prefix)
+        if split not in bounds:
+            raise ValueError(f"Unknown E6 part split: {split}")
+        dates = [pd.Timestamp(value).normalize() for value in part.get("dates", [])]
+        if not dates or dates != sorted(dates) or len(set(dates)) != len(dates):
+            raise ValueError(f"E6 part {prefix} dates must be non-empty, sorted, and unique")
+        start, end = bounds[split]
+        if any(pd.isna(value) or value < start or value > end for value in dates):
+            raise ValueError(f"E6 part {prefix} contains dates outside {split}")
+        if any(value in seen_dates for value in dates):
+            raise ValueError(f"E6 part {prefix} overlaps another split or part")
+        seen_dates.update(dates)
+        split_counts[split] += len(dates)
+    missing = [split for split, count in split_counts.items() if count == 0]
+    if missing:
+        raise ValueError(f"E6 store has no dates for splits: {missing}")
+
+
 class CrossMarketDateStore:
     """Lazy mmap reader for the builder's E6 manifest and parts.
 
@@ -100,16 +180,22 @@ class CrossMarketDateStore:
         self.directory = Path(directory).expanduser().resolve()
         self.manifest_path = self.directory / "manifest.json"
         self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        if self.manifest.get("schema_version") != 2:
+            raise ValueError("E6 store schema 2 with UTC as-of timestamps is required")
         if self.manifest.get("status") != "complete":
             raise RuntimeError("E6 cross-market store is not complete")
         if self.manifest.get("feature_layout", {}).get("width") != 360:
             raise ValueError("E6 store is not Alpha360")
         if self.manifest.get("normalizers", {}).get("independent_markets") is not True:
             raise ValueError("E6 store must use independent A/US normalizers")
-        if self.manifest.get("alignment", {}).get("same_calendar_day_us_close_allowed") is not False:
+        alignment = self.manifest.get("alignment", {})
+        if (
+            alignment.get("same_calendar_day_us_close_allowed") is not False
+            or alignment.get("strictly_prior_close_required") is not True
+            or alignment.get("comparison_timezone") != "UTC"
+        ):
             raise ValueError("E6 store does not enforce strict prior-US-close alignment")
-        if set(self.manifest.get("segments", {})) != {*TRAIN_SPLITS, TEST_SPLIT}:
-            raise ValueError("E6 store must contain train/valid/selection_valid/test metadata")
+        _validate_manifest_parts(self.manifest)
 
         dictionaries_path = self.directory / self.manifest["stock_dictionaries"]["path"]
         if file_hash(dictionaries_path) != self.manifest["stock_dictionaries"]["sha256"]:
@@ -117,6 +203,13 @@ class CrossMarketDateStore:
         dictionaries = json.loads(dictionaries_path.read_text(encoding="utf-8"))
         self.a_id_to_code = {int(value): key for key, value in dictionaries["a"].items()}
         self.us_id_to_code = {int(value): key for key, value in dictionaries["us"].items()}
+        for market, mapping, expected_count in (
+            ("A", self.a_id_to_code, self.manifest["stock_dictionaries"]["a_count"]),
+            ("US", self.us_id_to_code, self.manifest["stock_dictionaries"]["us_count"]),
+        ):
+            expected_ids = set(range(1, int(expected_count) + 1))
+            if set(mapping) != expected_ids:
+                raise ValueError(f"{market} stock IDs must be unique and contiguous from 1")
 
         a_normalizer = Path(self.manifest["a_source"]["normalizer_output"]["path"])
         if file_hash(a_normalizer) != self.manifest["a_source"]["normalizer_output"]["sha256"]:
@@ -193,8 +286,31 @@ class CrossMarketDateStore:
                     mmap_mode="r",
                     allow_pickle=False,
                 )
-                for name in ("a_dates", "us_asof_dates", "us_features", "us_stock_ids", "us_offsets")
+                for name in (
+                    "a_dates",
+                    "a_signal_times_utc",
+                    "us_asof_dates",
+                    "us_close_times_utc",
+                    "us_features",
+                    "us_stock_ids",
+                    "us_offsets",
+                )
             }
+            day_count = len(part["dates"])
+            for name in (
+                "a_dates", "a_signal_times_utc", "us_asof_dates", "us_close_times_utc"
+            ):
+                if us_arrays[name].shape != (day_count,):
+                    raise ValueError(
+                        f"Invalid {name} shape in {part['prefix']}: {us_arrays[name].shape}"
+                    )
+            if (
+                us_arrays["us_offsets"].shape != (day_count + 1,)
+                or int(us_arrays["us_offsets"][0]) != 0
+                or int(us_arrays["us_offsets"][-1]) != len(us_arrays["us_stock_ids"])
+                or len(us_arrays["us_features"]) != len(us_arrays["us_stock_ids"])
+            ):
+                raise ValueError(f"Invalid US offsets/rows in {part['prefix']}")
             local_days = list(range(len(part["dates"])))
             if seed is not None:
                 generator.shuffle(local_days)
@@ -206,13 +322,23 @@ class CrossMarketDateStore:
                 us_begin, us_end = (int(value) for value in us_arrays["us_offsets"][local_day:local_day + 2])
                 a_date = np.datetime64(us_arrays["a_dates"][local_day], "D")
                 us_asof = np.datetime64(us_arrays["us_asof_dates"][local_day], "D")
-                if not np.isnat(us_asof) and not us_asof < a_date:
+                a_signal = np.datetime64(
+                    us_arrays["a_signal_times_utc"][local_day], "ns"
+                )
+                us_close = np.datetime64(
+                    us_arrays["us_close_times_utc"][local_day], "ns"
+                )
+                if not np.isnat(us_close) and not us_close < a_signal:
                     raise RuntimeError(f"US as-of leakage in {part['prefix']} day {local_day}")
+                if np.isnat(us_asof) != np.isnat(us_close):
+                    raise RuntimeError(f"US as-of date/time mismatch in {part['prefix']} day {local_day}")
                 if str(a_date) != str(part["dates"][local_day]):
                     raise RuntimeError(f"A date mismatch in {part['prefix']} day {local_day}")
                 yield {
                     "date": part["dates"][local_day],
                     "us_asof_date": str(us_asof),
+                    "a_signal_time_utc": str(a_signal),
+                    "us_close_time_utc": str(us_close),
                     "a_features": self._normalize(
                         np.array(a_arrays["features"][a_begin:a_end]), self.a_mean, self.a_std
                     ),
@@ -231,6 +357,28 @@ class CrossMarketDateStore:
 def pad_cross_market_date_batches(batches: list[dict[str, Any]]) -> dict[str, np.ndarray]:
     if not batches:
         raise ValueError("at least one date batch is required")
+    required = {
+        "a_features", "a_labels", "a_stock_ids", "us_features", "us_stock_ids"
+    }
+    for row, batch in enumerate(batches):
+        missing = required.difference(batch)
+        if missing:
+            raise ValueError(f"date batch {row} is missing fields: {sorted(missing)}")
+        a_features = np.asarray(batch["a_features"])
+        a_labels = np.asarray(batch["a_labels"])
+        a_ids = np.asarray(batch["a_stock_ids"])
+        us_features = np.asarray(batch["us_features"])
+        us_ids = np.asarray(batch["us_stock_ids"])
+        if a_features.ndim != 2 or a_features.shape[1] != 360:
+            raise ValueError(f"date batch {row} A features must have shape [N, 360]")
+        if a_labels.shape != (len(a_features), 3) or a_ids.shape != (len(a_features),):
+            raise ValueError(f"date batch {row} A labels/IDs do not match A features")
+        if len(a_ids) < 1 or np.any(a_ids <= 0):
+            raise ValueError(f"date batch {row} must contain positive A stock IDs")
+        if us_features.ndim != 2 or us_features.shape[1] != 360:
+            raise ValueError(f"date batch {row} US features must have shape [N, 360]")
+        if us_ids.shape != (len(us_features),) or np.any(us_ids <= 0):
+            raise ValueError(f"date batch {row} US IDs do not match features or are nonpositive")
     batch_size = len(batches)
     max_a = max(len(batch["a_stock_ids"]) for batch in batches)
     max_us = max(1, max(len(batch["us_stock_ids"]) for batch in batches))
@@ -330,21 +478,8 @@ class Trainer:
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
-        warmup = torch.optim.lr_scheduler.LinearLR(
-            self.optimizer,
-            start_factor=args.warmup_start_factor,
-            end_factor=1.0,
-            total_iters=args.warmup_epochs,
-        )
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=FORMAL_EPOCHS - args.warmup_epochs,
-            eta_min=args.minimum_learning_rate,
-        )
-        self.scheduler = torch.optim.lr_scheduler.SequentialLR(
-            self.optimizer,
-            schedulers=[warmup, cosine],
-            milestones=[args.warmup_epochs],
+        self.scheduler = build_learning_rate_scheduler(
+            torch, self.optimizer, args
         )
         self.amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
         self.scaler = torch.amp.GradScaler(
@@ -375,7 +510,7 @@ class Trainer:
             "weight_decay": args.weight_decay,
             "warmup_epochs": args.warmup_epochs,
             "warmup_start_factor": args.warmup_start_factor,
-            "scheduler": "3-epoch linear warmup followed by cosine annealing",
+            "scheduler": SCHEDULER_DESCRIPTION,
             "checkpoint_split": "valid",
             "checkpoint_metric": "per-horizon RankIC",
             "selection_export_split": "selection_valid",
@@ -417,7 +552,8 @@ class Trainer:
     def train_epoch(self, epoch: int, max_days: int | None = None):
         torch = self.torch
         self.model.train()
-        losses: list[float] = []
+        loss_date_total = 0.0
+        loss_date_count = 0
         durations: list[float] = []
         processed = 0
         total_days = min(self.store.days("train"), max_days) if max_days else self.store.days("train")
@@ -436,12 +572,12 @@ class Trainer:
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Nonfinite training NLL: {[item['date'] for item in usable]}")
             # One optimizer update per real padded date batch.
-            scaled_loss = loss * (len(usable) / self.args.date_batch_size)
-            self.scaler.scale(scaled_loss).backward()
+            self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
             processed += len(usable)
-            losses.append(float(loss.detach()))
+            loss_date_total += float(loss.detach()) * len(usable)
+            loss_date_count += len(usable)
             durations.append(time.monotonic() - started)
             if processed % 100 == 0 or processed == total_days:
                 status = {
@@ -455,9 +591,9 @@ class Trainer:
                 }
                 write_json(self.args.output / "status.json", status)
                 print("PROGRESS " + json.dumps(status), flush=True)
-        if not losses:
+        if not loss_date_count:
             raise RuntimeError("No usable training labels")
-        return float(np.mean(losses)), durations
+        return loss_date_total / loss_date_count, durations
 
     def evaluate_current(
         self,
@@ -692,7 +828,8 @@ class Trainer:
                 "epoch_seconds": time.monotonic() - started,
             }
             history.append(row)
-            self.scheduler.step()
+            if epoch + 1 < FORMAL_EPOCHS:
+                self.scheduler.step()
             atomic_csv(pd.DataFrame(history), args.output / "epoch_metrics.csv")
             self._save_last_checkpoint(epoch + 1, history, best_rank_ic)
             print("EPOCH " + json.dumps(row), flush=True)
@@ -767,7 +904,12 @@ class Trainer:
         selected_horizons: tuple[str, ...],
         frozen_candidate: dict[str, Any] | None = None,
     ) -> None:
-        del manifest  # It was fully validated before this Trainer was created.
+        # Detect a manifest replacement in the interval between the shared
+        # selector validation and this first potential Test access.
+        manifest_path = Path(manifest_path).expanduser().resolve()
+        persisted_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if persisted_manifest != manifest:
+            raise RuntimeError("Selection manifest changed after validation")
         destination = self.args.output / "test_predictions.csv"
         summary_path = self.args.output / "test_summary.csv"
         access_path = self.args.output / "test_access.json"
@@ -864,8 +1006,8 @@ class Trainer:
         write_json(
             access_path,
             {
-                "selection_manifest": str(Path(manifest_path).resolve()),
-                "selection_manifest_sha256": file_hash(Path(manifest_path)),
+                "selection_manifest": str(manifest_path),
+                "selection_manifest_sha256": file_hash(manifest_path),
                 "candidate_name": candidate_name,
                 "horizons": list(selected_horizons),
                 "test_read": True,
@@ -887,7 +1029,7 @@ class Trainer:
             "schema_version": 1,
             "status": "test_complete",
             "test_read": True,
-            "selection_manifest": frozen_file(Path(manifest_path)),
+            "selection_manifest": frozen_file(manifest_path),
             "candidate_manifest": (
                 frozen_candidate["candidate_manifest"] if frozen_candidate is not None
                 else frozen_file(self.args.output / "selection_candidate_manifest.json")

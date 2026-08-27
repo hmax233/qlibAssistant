@@ -34,6 +34,10 @@ DEFAULT_OUTPUT = ROOT / ".qlibAssistant/cross_market/alpha360_e6_store"
 FIELDS = ("close", "open", "high", "low", "vwap", "volume")
 FEATURE_WIDTH = 360
 LOOKBACK = 60
+A_SIGNAL_TIME = "15:00"
+A_SIGNAL_TIMEZONE = "Asia/Shanghai"
+US_CLOSE_TIME = "16:00"
+US_CLOSE_TIMEZONE = "America/New_York"
 
 
 def sha256_file(path: Path) -> str:
@@ -135,22 +139,73 @@ def construct_us_alpha360(values: np.ndarray, positions: np.ndarray) -> np.ndarr
     return output.astype("float32", copy=False)
 
 
+def _session_date_index(values: Iterable[pd.Timestamp], *, market: str) -> pd.DatetimeIndex:
+    index = pd.DatetimeIndex(values)
+    if index.hasnans:
+        raise ValueError(f"{market} calendar contains NaT")
+    # Source dates are exchange-session labels, not instants.  Drop any source
+    # timezone while preserving the displayed exchange date before attaching
+    # the explicit exchange timezone below.
+    if index.tz is not None:
+        index = index.tz_localize(None)
+    return index.normalize()
+
+
+def _session_times_utc(
+    dates: pd.DatetimeIndex,
+    *,
+    local_time: str,
+    timezone: str,
+) -> np.ndarray:
+    hour, minute = (int(value) for value in local_time.split(":"))
+    local = dates.tz_localize(timezone) + pd.Timedelta(hours=hour, minutes=minute)
+    return local.tz_convert("UTC").tz_localize(None).to_numpy(dtype="datetime64[ns]")
+
+
+def strict_us_asof_alignment(
+    a_dates: Iterable[pd.Timestamp], us_calendar: Iterable[pd.Timestamp]
+) -> dict[str, np.ndarray]:
+    """Return the latest US close already observable at each China signal.
+
+    A signals are timestamped at 15:00 Asia/Shanghai.  A US session is only
+    eligible after its 16:00 America/New_York close, with daylight saving time
+    handled by the timezone database.  Comparing UTC instants makes the no-
+    future-information rule explicit and auditable.
+    """
+
+    a_index = _session_date_index(a_dates, market="A-share")
+    us_index = _session_date_index(us_calendar, market="US").unique().sort_values()
+    a_signal_times = _session_times_utc(
+        a_index, local_time=A_SIGNAL_TIME, timezone=A_SIGNAL_TIMEZONE
+    )
+    us_close_times = _session_times_utc(
+        us_index, local_time=US_CLOSE_TIME, timezone=US_CLOSE_TIMEZONE
+    )
+    positions = np.searchsorted(us_close_times, a_signal_times, side="left") - 1
+    asof_dates = np.full(len(a_index), np.datetime64("NaT"), dtype="datetime64[D]")
+    aligned_close_times = np.full(
+        len(a_index), np.datetime64("NaT"), dtype="datetime64[ns]"
+    )
+    valid = positions >= 0
+    if valid.any():
+        asof_dates[valid] = us_index.values[positions[valid]].astype("datetime64[D]")
+        aligned_close_times[valid] = us_close_times[positions[valid]]
+    if np.any(valid & ~(aligned_close_times < a_signal_times)):
+        raise AssertionError("US close must be strictly earlier than the A signal instant")
+    return {
+        "a_dates": a_index.values.astype("datetime64[D]"),
+        "a_signal_times_utc": a_signal_times,
+        "us_asof_dates": asof_dates,
+        "us_close_times_utc": aligned_close_times,
+    }
+
+
 def strict_us_asof_dates(
     a_dates: Iterable[pd.Timestamp], us_calendar: Iterable[pd.Timestamp]
 ) -> np.ndarray:
-    """Map each A date to the final US market date strictly before it."""
+    """Compatibility wrapper returning exchange dates from strict UTC alignment."""
 
-    a_index = pd.DatetimeIndex(a_dates).normalize()
-    us_index = pd.DatetimeIndex(us_calendar).normalize().unique().sort_values()
-    positions = us_index.searchsorted(a_index, side="left") - 1
-    result = np.full(len(a_index), np.datetime64("NaT"), dtype="datetime64[D]")
-    valid = positions >= 0
-    if valid.any():
-        result[valid] = us_index.values[positions[valid]].astype("datetime64[D]")
-    comparable_a = a_index.values.astype("datetime64[D]")
-    if np.any(valid & ~(result < comparable_a)):
-        raise AssertionError("US as-of date must be strictly earlier than A signal date")
-    return result
+    return strict_us_asof_alignment(a_dates, us_calendar)["us_asof_dates"]
 
 
 @dataclass
@@ -190,6 +245,60 @@ def _part_paths(a_store: Path, part: dict[str, Any]) -> dict[str, Path]:
     }
 
 
+def validate_split_boundaries(manifest: dict[str, Any]) -> None:
+    """Reject mislabeled, overlapping, or out-of-bound source parts."""
+
+    expected = ("train", "valid", "selection_valid", "test")
+    segments = manifest.get("segments", {})
+    if set(segments) != set(expected):
+        raise ValueError("E0 manifest must contain train/valid/selection_valid/test")
+    bounds: dict[str, tuple[pd.Timestamp, pd.Timestamp]] = {}
+    previous_end: pd.Timestamp | None = None
+    for split in expected:
+        values = segments[split]
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            raise ValueError(f"Invalid E0 segment bounds for {split}")
+        start, end = (pd.Timestamp(value).normalize() for value in values)
+        if pd.isna(start) or pd.isna(end) or start > end:
+            raise ValueError(f"Invalid E0 segment bounds for {split}")
+        if previous_end is not None and start <= previous_end:
+            raise ValueError("E0 segments must be strictly ordered and non-overlapping")
+        bounds[split] = (start, end)
+        previous_end = end
+
+    prefixes: set[str] = set()
+    seen_dates: dict[pd.Timestamp, str] = {}
+    dates_by_split = {split: [] for split in expected}
+    for part in manifest.get("parts", []):
+        prefix = str(part.get("prefix", ""))
+        split = part.get("split")
+        if not prefix or prefix in prefixes:
+            raise ValueError(f"Duplicate or empty E0 part prefix: {prefix!r}")
+        prefixes.add(prefix)
+        if split not in bounds:
+            raise ValueError(f"Unknown E0 part split: {split}")
+        dates = [pd.Timestamp(value).normalize() for value in part.get("dates", [])]
+        if not dates or any(pd.isna(value) for value in dates):
+            raise ValueError(f"E0 part {prefix} has no valid dates")
+        if dates != sorted(dates) or len(set(dates)) != len(dates):
+            raise ValueError(f"E0 part {prefix} dates must be sorted and unique")
+        start, end = bounds[split]
+        for value in dates:
+            if value < start or value > end:
+                raise ValueError(f"E0 part {prefix} date {value.date()} is outside {split}")
+            if value in seen_dates:
+                raise ValueError(
+                    f"E0 date {value.date()} appears in both {seen_dates[value]} and {split}"
+                )
+            seen_dates[value] = split
+        dates_by_split[split].extend(dates)
+    for split, dates in dates_by_split.items():
+        if not dates:
+            raise ValueError(f"E0 manifest has no {split} parts")
+        if dates != sorted(dates):
+            raise ValueError(f"E0 {split} parts are not in chronological order")
+
+
 def validate_a_store(a_store: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Validate E0 metadata and every memory-mapped array/hash."""
 
@@ -199,9 +308,7 @@ def validate_a_store(a_store: Path) -> tuple[dict[str, Any], dict[str, Any]]:
         raise ValueError("E0 feature_names are not canonical field-major Alpha360")
     if int(manifest.get("stock_count", 0)) <= 0:
         raise ValueError("E0 manifest has no stocks")
-    required_segments = {"train", "valid", "selection_valid", "test"}
-    if set(manifest.get("segments", {})) != required_segments:
-        raise ValueError("E0 manifest must contain train/valid/selection_valid/test")
+    validate_split_boundaries(manifest)
     sidecars: dict[str, Any] = {}
     for name, key in (
         ("normalizer.npz", "normalizer_sha256"),
@@ -321,7 +428,8 @@ def _build_us_part(
     us_calendar: pd.DatetimeIndex,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     a_dates = pd.DatetimeIndex([part["dates"][index] for index in day_indices]).normalize()
-    asof_dates = strict_us_asof_dates(a_dates, us_calendar)
+    alignment = strict_us_asof_alignment(a_dates, us_calendar)
+    asof_dates = alignment["us_asof_dates"]
     rows: list[np.ndarray] = []
     ids: list[int] = []
     offsets = [0]
@@ -349,13 +457,16 @@ def _build_us_part(
         offsets.append(len(ids))
     features = np.asarray(rows, dtype="float32").reshape(-1, FEATURE_WIDTH)
     arrays = {
-        "a_dates": a_dates.values.astype("datetime64[D]"),
-        "us_asof_dates": asof_dates,
+        **alignment,
         "us_features": features,
         "us_stock_ids": np.asarray(ids, dtype="int32"),
         "us_offsets": np.asarray(offsets, dtype="int64"),
     }
-    if np.any(~np.isnat(asof_dates) & ~(asof_dates < arrays["a_dates"])):
+    observed = ~np.isnat(arrays["us_close_times_utc"])
+    if np.any(
+        observed
+        & ~(arrays["us_close_times_utc"] < arrays["a_signal_times_utc"])
+    ):
         raise AssertionError("US as-of leakage detected while writing a part")
     sizes = np.diff(arrays["us_offsets"])
     stats = {
@@ -420,7 +531,7 @@ def build_store(args: argparse.Namespace) -> dict[str, Any]:
     us_sources = [source_record(raw_dir / f"{symbol}.parquet") for symbol in symbols]
     selected = _selected_parts(a_manifest, args.max_a_dates)
     configuration = {
-        "schema_version": 1,
+        "schema_version": 2,
         "a_source_identity": a_identity,
         "a_selected_dates": [
             {"prefix": part["prefix"], "indices": indices} for part, indices in selected
@@ -430,7 +541,10 @@ def build_store(args: argparse.Namespace) -> dict[str, Any]:
         "symbols": symbols,
         "max_us_stocks": args.max_us_stocks,
         "max_a_dates_per_split": args.max_a_dates,
-        "asof_rule": "max(US market date < A signal calendar date); same-day US close forbidden",
+        "asof_rule": (
+            "max(US 16:00 America/New_York close timestamp < "
+            "A 15:00 Asia/Shanghai signal timestamp), compared in UTC"
+        ),
         "adjustment": "OHLC *= adjclose/close; volume /= adjclose/close; VWAP = adjusted OHLC4 proxy",
     }
     fingerprint = canonical_hash(configuration)
@@ -456,7 +570,7 @@ def build_store(args: argparse.Namespace) -> dict[str, Any]:
             _verify_output_part(output, record)
     else:
         state = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "building",
             "input_fingerprint": fingerprint,
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -532,10 +646,11 @@ def build_store(args: argparse.Namespace) -> dict[str, Any]:
         or final_us_sources != us_sources
     ):
         raise RuntimeError(
-            "A source changed during construction; output remains resumable but is not finalized"
+            "An A/US/universe source changed during construction; output remains resumable "
+            "but is not finalized"
         )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
         "input_fingerprint": fingerprint,
         "created_at": state["created_at"],
@@ -550,8 +665,17 @@ def build_store(args: argparse.Namespace) -> dict[str, Any]:
         },
         "alignment": {
             "rule": configuration["asof_rule"],
+            "a_signal_local_time": A_SIGNAL_TIME,
+            "a_signal_timezone": A_SIGNAL_TIMEZONE,
+            "us_close_local_time": US_CLOSE_TIME,
+            "us_close_timezone": US_CLOSE_TIMEZONE,
+            "comparison_timezone": "UTC",
             "same_calendar_day_us_close_allowed": False,
-            "per_a_date_files": "*_a_dates.npy and *_us_asof_dates.npy",
+            "strictly_prior_close_required": True,
+            "per_a_date_files": (
+                "*_a_dates.npy, *_a_signal_times_utc.npy, *_us_asof_dates.npy, "
+                "and *_us_close_times_utc.npy"
+            ),
         },
         "a_source": {
             **a_identity,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from roll.alpha360_cross_market import (
@@ -80,6 +81,18 @@ def test_market_and_stock_identity_embeddings_are_trainable() -> None:
         assert encoder.stock_identity.embedding_dim == 64
 
 
+def test_four_gaussian_heads_are_parameter_independent() -> None:
+    network = model()
+    assert tuple(network.heads) == HORIZON_NAMES
+    parameter_ids = [
+        {parameter.data_ptr() for parameter in head.parameters()}
+        for head in network.heads.values()
+    ]
+    for left, left_ids in enumerate(parameter_ids):
+        for right_ids in parameter_ids[left + 1:]:
+            assert left_ids.isdisjoint(right_ids)
+
+
 def test_masked_stocks_cannot_change_valid_a_predictions() -> None:
     torch.manual_seed(11)
     network = model().eval()
@@ -157,6 +170,8 @@ def test_fully_masked_us_date_is_safe_and_feature_independent() -> None:
     inputs = list(sample_inputs())
     inputs[5] = inputs[5].clone()
     inputs[5][0] = False
+    inputs[3] = inputs[3].clone()
+    inputs[3][0] = 0
     original = network(*inputs)
     assert torch.isfinite(original["mean"]).all()
     assert torch.isfinite(original["std"]).all()
@@ -170,6 +185,36 @@ def test_fully_masked_us_date_is_safe_and_feature_independent() -> None:
     torch.testing.assert_close(
         original["std"][0], changed["std"][0], atol=2e-6, rtol=2e-6
     )
+
+
+def test_fully_masked_us_batch_is_safe_and_padding_tokens_stay_zero() -> None:
+    torch.manual_seed(151)
+    network = model().eval()
+    inputs = list(sample_inputs())
+    inputs[3] = torch.zeros_like(inputs[3])
+    inputs[5] = torch.zeros_like(inputs[5])
+    output = network(*inputs)
+    assert torch.isfinite(output["mean"]).all()
+    assert torch.isfinite(output["std"]).all()
+
+    state = torch.randn(2, 6, small_config().model_width)
+    token = network._add_market_embedding(state, 1, inputs[5])
+    assert not token.any()
+
+
+def test_masks_and_stock_ids_must_describe_real_vs_padded_slots() -> None:
+    network = model().eval()
+    inputs = list(sample_inputs())
+    inputs[2] = inputs[2].clone()
+    inputs[2][0, 0] = 0
+    with torch.no_grad(), pytest.raises(ValueError, match="valid stock IDs"):
+        network(*inputs)
+
+    inputs = list(sample_inputs())
+    inputs[3] = inputs[3].clone()
+    inputs[3][0, -1] = 9
+    with torch.no_grad(), pytest.raises(ValueError, match="padded stock IDs"):
+        network(*inputs)
 
 
 def test_backward_reaches_both_encoders_embeddings_attention_and_heads() -> None:

@@ -21,7 +21,9 @@ from build_alpha360_cross_market_store import (  # noqa: E402
     build_store,
     construct_us_alpha360,
     sha256_file,
+    strict_us_asof_alignment,
     strict_us_asof_dates,
+    validate_a_store,
 )
 
 
@@ -178,6 +180,26 @@ def test_strict_asof_handles_weekends_holidays_and_forbids_same_day() -> None:
     assert np.all(aligned < a.values.astype("datetime64[D]"))
 
 
+def test_asof_compares_actual_exchange_close_and_signal_instants_in_utc() -> None:
+    # July exercises US daylight saving time.  The July 6 US close is 20:00
+    # UTC and is available at the July 7 China signal (07:00 UTC); the July 7
+    # US close is 20:00 UTC and must not be used at that signal.
+    alignment = strict_us_asof_alignment(
+        pd.to_datetime(["2026-07-07"]),
+        pd.to_datetime(["2026-07-06", "2026-07-07"]),
+    )
+    assert alignment["us_asof_dates"].astype(str).tolist() == ["2026-07-06"]
+    assert alignment["a_signal_times_utc"].astype(str).tolist() == [
+        "2026-07-07T07:00:00.000000000"
+    ]
+    assert alignment["us_close_times_utc"].astype(str).tolist() == [
+        "2026-07-06T20:00:00.000000000"
+    ]
+    assert np.all(
+        alignment["us_close_times_utc"] < alignment["a_signal_times_utc"]
+    )
+
+
 def test_builder_uses_train_only_normalization_and_pins_all_inputs(tmp_path: Path) -> None:
     a_store = _make_e0_store(tmp_path / "a_store")
     raw, universe = _make_us_source(tmp_path / "us")
@@ -185,9 +207,12 @@ def test_builder_uses_train_only_normalization_and_pins_all_inputs(tmp_path: Pat
     manifest = build_store(_args(a_store, raw, universe, output))
 
     assert manifest["status"] == "complete"
+    assert manifest["schema_version"] == 2
     assert manifest["normalizers"]["independent_markets"] is True
     assert manifest["normalizers"]["us"]["fit_split"] == "train only"
     assert manifest["alignment"]["same_calendar_day_us_close_allowed"] is False
+    assert manifest["alignment"]["strictly_prior_close_required"] is True
+    assert manifest["alignment"]["comparison_timezone"] == "UTC"
     assert "survivorship bias" in manifest["us_source"]["survivorship_bias"]
     assert manifest["stock_dictionaries"]["a_count"] == 2
     assert manifest["stock_dictionaries"]["us_count"] == 1
@@ -200,7 +225,10 @@ def test_builder_uses_train_only_normalization_and_pins_all_inputs(tmp_path: Pat
         if part["split"] == "train":
             train_arrays.append(features)
         a_dates = np.load(output / f"{part['prefix']}_a_dates.npy")
+        a_signal_times = np.load(output / f"{part['prefix']}_a_signal_times_utc.npy")
         us_dates = np.load(output / f"{part['prefix']}_us_asof_dates.npy")
+        us_close_times = np.load(output / f"{part['prefix']}_us_close_times_utc.npy")
+        assert np.all(us_close_times < a_signal_times)
         assert np.all(us_dates < a_dates)
         for name, expected in part["sha256"].items():
             assert sha256_file(output / name) == expected
@@ -275,3 +303,18 @@ def test_builder_refuses_any_output_under_investment_data(tmp_path: Path) -> Non
     )
     with pytest.raises(ValueError, match="Refusing to write"):
         build_store(args)
+
+
+def test_a_source_split_dates_cannot_be_mislabeled_into_pretest_data(
+    tmp_path: Path,
+) -> None:
+    a_store = _make_e0_store(tmp_path / "a_store")
+    manifest_path = a_store / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    selection_part = next(
+        part for part in manifest["parts"] if part["split"] == "selection_valid"
+    )
+    selection_part["dates"] = ["2020-04-08"]  # Held-out Test date.
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="outside selection_valid"):
+        validate_a_store(a_store)

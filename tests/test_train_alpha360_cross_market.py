@@ -15,6 +15,7 @@ from script.train_alpha360_cross_market import (
     TRAIN_SPLITS,
     CrossMarketDateStore,
     Trainer,
+    build_learning_rate_scheduler,
     file_hash,
     pad_cross_market_date_batches,
     parse_args,
@@ -75,8 +76,14 @@ def make_cross_store(root: Path) -> Path:
             references[name] = _source(path)
         us_values = {
             "a_dates": np.asarray([date], dtype="datetime64[D]"),
+            "a_signal_times_utc": np.asarray(
+                [f"{date}T07:00:00"], dtype="datetime64[ns]"
+            ),
             "us_asof_dates": np.asarray(
                 [(pd.Timestamp(date) - pd.Timedelta(days=1)).date()], dtype="datetime64[D]"
+            ),
+            "us_close_times_utc": np.asarray(
+                [pd.Timestamp(date) - pd.Timedelta(hours=12)], dtype="datetime64[ns]"
             ),
             "us_features": np.full((1, 360), number + 0.5, dtype="float32"),
             "us_stock_ids": np.asarray([1], dtype="int32"),
@@ -98,12 +105,16 @@ def make_cross_store(root: Path) -> Path:
         )
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
         "input_fingerprint": "synthetic-e6-store",
         "segments": {name: [date, date] for name, date in dates.items()},
         "feature_layout": {"width": 360},
-        "alignment": {"same_calendar_day_us_close_allowed": False},
+        "alignment": {
+            "same_calendar_day_us_close_allowed": False,
+            "strictly_prior_close_required": True,
+            "comparison_timezone": "UTC",
+        },
         "normalizers": {
             "independent_markets": True,
             "a": "a_normalizer.npz",
@@ -151,6 +162,25 @@ def test_padding_is_a_true_variable_size_date_batch_with_two_masks() -> None:
     assert padded["us_mask"].tolist() == [[True, True, True], [False, False, False]]
     assert np.isnan(padded["a_labels"][0, 2:]).all()
     assert not padded["us_features"][1].any()
+
+
+def test_padding_rejects_empty_a_dates_and_mismatched_rows() -> None:
+    empty_a = {
+        "a_features": np.empty((0, 360), dtype="float32"),
+        "a_labels": np.empty((0, 3), dtype="float32"),
+        "a_stock_ids": np.empty((0,), dtype="int64"),
+        "us_features": np.ones((1, 360), dtype="float32"),
+        "us_stock_ids": np.asarray([1]),
+    }
+    with pytest.raises(ValueError, match="at least one|must contain positive"):
+        pad_cross_market_date_batches([empty_a])
+
+    mismatched = dict(empty_a)
+    mismatched["a_features"] = np.ones((2, 360), dtype="float32")
+    mismatched["a_labels"] = np.ones((1, 3), dtype="float32")
+    mismatched["a_stock_ids"] = np.asarray([1, 2])
+    with pytest.raises(ValueError, match="labels/IDs"):
+        pad_cross_market_date_batches([mismatched])
 
 
 def test_training_scoped_verification_and_iteration_never_touch_test(tmp_path: Path) -> None:
@@ -207,6 +237,26 @@ def test_protocol_defaults_are_fixed_and_not_cli_overridable(tmp_path: Path) -> 
         )
 
 
+def test_schedule_uses_three_warmup_epochs_and_eta_min_during_epoch_50(
+    tmp_path: Path,
+) -> None:
+    args = parse_args(
+        ["train", "--data", str(tmp_path / "data"), "--output", str(tmp_path / "run")]
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.AdamW([parameter], lr=args.learning_rate)
+    scheduler = build_learning_rate_scheduler(torch, optimizer, args)
+    used = []
+    for epoch in range(FORMAL_EPOCHS):
+        used.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        if epoch + 1 < FORMAL_EPOCHS:
+            scheduler.step()
+    assert used[:4] == pytest.approx([1e-4, 2e-4, 3e-4, 3e-4])
+    assert used[-1] == pytest.approx(1e-6)
+    assert min(used) == pytest.approx(1e-6)
+
+
 def test_training_source_has_one_update_per_batch_and_no_forbidden_operations() -> None:
     source = Path(__file__).parents[1].joinpath(
         "script/train_alpha360_cross_market.py"
@@ -214,7 +264,9 @@ def test_training_source_has_one_update_per_batch_and_no_forbidden_operations() 
     assert "clip_grad_norm_" not in source
     assert "max_norm" not in source
     assert source.count("self.scaler.step(self.optimizer)") == 1
-    assert source.count("self.scaler.scale(scaled_loss).backward()") == 1
+    assert source.count("self.scaler.scale(loss).backward()") == 1
+    assert "scaled_loss" not in source
+    assert "len(usable) / self.args.date_batch_size" not in source
     assert "group_date_batches(iterator, self.args.date_batch_size)" in source
 
 
