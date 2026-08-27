@@ -12,6 +12,8 @@ directory rename publishes the completed local result.
 from __future__ import annotations
 
 import argparse
+import base64
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -30,6 +32,35 @@ HOST_KEY_ALIAS = "192.168.1.7"
 REMOTE_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_e6_full_260828"
 REMOTE_BASE_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_probabilistic_matrix_260828"
 REMOTE_E0_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_cross_stock_fold3_120m_v2_260828/run"
+WATCHDOG_AUDIT_LOG = (
+    ROOT / ".qlibAssistant/analysis/alpha360_e0_e6_260828_watchdog.jsonl"
+)
+WATCHDOG_TARGETS = (
+    {
+        "key": "base",
+        "task_name": "Qlib_Alpha360_Probabilistic_Matrix_260828",
+        "status_path": f"{REMOTE_BASE_ROOT}/pipeline_status.json",
+        "process_marker": REMOTE_BASE_ROOT.replace("/", "\\"),
+        "complete_statuses": frozenset({"selection_ready", "test_ready"}),
+        "incomplete_statuses": frozenset({
+            "waiting_for_e0", "materializing_e0_selection", "skipped_selection_ready",
+            "training", "selecting_ensemble",
+        }),
+    },
+    {
+        "key": "combined",
+        "task_name": "Qlib_Alpha360_E6_Combined_260828",
+        "status_path": f"{REMOTE_ROOT}/pipeline_status.json",
+        "process_marker": REMOTE_ROOT.replace("/", "\\"),
+        "complete_statuses": frozenset({"test_ready"}),
+        "incomplete_statuses": frozenset({
+            "waiting_for_e0_e5_selection", "training_e6",
+            "selecting_e0_e6_ensemble", "materializing_selected_test",
+            "selected_candidate_test_complete",
+        }),
+    },
+)
+WATCHDOG_TASK_WHITELIST = frozenset(value["task_name"] for value in WATCHDOG_TARGETS)
 REMOTE_FILES = {
     "pipeline_status.json": "pipeline_status.json",
     "pipeline.log": "pipeline.log",
@@ -44,6 +75,12 @@ REMOTE_FILES = {
         "test_evaluation_e0_e6/evaluated_selection_manifest.json"
     ),
 }
+
+
+class RemoteWatchdogUnavailable(RuntimeError):
+    """The remote watchdog snapshot could not be authenticated or retrieved."""
+
+
 REMOTE_EPOCH_METRICS = {
     "E0_joint_three_leg": f"{REMOTE_E0_ROOT}/epoch_metrics.csv",
     "E1_shared_four_head": f"{REMOTE_BASE_ROOT}/E1_shared_four_head/epoch_metrics.csv",
@@ -73,6 +110,276 @@ def scp_base() -> list[str]:
         "-o", "StrictHostKeyChecking=yes",
         "-P", PORT,
     ]
+
+
+def _watchdog_powershell() -> str:
+    targets = [
+        {
+            "key": value["key"],
+            "task_name": value["task_name"],
+            "status_path": value["status_path"].replace("/", "\\"),
+            "process_marker": value["process_marker"],
+        }
+        for value in WATCHDOG_TARGETS
+    ]
+    target_json = json.dumps(targets, ensure_ascii=True).replace("'", "''")
+    return rf"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$utf8NoBom = New-Object System.Text.UTF8Encoding -ArgumentList $false
+[Console]::OutputEncoding = $utf8NoBom
+$targets = ConvertFrom-Json @'
+{target_json}
+'@
+$processError = $null
+$pythonProcesses = @()
+try {{
+    $pythonProcesses = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction Stop)
+}} catch {{
+    $processError = $_.Exception.Message
+}}
+$result = @()
+foreach ($target in $targets) {{
+    $statusBody = $null
+    $statusError = $null
+    try {{
+        $statusBody = Get-Content -LiteralPath $target.status_path -Raw -ErrorAction Stop | ConvertFrom-Json
+    }} catch {{
+        $statusError = $_.Exception.Message
+    }}
+    $taskExists = $false
+    $taskState = $null
+    $taskError = $null
+    try {{
+        $task = Get-ScheduledTask -TaskName $target.task_name -ErrorAction Stop
+        $taskExists = $true
+        $taskState = [string]$task.State
+    }} catch {{
+        $taskError = $_.Exception.Message
+    }}
+    $matching = @()
+    if ($null -eq $processError) {{
+        $matching = @($pythonProcesses | Where-Object {{
+            $_.CommandLine -and
+            $_.CommandLine.IndexOf($target.process_marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        }})
+    }}
+    $result += [pscustomobject]@{{
+        key = [string]$target.key
+        task_name = [string]$target.task_name
+        pipeline_status = if ($null -ne $statusBody) {{ [string]$statusBody.status }} else {{ $null }}
+        pipeline_updated = if ($null -ne $statusBody) {{ [string]$statusBody.updated }} else {{ $null }}
+        status_body = $statusBody
+        status_error = $statusError
+        task_exists = $taskExists
+        task_state = $taskState
+        task_error = $taskError
+        matching_python_count = if ($null -eq $processError) {{ $matching.Count }} else {{ $null }}
+        matching_python_pids = @($matching | ForEach-Object {{ [int]$_.ProcessId }})
+        process_query_error = $processError
+    }}
+}}
+$result | ConvertTo-Json -Depth 12 -Compress
+""".strip()
+
+
+def _decode_json_output(raw: bytes) -> object:
+    text = raw.decode("utf-8-sig", errors="strict").strip()
+    candidates = [text, *reversed([line.strip() for line in text.splitlines()])]
+    for candidate in candidates:
+        if not candidate or candidate[0] not in "[{":
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise ValueError("Remote watchdog returned no JSON payload")
+
+
+def query_watchdog_snapshot() -> list[dict]:
+    encoded = base64.b64encode(_watchdog_powershell().encode("utf-16le")).decode("ascii")
+    command = [
+        *ssh_base(),
+        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-EncodedCommand", encoded,
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, timeout=30,
+        )
+        value = _decode_json_output(completed.stdout)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as error:
+        raise RemoteWatchdogUnavailable(str(error)) from error
+    if isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise RemoteWatchdogUnavailable("Remote watchdog snapshot is not a JSON object list")
+    expected_keys = {target["key"] for target in WATCHDOG_TARGETS}
+    observed_keys = [item.get("key") for item in value]
+    if len(value) != len(WATCHDOG_TARGETS) or set(observed_keys) != expected_keys:
+        raise RemoteWatchdogUnavailable(
+            f"Remote watchdog snapshot identity mismatch: {observed_keys}"
+        )
+    return value
+
+
+def watchdog_decisions(snapshot: list[dict]) -> list[dict]:
+    """Return fail-closed decisions for the two explicitly authorized tasks."""
+
+    by_key = {item.get("key"): item for item in snapshot if isinstance(item, dict)}
+    decisions: list[dict] = []
+    for target in WATCHDOG_TARGETS:
+        observed = by_key.get(target["key"])
+        decision = {
+            "key": target["key"],
+            "task_name": target["task_name"],
+            "restart_eligible": False,
+            "reason": "snapshot_missing",
+        }
+        if observed is None:
+            decisions.append(decision)
+            continue
+        if observed.get("task_name") != target["task_name"]:
+            decision["reason"] = "snapshot_identity_mismatch"
+        elif observed.get("status_error") or not isinstance(
+            observed.get("pipeline_status"), str
+        ):
+            decision["reason"] = "pipeline_status_unavailable"
+        elif observed["pipeline_status"] in target["complete_statuses"]:
+            decision["reason"] = "pipeline_complete"
+        elif observed["pipeline_status"] not in target["incomplete_statuses"]:
+            decision["reason"] = "pipeline_status_unrecognized"
+        elif not observed.get("task_exists") or observed.get("task_error"):
+            decision["reason"] = "scheduled_task_unavailable"
+        elif str(observed.get("task_state", "")).casefold() == "running":
+            decision["reason"] = "scheduled_task_running"
+        elif observed.get("process_query_error"):
+            decision["reason"] = "python_process_query_unavailable"
+        elif observed.get("matching_python_count") != 0:
+            decision["reason"] = "matching_pipeline_python_running"
+        else:
+            decision["restart_eligible"] = True
+            decision["reason"] = "incomplete_task_stopped_no_matching_python"
+        decision.update({
+            "pipeline_status": observed.get("pipeline_status"),
+            "pipeline_updated": observed.get("pipeline_updated"),
+            "task_state": observed.get("task_state"),
+            "matching_python_count": observed.get("matching_python_count"),
+            "matching_python_pids": observed.get("matching_python_pids", []),
+        })
+        decisions.append(decision)
+    return decisions
+
+
+def append_watchdog_audit(path: Path, record: dict) -> None:
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run_authorized_scheduled_task(task_name: str) -> subprocess.CompletedProcess:
+    if task_name not in WATCHDOG_TASK_WHITELIST:
+        raise ValueError(f"Scheduled task is not watchdog-authorized: {task_name}")
+    return subprocess.run(
+        [*ssh_base(), "schtasks", "/Run", "/TN", task_name],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def run_training_watchdog(audit_log: Path, *, allow_restart: bool) -> list[dict] | None:
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        snapshot = query_watchdog_snapshot()
+    except RemoteWatchdogUnavailable as error:
+        append_watchdog_audit(audit_log, {
+            "timestamp": timestamp,
+            "event": "watchdog_offline_or_unavailable",
+            "host": HOST,
+            "error": str(error),
+            "action": "retry_next_launchd_interval",
+        })
+        print(f"Remote watchdog unavailable; retry next interval: {error}")
+        return None
+
+    decisions = watchdog_decisions(snapshot)
+    append_watchdog_audit(audit_log, {
+        "timestamp": timestamp,
+        "event": "watchdog_check",
+        "host": HOST,
+        "allow_restart": allow_restart,
+        "decisions": decisions,
+    })
+    if not allow_restart:
+        return snapshot
+
+    eligible = [decision for decision in decisions if decision["restart_eligible"]]
+    if not eligible:
+        return snapshot
+
+    # Close the obvious observation/action race: immediately re-read all three
+    # gates before issuing any authorized /Run.  If the host drops offline or a
+    # task/process state changes, fail closed and let the next interval retry.
+    try:
+        recheck_snapshot = query_watchdog_snapshot()
+    except RemoteWatchdogUnavailable as error:
+        append_watchdog_audit(audit_log, {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "event": "watchdog_pre_run_recheck_unavailable",
+            "host": HOST,
+            "error": str(error),
+            "action": "no_restart_retry_next_launchd_interval",
+        })
+        return None
+    recheck_decisions = watchdog_decisions(recheck_snapshot)
+    append_watchdog_audit(audit_log, {
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "event": "watchdog_pre_run_recheck",
+        "host": HOST,
+        "decisions": recheck_decisions,
+    })
+    initially_eligible = {decision["task_name"] for decision in eligible}
+    for decision in recheck_decisions:
+        if decision["task_name"] not in initially_eligible:
+            continue
+        if not decision["restart_eligible"]:
+            continue
+        task_name = decision["task_name"]
+        result_record = {
+            "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "event": "watchdog_schtasks_run",
+            "host": HOST,
+            "task_name": task_name,
+            "preconditions": decision,
+        }
+        try:
+            completed = run_authorized_scheduled_task(task_name)
+            result_record.update({
+                "result": "submitted",
+                "returncode": completed.returncode,
+                "stdout": completed.stdout.decode("utf-8", errors="replace").strip()[:2000],
+                "stderr": completed.stderr.decode("utf-8", errors="replace").strip()[:2000],
+            })
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            result_record.update({
+                "result": "failed_retry_next_interval",
+                "error": str(error),
+            })
+        append_watchdog_audit(audit_log, result_record)
+    return recheck_snapshot
+
+
+def combined_status_from_snapshot(snapshot: list[dict]) -> dict:
+    for item in snapshot:
+        if (
+            item.get("key") == "combined"
+            and item.get("task_name") == "Qlib_Alpha360_E6_Combined_260828"
+            and isinstance(item.get("status_body"), dict)
+        ):
+            return item["status_body"]
+    raise RemoteWatchdogUnavailable("Combined pipeline status is absent from watchdog snapshot")
 
 
 def remote_status() -> dict:
@@ -274,12 +581,47 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / ".qlibAssistant/analysis/alpha360_e0_e6_260828",
     )
     parser.add_argument("--status-only", action="store_true")
+    parser.add_argument(
+        "--watchdog",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Check and, when all strict gates pass, restart only the two authorized tasks.",
+    )
+    parser.add_argument(
+        "--watchdog-audit-log",
+        type=Path,
+        default=WATCHDOG_AUDIT_LOG,
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    status = remote_status()
+    if args.watchdog:
+        snapshot = run_training_watchdog(
+            args.watchdog_audit_log,
+            allow_restart=not args.status_only,
+        )
+        if snapshot is None:
+            return 3
+        try:
+            status = combined_status_from_snapshot(snapshot)
+        except RemoteWatchdogUnavailable as error:
+            append_watchdog_audit(args.watchdog_audit_log, {
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "event": "watchdog_combined_status_unavailable",
+                "host": HOST,
+                "error": str(error),
+                "action": "retry_next_launchd_interval",
+            })
+            print(f"Combined pipeline status unavailable; retry next interval: {error}")
+            return 3
+    else:
+        try:
+            status = remote_status()
+        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+            print(f"Remote status unavailable; retry next interval: {error}")
+            return 3
     print(json.dumps(status, ensure_ascii=False, indent=2))
     if args.status_only:
         return 0
