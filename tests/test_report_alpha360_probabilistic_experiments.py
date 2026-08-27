@@ -82,6 +82,42 @@ def index_fixture(path: Path) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
     return frame, pd.DatetimeIndex(calendar)
 
 
+def fixed_reference_fixture(path: Path) -> pd.DataFrame:
+    rows = []
+    for exit_time in ("10:30", "15:00"):
+        for fallback in (False, True):
+            for slippage in (0.0, 5.0):
+                net = (
+                    0.15
+                    - (0.03 if exit_time == "10:30" else 0.0)
+                    - (0.03 if fallback else 0.0)
+                    - slippage / 1000
+                )
+                rows.append({
+                    "buy_time": "15:00",
+                    "exit_time": exit_time,
+                    "fallback": fallback,
+                    "slippage_bps_each_side": slippage,
+                    "signal_days": 4,
+                    "completed_trades": 4 if fallback else 3,
+                    "net_cumulative": net,
+                    "max_drawdown": -0.20 if fallback else -0.15,
+                    "trade_win_rate": 0.60 if fallback else 0.55,
+                    "average_net_trade_return": 0.002,
+                    "total_fees": 2500.0,
+                    "blocked_buy_candidates": 20,
+                    "blocked_sell_attempts": 10,
+                    "skipped_due_existing_holding": 10,
+                    "average_selected_rank": 1.3 if fallback else 1.0,
+                    "max_selected_rank": 3 if fallback else 1,
+                    "ending_equity": 100_000 * (1 + net),
+                    "unclosed_position": False,
+                })
+    frame = pd.DataFrame(rows)
+    frame.to_csv(path, index=False)
+    return frame
+
+
 def write_strict_directory(
     path: Path,
     variant: str,
@@ -256,6 +292,8 @@ def complete_fixture(tmp_path: Path) -> dict[str, Path]:
     pd.DataFrame(test_rows).to_csv(test_summary, index=False)
     index_cache = tmp_path / "index.csv"
     index, calendar = index_fixture(index_cache)
+    fixed_reference = tmp_path / "fixed_reference_summary.csv"
+    fixed_reference_fixture(fixed_reference)
     mainboard = tmp_path / "mainboard"
     all_pool = tmp_path / "all"
     write_strict_directory(
@@ -274,6 +312,7 @@ def complete_fixture(tmp_path: Path) -> dict[str, Path]:
         "mainboard": mainboard,
         "all": all_pool,
         "index": index_cache,
+        "fixed_reference": fixed_reference,
         "output": tmp_path / "report",
     }
 
@@ -287,6 +326,8 @@ def run_report(paths: dict[str, Path]) -> Path:
         mainboard_backtest_dir=paths["mainboard"],
         all_backtest_dir=paths["all"],
         index_cache_path=paths["index"],
+        fixed_reference_summary_path=paths["fixed_reference"],
+        execution_policy="fallback",
         output_directory=paths["output"],
     )
 
@@ -294,13 +335,17 @@ def run_report(paths: dict[str, Path]) -> Path:
 def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[str, Path]) -> None:
     input_paths = [
         complete_fixture[key]
-        for key in ("selection_manifest", "selection_predictions", "test_summary", "test_predictions", "index")
+        for key in (
+            "selection_manifest", "selection_predictions", "test_summary",
+            "test_predictions", "index", "fixed_reference",
+        )
     ]
     before = {path: file_hash(path) for path in input_paths}
     output = run_report(complete_fixture)
     assert {path.name for path in output.iterdir()} == {
         "concise_summary.csv",
         "model_selection.csv",
+        "fixed_reference_comparison.csv",
         "prediction_metrics_comparison.png",
         "strategy_equity_curves.png",
         "method_and_findings.md",
@@ -311,6 +356,22 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert summary.loc[0, "mainboard_selection_rule"] == "frozen_rule_0"
     assert summary.loc[0, "mainboard_selection_rule_test_net_cumulative"] == pytest.approx(0.03)
     assert summary.loc[0, "all_selection_rule_test_net_cumulative"] == pytest.approx(0.033)
+    comparison = pd.read_csv(output / "fixed_reference_comparison.csv")
+    assert len(comparison) == 1
+    assert comparison.loc[0, "horizon"] == "close1_close2"
+    assert comparison.loc[0, "board_variant"] == "mainboard"
+    assert comparison.loc[0, "topk"] == 1
+    assert comparison.loc[0, "execution_policy"] == "fallback"
+    assert comparison.loc[0, "comparability"] == (
+        "approximate_old_fallback_rank_cap_20_vs_new_full_ranking"
+    )
+    assert comparison.loc[0, "alpha360_net_cumulative"] == pytest.approx(0.025)
+    assert comparison.loc[0, "fixed_reference_net_cumulative"] == pytest.approx(0.115)
+    assert comparison.loc[
+        0, "delta_alpha360_minus_fixed_net_cumulative"
+    ] == pytest.approx(-0.09)
+    assert comparison.loc[0, "alpha360_completed_trades"] == 4
+    assert comparison.loc[0, "fixed_reference_completed_trades"] == 4
     for column in (
         "test_coverage_50", "test_coverage_80", "test_coverage_95",
         "test_top1_win_rate", "test_top3_mean_return", "test_top5_cumulative",
@@ -335,6 +396,9 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert "STAR and ChiNext excluded" in method
     assert "Calibration and frictionless ranking diagnostics" in method
     assert "Top1 win/mean/cum" in method
+    assert "does not participate in model Selection" in method
+    assert "old Fixed implementation searched at most through rank 20" in method
+    assert "close1_close2" in method
     assert {path: file_hash(path) for path in input_paths} == before
 
 
@@ -365,4 +429,97 @@ def test_rejects_test_diagnostic_grid(complete_fixture: dict[str, Path]) -> None
     method_path.write_text(json.dumps(method), encoding="utf-8")
     with pytest.raises(ValueError, match="must not generate a Test diagnostic"):
         run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_duplicate_fixed_reference_row_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["fixed_reference"]
+    frame = pd.read_csv(path)
+    pd.concat([frame, frame.iloc[[0]]], ignore_index=True).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="duplicate key rows"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_missing_fixed_reference_row_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["fixed_reference"]
+    frame = pd.read_csv(path)
+    frame.iloc[:-1].to_csv(path, index=False)
+    with pytest.raises(ValueError, match="grid mismatch"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_wrong_fixed_reference_row_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["fixed_reference"]
+    frame = pd.read_csv(path)
+    frame.loc[0, "buy_time"] = "14:59"
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="grid mismatch"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_fixed_reference_signal_day_mismatch_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    path = complete_fixture["fixed_reference"]
+    frame = pd.read_csv(path)
+    frame["signal_days"] = frame["signal_days"] + 1
+    frame.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="signal-day counts differ"):
+        run_report(complete_fixture)
+    assert not complete_fixture["output"].exists()
+
+
+def test_leave_cash_uses_exact_matching_reference_and_strongest_label(
+    complete_fixture: dict[str, Path],
+) -> None:
+    for key in ("mainboard", "all"):
+        method_path = complete_fixture[key] / "method.json"
+        method = json.loads(method_path.read_text(encoding="utf-8"))
+        method["fallback"] = False
+        method_path.write_text(json.dumps(method), encoding="utf-8")
+    output = generate_report(
+        selection_manifest_path=complete_fixture["selection_manifest"],
+        selection_predictions_path=complete_fixture["selection_predictions"],
+        test_summary_path=complete_fixture["test_summary"],
+        test_predictions_path=complete_fixture["test_predictions"],
+        mainboard_backtest_dir=complete_fixture["mainboard"],
+        all_backtest_dir=complete_fixture["all"],
+        index_cache_path=complete_fixture["index"],
+        fixed_reference_summary_path=complete_fixture["fixed_reference"],
+        execution_policy="leave_cash",
+        output_directory=complete_fixture["output"],
+    )
+    comparison = pd.read_csv(output / "fixed_reference_comparison.csv")
+    assert comparison.loc[0, "fixed_reference_net_cumulative"] == pytest.approx(0.145)
+    assert comparison.loc[0, "fixed_reference_completed_trades"] == 3
+    assert comparison.loc[0, "comparability"] == "strongest_same_definition"
+    method = (output / "method_and_findings.md").read_text(encoding="utf-8")
+    assert "`leave_cash` is the strongest same-definition comparison" in method
+
+
+def test_execution_policy_mismatch_fails_atomically(
+    complete_fixture: dict[str, Path],
+) -> None:
+    with pytest.raises(ValueError, match="does not match explicit execution_policy"):
+        generate_report(
+            selection_manifest_path=complete_fixture["selection_manifest"],
+            selection_predictions_path=complete_fixture["selection_predictions"],
+            test_summary_path=complete_fixture["test_summary"],
+            test_predictions_path=complete_fixture["test_predictions"],
+            mainboard_backtest_dir=complete_fixture["mainboard"],
+            all_backtest_dir=complete_fixture["all"],
+            index_cache_path=complete_fixture["index"],
+            fixed_reference_summary_path=complete_fixture["fixed_reference"],
+            execution_policy="leave_cash",
+            output_directory=complete_fixture["output"],
+        )
     assert not complete_fixture["output"].exists()

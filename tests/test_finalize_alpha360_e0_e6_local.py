@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 from pathlib import Path
 
@@ -74,7 +75,81 @@ def test_finalizer_runs_both_strict_variants_and_read_only_report() -> None:
     assert 'report_alpha360_training_curves.py' in source
     assert '"E6_a_us_four_head"' in source
     assert '"--expected-epochs", "50"' in source
+    assert '"--fixed-reference-summary", str(staging / FIXED_REFERENCE_STAGING_NAME)' in source
+    assert '"--execution-policy", execution_policy' in source
     assert "staging.replace(output)" in source
+    assert "FIXED_REFERENCE_EXPECTED_SHA256" in source
+
+
+def test_fixed_reference_source_is_exactly_the_authorized_history() -> None:
+    module = load_finalizer_module()
+    assert module.FIXED_REFERENCE_SOURCE == (
+        ROOT
+        / ".qlibAssistant/analysis/fixed_fold3_full_intraday_exit_20260821/summary.csv"
+    )
+
+
+def test_stage_fixed_reference_copies_and_records_sha(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_finalizer_module()
+    source = tmp_path / "source.csv"
+    source.write_bytes(b"a,b\n1,2\n")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(module, "FIXED_REFERENCE_SOURCE", source)
+    monkeypatch.setattr(
+        module,
+        "FIXED_REFERENCE_EXPECTED_SHA256",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    audit = module.stage_fixed_reference(staging)
+    copied = staging / module.FIXED_REFERENCE_STAGING_NAME
+    expected_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert copied.read_bytes() == source.read_bytes()
+    assert audit == {
+        "source": str(source.resolve()),
+        "staged_path": module.FIXED_REFERENCE_STAGING_NAME,
+        "sha256": expected_sha,
+        "size": source.stat().st_size,
+    }
+
+
+def test_stage_fixed_reference_missing_or_duplicate_destination_fails_closed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    module = load_finalizer_module()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    missing = tmp_path / "missing.csv"
+    monkeypatch.setattr(module, "FIXED_REFERENCE_SOURCE", missing)
+    with pytest.raises(FileNotFoundError, match="Missing Fixed Ensemble reference"):
+        module.stage_fixed_reference(staging)
+
+    source = tmp_path / "source.csv"
+    source.write_text("a,b\n1,2\n", encoding="utf-8")
+    monkeypatch.setattr(module, "FIXED_REFERENCE_SOURCE", source)
+    with pytest.raises(RuntimeError, match="differs from the frozen historical artifact"):
+        module.stage_fixed_reference(staging)
+
+    monkeypatch.setattr(
+        module,
+        "FIXED_REFERENCE_EXPECTED_SHA256",
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    destination = staging / module.FIXED_REFERENCE_STAGING_NAME
+    destination.write_text("preexisting", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        module.stage_fixed_reference(staging)
+    assert destination.read_text(encoding="utf-8") == "preexisting"
+
+
+def test_fixed_reference_is_staged_only_after_test_ready_gate_and_recorded() -> None:
+    source = FINALIZER.read_text(encoding="utf-8")
+    gate = 'if status.get("status") != "test_ready" or status.get("test_read") is not True:'
+    stage = "fixed_reference = stage_fixed_reference(staging)"
+    completion = '"fixed_reference": fixed_reference'
+    assert source.index(gate) < source.index(stage) < source.index(completion)
 
 
 def test_watchdog_has_exactly_two_authorized_tasks_and_no_termination_command() -> None:

@@ -52,6 +52,29 @@ TOPK_METRICS = tuple(
 )
 PREDICTION_METRICS = (*CORE_PREDICTION_METRICS, *CALIBRATION_METRICS, *TOPK_METRICS)
 SUMMARY_METRICS = ("days", "rows", "components", *PREDICTION_METRICS)
+FIXED_REFERENCE_REQUIRED_COLUMNS = {
+    "buy_time",
+    "exit_time",
+    "fallback",
+    "slippage_bps_each_side",
+    "signal_days",
+    "completed_trades",
+    "net_cumulative",
+    "max_drawdown",
+    "trade_win_rate",
+    "average_net_trade_return",
+    "total_fees",
+    "blocked_buy_candidates",
+    "blocked_sell_attempts",
+    "skipped_due_existing_holding",
+    "average_selected_rank",
+    "max_selected_rank",
+    "ending_equity",
+    "unclosed_position",
+}
+FIXED_REFERENCE_KEY_COLUMNS = (
+    "buy_time", "exit_time", "fallback", "slippage_bps_each_side"
+)
 
 
 def sha256(path: Path) -> str:
@@ -110,6 +133,130 @@ def _require_finite(value: Any, label: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{label} must be finite, got {value!r}")
     return result
+
+
+def _strict_boolean_series(values: pd.Series, label: str) -> pd.Series:
+    """Parse booleans without allowing truthy strings or missing values."""
+
+    parsed: list[bool] = []
+    for row_number, value in enumerate(values, start=2):
+        if isinstance(value, (bool, np.bool_)):
+            parsed.append(bool(value))
+            continue
+        if isinstance(value, str) and value.strip().casefold() in {"true", "false"}:
+            parsed.append(value.strip().casefold() == "true")
+            continue
+        raise ValueError(f"{label} row {row_number} must be exactly true or false")
+    return pd.Series(parsed, index=values.index, dtype=bool)
+
+
+def load_fixed_reference(path: Path, execution_policy: str) -> dict[str, Any]:
+    """Load the immutable external Fixed Ensemble history, failing closed."""
+
+    if execution_policy not in {"fallback", "leave_cash"}:
+        raise ValueError(
+            "execution_policy must be exactly 'fallback' or 'leave_cash'"
+        )
+    frame = _read_csv(
+        path, "Fixed Ensemble external reference", FIXED_REFERENCE_REQUIRED_COLUMNS
+    )
+    if frame.empty:
+        raise ValueError("Fixed Ensemble external reference is empty")
+    frame = frame.copy()
+    for column in ("buy_time", "exit_time"):
+        if frame[column].isna().any():
+            raise ValueError(f"Fixed Ensemble external reference/{column} is missing")
+        frame[column] = frame[column].astype(str)
+    frame["fallback"] = _strict_boolean_series(
+        frame["fallback"], "Fixed Ensemble external reference/fallback"
+    )
+    frame["unclosed_position"] = _strict_boolean_series(
+        frame["unclosed_position"],
+        "Fixed Ensemble external reference/unclosed_position",
+    )
+    numeric_columns = sorted(
+        FIXED_REFERENCE_REQUIRED_COLUMNS
+        - {"buy_time", "exit_time", "fallback", "unclosed_position"}
+    )
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if not np.isfinite(frame[numeric_columns].to_numpy(float)).all():
+        raise ValueError("Fixed Ensemble external reference contains non-finite values")
+    integer_columns = (
+        "signal_days",
+        "completed_trades",
+        "blocked_buy_candidates",
+        "blocked_sell_attempts",
+        "skipped_due_existing_holding",
+        "max_selected_rank",
+    )
+    for column in integer_columns:
+        values = frame[column].to_numpy(float)
+        if (values < 0).any() or not np.equal(values, np.floor(values)).all():
+            raise ValueError(
+                f"Fixed Ensemble external reference/{column} must be non-negative integers"
+            )
+    if (frame["completed_trades"] > frame["signal_days"]).any():
+        raise ValueError(
+            "Fixed Ensemble external reference completed_trades exceeds signal_days"
+        )
+    if (frame["net_cumulative"] <= -1).any():
+        raise ValueError("Fixed Ensemble external reference net_cumulative must exceed -1")
+    if ((frame["max_drawdown"] < -1) | (frame["max_drawdown"] > 0)).any():
+        raise ValueError("Fixed Ensemble external reference max_drawdown must be in [-1, 0]")
+    if ((frame["trade_win_rate"] < 0) | (frame["trade_win_rate"] > 1)).any():
+        raise ValueError("Fixed Ensemble external reference trade_win_rate must be in [0, 1]")
+    if (frame["ending_equity"] <= 0).any() or (frame["total_fees"] < 0).any():
+        raise ValueError(
+            "Fixed Ensemble external reference equity must be positive and fees non-negative"
+        )
+    if frame["unclosed_position"].any():
+        raise ValueError("Fixed Ensemble external reference contains an unclosed position")
+    if frame.duplicated(list(FIXED_REFERENCE_KEY_COLUMNS)).any():
+        raise ValueError("Fixed Ensemble external reference contains duplicate key rows")
+
+    expected_keys = {
+        ("15:00", exit_time, fallback, slippage)
+        for exit_time in ("10:30", "15:00")
+        for fallback in (False, True)
+        for slippage in (0.0, 5.0)
+    }
+    observed_keys = {
+        (row.buy_time, row.exit_time, bool(row.fallback), float(row.slippage_bps_each_side))
+        for row in frame.itertuples(index=False)
+    }
+    if observed_keys != expected_keys or len(frame) != len(expected_keys):
+        missing = sorted(expected_keys - observed_keys)
+        unexpected = sorted(observed_keys - expected_keys)
+        raise ValueError(
+            "Fixed Ensemble external reference grid mismatch: "
+            f"missing={missing}, unexpected={unexpected}, rows={len(frame)}"
+        )
+
+    expected_fallback = execution_policy == "fallback"
+    selected = frame.loc[
+        frame["buy_time"].eq("15:00")
+        & frame["exit_time"].eq("15:00")
+        & frame["fallback"].eq(expected_fallback)
+        & np.isclose(frame["slippage_bps_each_side"], 5.0)
+    ]
+    if len(selected) != 1:
+        raise ValueError(
+            "Fixed Ensemble external reference must contain exactly one matching "
+            "buy_time=15:00/exit_time=15:00/slippage=5 row"
+        )
+    resolved = path.expanduser().resolve()
+    return {
+        "path": resolved,
+        "sha256": sha256(resolved),
+        "execution_policy": execution_policy,
+        "comparability": (
+            "strongest_same_definition"
+            if execution_policy == "leave_cash"
+            else "approximate_old_fallback_rank_cap_20_vs_new_full_ranking"
+        ),
+        "row": selected.iloc[0],
+    }
 
 
 def prediction_columns(horizon: str) -> set[str]:
@@ -430,9 +577,11 @@ def load_strict_backtest(
         "rule",
         "topk",
         "slippage_bps_each_side",
+        "signal_days",
         "net_cumulative",
         "trade_win_rate",
         "max_drawdown_marked",
+        "completed_trades",
         "CSI1000_gross_cumulative",
         "net_excess_vs_CSI1000",
         "CSI300_gross_cumulative",
@@ -511,6 +660,51 @@ def load_strict_backtest(
         "selected": selected,
         "daily": daily,
     }
+
+
+def build_fixed_reference_comparison(
+    fixed_reference: dict[str, Any],
+    strict_mainboard: dict[str, Any],
+) -> pd.DataFrame:
+    """Compare only executable mainboard Top1 close1→close2 results."""
+
+    current = strict_mainboard["baseline"].loc["close1_close2"]
+    reference = fixed_reference["row"]
+    current_signal_days = int(_require_finite(current["signal_days"], "current/signal_days"))
+    reference_signal_days = int(
+        _require_finite(reference["signal_days"], "fixed/signal_days")
+    )
+    if current_signal_days != reference_signal_days:
+        raise ValueError(
+            "Alpha360 and Fixed reference signal-day counts differ: "
+            f"{current_signal_days} != {reference_signal_days}"
+        )
+    metrics = {
+        "net_cumulative": ("net_cumulative", "net_cumulative"),
+        "max_drawdown": ("max_drawdown_marked", "max_drawdown"),
+        "trade_win_rate": ("trade_win_rate", "trade_win_rate"),
+        "completed_trades": ("completed_trades", "completed_trades"),
+    }
+    row: dict[str, Any] = {
+        "horizon": "close1_close2",
+        "board_variant": "mainboard",
+        "topk": 1,
+        "buy_time": "15:00",
+        "exit_time": "15:00",
+        "slippage_bps_each_side": 5.0,
+        "execution_policy": fixed_reference["execution_policy"],
+        "comparability": fixed_reference["comparability"],
+        "selection_role": "external_reference_only_not_used_for_selection",
+        "fixed_reference_sha256": fixed_reference["sha256"],
+        "signal_days": current_signal_days,
+    }
+    for metric, (current_column, reference_column) in metrics.items():
+        current_value = _require_finite(current[current_column], f"current/{metric}")
+        reference_value = _require_finite(reference[reference_column], f"fixed/{metric}")
+        row[f"alpha360_{metric}"] = current_value
+        row[f"fixed_reference_{metric}"] = reference_value
+        row[f"delta_alpha360_minus_fixed_{metric}"] = current_value - reference_value
+    return pd.DataFrame([row])
 
 
 def load_index_cache(path: Path) -> tuple[pd.DataFrame, pd.DatetimeIndex]:
@@ -709,6 +903,8 @@ def write_method_and_findings(
     test_predictions: Path,
     index_cache: Path,
     strict: dict[str, dict[str, Any]],
+    fixed_comparison: pd.DataFrame,
+    fixed_reference: dict[str, Any],
 ) -> None:
     lines = [
         "# Alpha360 probabilistic experiment report",
@@ -799,6 +995,36 @@ def write_method_and_findings(
         "",
         "The differences between Selection-valid and Test are out-of-sample findings, not a reason to switch components or rules. Any follow-up design must be registered and evaluated on a future lockbox.",
         "",
+        "## Fixed Ensemble external historical reference",
+        "",
+        "- This is a descriptive external historical baseline only. It does not participate in model Selection, trading-rule Selection, or Test gating.",
+        "- The comparison is restricted to `close1_close2` / `mainboard` / `Top1`, with buy time `15:00`, exit time `15:00`, and `5` bps slippage each side.",
+        (
+            "- `leave_cash` is the strongest same-definition comparison."
+            if fixed_reference["execution_policy"] == "leave_cash"
+            else "- `fallback` is approximate: the old Fixed implementation searched at most through rank 20, while the new strict implementation traverses the complete ranking."
+        ),
+        "- Positive deltas below mean the current Alpha360 result is numerically larger than the Fixed reference; for drawdown, a positive delta means a shallower (better) drawdown.",
+        "",
+        "| Policy | Comparability | Metric | Alpha360 | Fixed reference | Delta (Alpha360 − Fixed) |",
+        "|---|---|---|---:|---:|---:|",
+    ])
+    comparison = fixed_comparison.iloc[0]
+    for metric in ("net_cumulative", "max_drawdown", "trade_win_rate"):
+        lines.append(
+            f"| {comparison.execution_policy} | {comparison.comparability} | {metric} | "
+            f"{_percent(comparison[f'alpha360_{metric}'])} | "
+            f"{_percent(comparison[f'fixed_reference_{metric}'])} | "
+            f"{_percent(comparison[f'delta_alpha360_minus_fixed_{metric}'])} |"
+        )
+    lines.append(
+        f"| {comparison.execution_policy} | {comparison.comparability} | completed_trades | "
+        f"{int(comparison.alpha360_completed_trades)} | "
+        f"{int(comparison.fixed_reference_completed_trades)} | "
+        f"{int(comparison.delta_alpha360_minus_fixed_completed_trades)} |"
+    )
+    lines.extend([
+        "",
         "## Input audit",
         "",
         "| Input | SHA-256 |",
@@ -812,12 +1038,13 @@ def write_method_and_findings(
         "index cache": index_cache,
         "mainboard pre-Test rule manifest": strict["mainboard"]["directory"] / "chosen_rule_manifest_pre_test.json",
         "all pre-Test rule manifest": strict["all"]["directory"] / "chosen_rule_manifest_pre_test.json",
+        "Fixed Ensemble external historical summary": fixed_reference["path"],
     }
     for label, path in audited.items():
         lines.append(f"| {label} | `{sha256(path)}` |")
     lines.extend([
         "",
-        "Generated files: `concise_summary.csv`, `model_selection.csv`, `prediction_metrics_comparison.png`, and `strategy_equity_curves.png`.",
+        "Generated files: `concise_summary.csv`, `model_selection.csv`, `fixed_reference_comparison.csv`, `prediction_metrics_comparison.png`, and `strategy_equity_curves.png`.",
         "",
     ])
     output.write_text("\n".join(lines), encoding="utf-8")
@@ -832,6 +1059,8 @@ def generate_report(
     mainboard_backtest_dir: Path,
     all_backtest_dir: Path,
     index_cache_path: Path,
+    fixed_reference_summary_path: Path,
+    execution_policy: str,
     output_directory: Path,
 ) -> Path:
     inputs = [
@@ -840,6 +1069,7 @@ def generate_report(
         test_summary_path,
         test_predictions_path,
         index_cache_path,
+        fixed_reference_summary_path,
     ]
     resolved_inputs = [_require_file(path, "report input") for path in inputs]
     (
@@ -848,6 +1078,7 @@ def generate_report(
         test_summary_path,
         test_predictions_path,
         index_cache_path,
+        fixed_reference_summary_path,
     ) = resolved_inputs
     input_hashes_before = {path: sha256(path) for path in resolved_inputs}
     output_directory = output_directory.expanduser().resolve()
@@ -884,12 +1115,32 @@ def generate_report(
                 test_predictions_path,
             ),
         }
+        if execution_policy not in {"fallback", "leave_cash"}:
+            raise ValueError(
+                "execution_policy must be exactly 'fallback' or 'leave_cash'"
+            )
+        expected_fallback = execution_policy == "fallback"
+        for variant, data in strict.items():
+            if data["method"].get("fallback") is not expected_fallback:
+                raise ValueError(
+                    f"{variant} strict backtest fallback does not match explicit "
+                    f"execution_policy={execution_policy}"
+                )
+        fixed_reference = load_fixed_reference(
+            fixed_reference_summary_path, execution_policy
+        )
+        fixed_comparison = build_fixed_reference_comparison(
+            fixed_reference, strict["mainboard"]
+        )
         summary = build_concise_summary(manifest, test_summary, strict)
         model_selection = build_model_selection(manifest)
         index, calendar = load_index_cache(index_cache_path)
         signal_dates = list(test_predictions["datetime"].drop_duplicates().sort_values())
         summary.to_csv(output_directory / "concise_summary.csv", index=False)
         model_selection.to_csv(output_directory / "model_selection.csv", index=False)
+        fixed_comparison.to_csv(
+            output_directory / "fixed_reference_comparison.csv", index=False
+        )
         plot_prediction_metrics(
             summary, output_directory / "prediction_metrics_comparison.png"
         )
@@ -909,6 +1160,8 @@ def generate_report(
             test_predictions_path,
             index_cache_path,
             strict,
+            fixed_comparison,
+            fixed_reference,
         )
         input_hashes_after = {path: sha256(path) for path in resolved_inputs}
         if input_hashes_after != input_hashes_before:
@@ -932,6 +1185,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mainboard-backtest-dir", type=Path, required=True)
     parser.add_argument("--all-backtest-dir", type=Path, required=True)
     parser.add_argument("--index-cache", type=Path, default=DEFAULT_INDEX_CACHE)
+    parser.add_argument("--fixed-reference-summary", type=Path, required=True)
+    parser.add_argument(
+        "--execution-policy", choices=("fallback", "leave_cash"), required=True
+    )
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -946,6 +1203,8 @@ def main() -> None:
         mainboard_backtest_dir=args.mainboard_backtest_dir,
         all_backtest_dir=args.all_backtest_dir,
         index_cache_path=args.index_cache,
+        fixed_reference_summary_path=args.fixed_reference_summary,
+        execution_policy=args.execution_policy,
         output_directory=args.output,
     )
     print(f"report={output}")

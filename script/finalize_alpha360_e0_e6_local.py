@@ -35,6 +35,14 @@ REMOTE_E0_ROOT = "E:/qlibAssistant/.qlibAssistant/remote_runs/alpha360_cross_sto
 WATCHDOG_AUDIT_LOG = (
     ROOT / ".qlibAssistant/analysis/alpha360_e0_e6_260828_watchdog.jsonl"
 )
+FIXED_REFERENCE_SOURCE = (
+    ROOT
+    / ".qlibAssistant/analysis/fixed_fold3_full_intraday_exit_20260821/summary.csv"
+)
+FIXED_REFERENCE_STAGING_NAME = "fixed_reference_summary.csv"
+FIXED_REFERENCE_EXPECTED_SHA256 = (
+    "32db848d16978ff6a3f275931c22d85bd86790ba4510ed1044436d4fd30b67c0"
+)
 WATCHDOG_TARGETS = (
     {
         "key": "base",
@@ -508,6 +516,36 @@ def fetch_artifacts(staging: Path) -> None:
         checked([*scp_base(), source, str(epoch_directory / f"{experiment}.csv")])
 
 
+def stage_fixed_reference(staging: Path) -> dict:
+    """Copy and authenticate the fixed external history after Test completion."""
+
+    source = FIXED_REFERENCE_SOURCE.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Missing Fixed Ensemble reference: {source}")
+    destination = staging / FIXED_REFERENCE_STAGING_NAME
+    if destination.exists():
+        raise FileExistsError(destination)
+    source_sha_before = file_sha256(source)
+    if source_sha_before != FIXED_REFERENCE_EXPECTED_SHA256:
+        raise RuntimeError(
+            "Fixed Ensemble reference differs from the frozen historical artifact: "
+            f"expected {FIXED_REFERENCE_EXPECTED_SHA256}, got {source_sha_before}"
+        )
+    shutil.copy2(source, destination)
+    source_sha_after = file_sha256(source)
+    copied_sha = file_sha256(destination)
+    if source_sha_before != source_sha_after:
+        raise RuntimeError("Fixed Ensemble reference changed while it was copied")
+    if copied_sha != source_sha_before:
+        raise RuntimeError("Copied Fixed Ensemble reference hash mismatch")
+    return {
+        "source": str(source),
+        "staged_path": FIXED_REFERENCE_STAGING_NAME,
+        "sha256": copied_sha,
+        "size": destination.stat().st_size,
+    }
+
+
 def run_backtest(staging: Path, variant: str, fallback: bool) -> Path:
     execution_policy = "fallback" if fallback else "leave_cash"
     output = staging / f"strict_backtest_{variant}_{execution_policy}"
@@ -552,6 +590,8 @@ def build_report(
         "--mainboard-backtest-dir", str(mainboard),
         "--all-backtest-dir", str(all_board),
         "--index-cache", str(ROOT / ".qlibAssistant/cache/tushare_index_daily.csv"),
+        "--fixed-reference-summary", str(staging / FIXED_REFERENCE_STAGING_NAME),
+        "--execution-policy", execution_policy,
         "--output", str(output),
     ])
     return output
@@ -643,6 +683,7 @@ def main() -> int:
         (staging / "local_lockbox_validation.json").write_text(
             json.dumps(lockbox_audit, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        fixed_reference = stage_fixed_reference(staging)
         mainboard_fallback = run_backtest(staging, "mainboard", True)
         all_board_fallback = run_backtest(staging, "all", True)
         mainboard_leave_cash = run_backtest(staging, "mainboard", False)
@@ -660,6 +701,7 @@ def main() -> int:
             "status": "complete",
             "remote_status": status,
             "lockbox_validation": lockbox_audit,
+            "fixed_reference": fixed_reference,
             "reports": {
                 name: str(path.relative_to(staging)) for name, path in reports.items()
             },
