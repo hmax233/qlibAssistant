@@ -7,6 +7,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "script"))
 from evaluate_alpha360_uncertainty_horizons import (
     benchmark_cumulative,
+    excludes_star_and_chinext,
     prepare_rule,
     simulate,
 )
@@ -61,7 +62,9 @@ def test_state_machine_carries_limit_down_position_without_future_entry_scan():
     assert daily.iloc[0]["entries"] == 1
     assert result["completed_trades"] == 1
     assert result["delayed_exit_trades"] == 1
-    assert result["blocked_sell_down_limit_attempts"] == 1
+    # Scheduled open exit is blocked; the chronological state machine retries
+    # again at that day's close before succeeding on the next event.
+    assert result["blocked_sell_down_limit_attempts"] == 2
     assert result["unresolved_exit"] == 0
 
 
@@ -90,3 +93,45 @@ def test_overlapping_horizon_benchmark_uses_two_half_capital_sleeves():
     result = benchmark_cumulative(index, calendar[:2], calendar, "open1_close2", "CSI1000")
     # Sleeve A earns 10%, sleeve B earns 20%; total initial capital earns 15%.
     assert abs(result - 0.15) < 1e-12
+
+
+def test_fallback_walks_the_complete_ranking_beyond_top50():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    instruments = [f"SH60{number:04d}" for number in range(60)]
+    index = pd.MultiIndex.from_product(
+        [calendar, instruments], names=["trade_date", "instrument"]
+    )
+    prices = pd.DataFrame({"open": 10.0, "close": 10.0}, index=index)
+    limits = pd.DataFrame({"up_limit": 11.0, "down_limit": 9.0}, index=index)
+    # The first 55 ranked names are unbuyable at their exact upper limit.
+    prices.loc[(calendar[1], instruments[:55]), "close"] = 11.0
+    predictions = pd.DataFrame({
+        "datetime": calendar[0],
+        "instrument": instruments,
+        "close1_close2_expected_return": list(reversed(range(60))),
+        "close1_close2_return_std": 0.02,
+        "close1_close2_probability_positive": 0.7,
+    })
+    _, fallback = simulate(
+        predictions, prices, limits, calendar, "close1_close2", "mean_all",
+        1, True, 0.0, 100000.0, 0.000235, 5.0,
+    )
+    _, leave_cash = simulate(
+        predictions, prices, limits, calendar, "close1_close2", "mean_all",
+        1, False, 0.0, 100000.0, 0.000235, 5.0,
+    )
+    assert fallback["completed_trades"] == 1
+    assert fallback["fallback_replacements"] == 1
+    assert fallback["blocked_buy_up_limit"] == 55
+    assert leave_cash["completed_trades"] == 0
+    assert leave_cash["filtered_cash_slots"] == 1
+
+
+def test_mainboard_variant_excludes_only_star_and_chinext():
+    assert not excludes_star_and_chinext("SH688001")
+    assert not excludes_star_and_chinext("SZ300001")
+    assert excludes_star_and_chinext("SH600000")
+    assert excludes_star_and_chinext("SZ000001")
+    assert excludes_star_and_chinext("BJ430001")

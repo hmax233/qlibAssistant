@@ -25,8 +25,11 @@ def test_finalizer_is_one_shot_and_never_creates_a_polling_process() -> None:
 
 def test_finalizer_runs_both_strict_variants_and_read_only_report() -> None:
     source = FINALIZER.read_text(encoding="utf-8")
-    assert 'run_backtest(staging, "mainboard")' in source
-    assert 'run_backtest(staging, "all")' in source
+    assert 'run_backtest(staging, "mainboard", True)' in source
+    assert 'run_backtest(staging, "all", True)' in source
+    assert 'run_backtest(staging, "mainboard", False)' in source
+    assert 'run_backtest(staging, "all", False)' in source
+    assert '"--fallback" if fallback else "--no-fallback"' in source
     assert '"--commission-rate", "0.000235"' in source
     assert '"--minimum-commission", "5"' in source
     assert '"--slippage-bps", "0", "5"' in source

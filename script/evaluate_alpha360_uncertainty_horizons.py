@@ -19,7 +19,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from evaluate_alpha360_overnight import commission, mainboard
+from evaluate_alpha360_overnight import commission
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +55,7 @@ class Position:
     buy_fee: float
     entry_date: pd.Timestamp
     scheduled_exit: pd.Timestamp
+    scheduled_exit_event: int
     exit_phase: str
     last_price: float
 
@@ -67,6 +68,27 @@ class Slot:
 
 def drawdown(equity: pd.Series) -> float:
     return float((equity / equity.cummax() - 1.0).min()) if len(equity) else 0.0
+
+
+def annualized_sharpe(equity: pd.Series, initial_equity: float) -> float:
+    """Return the close-to-close, zero-risk-rate annualized Sharpe ratio."""
+
+    if equity.empty:
+        return float("nan")
+    previous = equity.shift(1)
+    previous.iloc[0] = initial_equity
+    returns = equity / previous - 1.0
+    deviation = float(returns.std(ddof=1))
+    if not np.isfinite(deviation) or deviation <= 0:
+        return float("nan")
+    return float(returns.mean() / deviation * np.sqrt(252.0))
+
+
+def excludes_star_and_chinext(code: str) -> bool:
+    """Keep every board except STAR (SH68) and ChiNext (SZ30)."""
+
+    value = str(code).upper()
+    return not value.startswith(("SH68", "SZ30"))
 
 
 def sha256(path: Path) -> str:
@@ -91,23 +113,96 @@ def load_inputs(args):
     return prices, limits, index, calendar
 
 
-def benchmark_cumulative(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
-                         horizon: str, benchmark: str) -> float:
+def benchmark_equity(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
+                     horizon: str, benchmark: str) -> pd.Series:
+    """Simulate the benchmark with the same entry/exit phases and temporal sleeves."""
+
     specification = HORIZONS[horizon]
-    frame = index.loc[index["index"].eq(benchmark)].drop_duplicates("datetime").set_index("datetime")
+    frame = (
+        index.loc[index["index"].eq(benchmark)]
+        .drop_duplicates("datetime", keep="last")
+        .set_index("datetime")
+        .sort_index()
+    )
     calendar_pos = {date: number for number, date in enumerate(calendar)}
-    sleeve_values = np.ones(specification["sleeves"], dtype=float)
-    for number, signal in enumerate(sorted(pd.Timestamp(date) for date in signal_dates)):
+    signals = sorted(pd.Timestamp(date) for date in signal_dates)
+    sleeves = [{"cash": 1.0 / specification["sleeves"], "units": 0.0}]
+    sleeves *= specification["sleeves"]
+    # Avoid aliasing the mutable dictionaries created by list multiplication.
+    sleeves = [dict(value) for value in sleeves]
+    entries: dict[int, list[int]] = {}
+    exits: dict[int, list[int]] = {}
+    maximum_event = -1
+    for number, signal in enumerate(signals):
+        if signal not in calendar_pos or calendar_pos[signal] + 2 >= len(calendar):
+            raise ValueError(f"Benchmark signal has no complete T+2 horizon: {signal}")
         i = calendar_pos[signal]
         entry_date, exit_date = calendar[i + 1], calendar[i + 2]
         if entry_date not in frame.index or exit_date not in frame.index:
             continue
-        realized = float(
-            frame.loc[exit_date, specification["exit"]]
-            / frame.loc[entry_date, specification["entry"]] - 1.0
+        sleeve = number % specification["sleeves"]
+        entry_event = 2 * (i + 1) + (0 if specification["entry"] == "open" else 1)
+        exit_event = 2 * (i + 2) + (0 if specification["exit"] == "open" else 1)
+        entries.setdefault(entry_event, []).append(sleeve)
+        exits.setdefault(exit_event, []).append(sleeve)
+        maximum_event = max(maximum_event, exit_event)
+    if maximum_event < 0:
+        return pd.Series(dtype=float, name=benchmark)
+
+    first_event = min(entries)
+    records: list[dict] = []
+    for event in range(first_event, maximum_event + 1):
+        date = calendar[event // 2]
+        phase = "open" if event % 2 == 0 else "close"
+        if date not in frame.index:
+            continue
+        price = float(frame.loc[date, phase])
+        if not np.isfinite(price) or price <= 0:
+            continue
+        for sleeve_number in exits.get(event, []):
+            sleeve = sleeves[sleeve_number]
+            if sleeve["units"]:
+                sleeve["cash"] = sleeve["units"] * price
+                sleeve["units"] = 0.0
+        for sleeve_number in entries.get(event, []):
+            sleeve = sleeves[sleeve_number]
+            if sleeve["units"]:
+                raise RuntimeError("Benchmark temporal sleeve was reused before its exit")
+            sleeve["units"] = sleeve["cash"] / price
+            sleeve["cash"] = 0.0
+        equity = sum(
+            sleeve["cash"] + sleeve["units"] * price
+            for sleeve in sleeves
         )
-        sleeve_values[number % specification["sleeves"]] *= 1.0 + realized
-    return float(sleeve_values.mean() - 1.0)
+        records.append({"datetime": date, "event": event, "equity": equity})
+    event_frame = pd.DataFrame(records)
+    if event_frame.empty:
+        return pd.Series(dtype=float, name=benchmark)
+    daily = (
+        event_frame.sort_values("event").groupby("datetime", sort=True)["equity"].last()
+    )
+    daily.name = benchmark
+    return daily
+
+
+def benchmark_statistics(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
+                         horizon: str, benchmark: str) -> dict[str, float]:
+    equity = benchmark_equity(index, signal_dates, calendar, horizon, benchmark)
+    with_initial = pd.concat([pd.Series([1.0]), equity], ignore_index=True)
+    return {
+        "gross_cumulative": float(equity.iloc[-1] - 1.0) if len(equity) else 0.0,
+        "max_drawdown": drawdown(with_initial),
+        "sharpe_rf0": annualized_sharpe(equity, 1.0),
+    }
+
+
+def benchmark_cumulative(index: pd.DataFrame, signal_dates, calendar: pd.DatetimeIndex,
+                         horizon: str, benchmark: str) -> float:
+    """Compatibility wrapper used by existing reports and tests."""
+
+    return benchmark_statistics(index, signal_dates, calendar, horizon, benchmark)[
+        "gross_cumulative"
+    ]
 
 
 def attach_benchmarks(results: pd.DataFrame, predictions: pd.DataFrame,
@@ -116,10 +211,18 @@ def attach_benchmarks(results: pd.DataFrame, predictions: pd.DataFrame,
     dates = predictions["datetime"].drop_duplicates()
     for benchmark in ("CSI1000", "CSI300"):
         values = {
-            horizon: benchmark_cumulative(index, dates, calendar, horizon, benchmark)
+            horizon: benchmark_statistics(index, dates, calendar, horizon, benchmark)
             for horizon in HORIZONS
         }
-        results[f"{benchmark}_gross_cumulative"] = results["horizon"].map(values)
+        results[f"{benchmark}_gross_cumulative"] = results["horizon"].map(
+            {horizon: metrics["gross_cumulative"] for horizon, metrics in values.items()}
+        )
+        results[f"{benchmark}_max_drawdown"] = results["horizon"].map(
+            {horizon: metrics["max_drawdown"] for horizon, metrics in values.items()}
+        )
+        results[f"{benchmark}_sharpe_rf0"] = results["horizon"].map(
+            {horizon: metrics["sharpe_rf0"] for horizon, metrics in values.items()}
+        )
         results[f"net_excess_vs_{benchmark}"] = (
             (1.0 + results["net_cumulative"])
             / (1.0 + results[f"{benchmark}_gross_cumulative"]) - 1.0
@@ -148,15 +251,24 @@ def label_alignment(split: str, predictions: pd.DataFrame, prices: pd.DataFrame,
         raw_array, label_array = np.asarray(raw), np.asarray(labels)
         finite = np.isfinite(raw_array) & np.isfinite(label_array)
         compared_raw, compared_label = raw_array[finite], label_array[finite]
+        correlation = (
+            float(np.corrcoef(compared_raw, compared_label)[0, 1])
+            if len(compared_raw) >= 2
+            and np.std(compared_raw) > 0 and np.std(compared_label) > 0
+            else float("nan")
+        )
         rows.append({
             "split": split, "horizon": horizon, "rows": len(raw_array),
             "raw_cumulative": float(np.prod(1.0 + raw_array) - 1.0),
-            "raw_up_rate": float((raw_array > 0).mean()),
+            "raw_up_rate": float((raw_array > 0).mean()) if len(raw_array) else float("nan"),
             "compared_rows": len(compared_raw),
             "label_cumulative": float(np.prod(1.0 + compared_label) - 1.0),
             "raw_cumulative_on_compared_rows": float(np.prod(1.0 + compared_raw) - 1.0),
-            "correlation": float(np.corrcoef(compared_raw, compared_label)[0, 1]),
-            "max_absolute_difference": float(np.max(np.abs(compared_raw - compared_label))),
+            "correlation": correlation,
+            "max_absolute_difference": (
+                float(np.max(np.abs(compared_raw - compared_label)))
+                if len(compared_raw) else float("nan")
+            ),
             "differences_over_50bps": int((np.abs(compared_raw - compared_label) > 0.005).sum()),
         })
     return pd.DataFrame(rows)
@@ -243,27 +355,19 @@ def limit(frame: pd.DataFrame, date: pd.Timestamp, instrument: str, field: str) 
     return float(value) if np.isfinite(value) else None
 
 
-def mark_slot(slot: Slot, date: pd.Timestamp, phase: str, prices: pd.DataFrame) -> float:
-    if slot.position is None:
-        return slot.cash
-    position = slot.position
-    marked = quote(prices, date, position.instrument, phase)
-    if marked is not None:
-        position.last_price = marked
-    return position.cash + position.shares * position.last_price
-
-
 def attempt_exit(
     slot: Slot,
+    event_number: int,
     date: pd.Timestamp,
     phase: str,
     prices: pd.DataFrame,
     limits: pd.DataFrame,
-    calendar_pos: dict[pd.Timestamp, int],
     slippage_bps: float,
     rate: float,
     minimum: float,
     trade_returns: list[float],
+    sell_notionals: list[float],
+    fees: list[float],
     counters: dict[str, int],
 ) -> bool:
     """Try one exit using only information available at this event."""
@@ -271,26 +375,29 @@ def attempt_exit(
     position = slot.position
     if position is None:
         return False
-    if phase != position.exit_phase or date < position.scheduled_exit:
+    if event_number < position.scheduled_exit_event:
         return False
     raw_price = quote(prices, date, position.instrument, phase)
     down = limit(limits, date, position.instrument, "down_limit")
-    if raw_price is None or down is None:
+    if raw_price is None or raw_price <= 0 or down is None or down <= 0:
         counters["blocked_sell_missing_attempts"] += 1
         return False
     position.last_price = raw_price
     if raw_price <= down + 0.005:
         counters["blocked_sell_down_limit_attempts"] += 1
         return False
-    sell_price = raw_price * (1.0 - slippage_bps / 10000.0)
-    sell_fee = commission(position.shares * sell_price, rate, minimum)
-    proceeds = position.shares * sell_price - sell_fee
+    # Slippage cannot create a synthetic execution below the exchange limit.
+    sell_price = max(raw_price * (1.0 - slippage_bps / 10000.0), down)
+    sell_notional = position.shares * sell_price
+    sell_fee = commission(sell_notional, rate, minimum)
+    proceeds = sell_notional - sell_fee
     final_cash = position.cash + proceeds
     starting_cash = position.cash + position.entry_value + position.buy_fee
     trade_returns.append(final_cash / starting_cash - 1.0)
-    delayed = calendar_pos[date] - calendar_pos[position.scheduled_exit]
-    counters["delayed_exit_trades"] += int(delayed > 0)
+    counters["delayed_exit_trades"] += int(event_number > position.scheduled_exit_event)
     counters["completed_exit_trades"] += 1
+    sell_notionals.append(sell_notional)
+    fees.append(sell_fee)
     slot.cash = final_cash
     slot.position = None
     return True
@@ -300,20 +407,65 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
              calendar: pd.DatetimeIndex, horizon: str, rule: str, topk: int,
              fallback: bool, slippage_bps: float, capital: float, rate: float,
              minimum: float) -> tuple[pd.DataFrame, dict]:
+    if topk <= 0 or capital <= 0 or rate < 0 or minimum < 0 or slippage_bps < 0:
+        raise ValueError("Invalid account or execution parameter")
     specification = HORIZONS[horizon]
     sleeves = specification["sleeves"]
     entry_phase, exit_phase = specification["entry"], specification["exit"]
     slot_groups = [[Slot(capital / (sleeves * topk)) for _ in range(topk)] for _ in range(sleeves)]
     calendar_pos = {date: number for number, date in enumerate(calendar)}
-    rows, trade_returns = [], []
+    trade_returns: list[float] = []
+    buy_notionals: list[float] = []
+    sell_notionals: list[float] = []
+    fees: list[float] = []
+    event_records: dict[int, dict] = {}
+    signal_records: list[dict] = []
     counters = {
         "blocked_buy_up_limit": 0, "blocked_buy_missing": 0, "too_expensive": 0,
         "delayed_exit_trades": 0, "skipped_busy_slots": 0, "filtered_cash_slots": 0,
         "blocked_sell_missing_attempts": 0, "blocked_sell_down_limit_attempts": 0,
         "completed_exit_trades": 0, "unresolved_exit": 0,
+        "fallback_replacements": 0,
     }
     grouped = list(predictions.groupby("datetime", sort=True))
     last_processed_event: int | None = None
+
+    def snapshot(event_number: int, entries: int = 0) -> dict:
+        date = calendar[event_number // 2]
+        phase = "open" if event_number % 2 == 0 else "close"
+        equity = 0.0
+        gross_position_value = 0.0
+        by_instrument: dict[str, float] = {}
+        active_positions = 0
+        for slot_group in slot_groups:
+            for slot in slot_group:
+                equity += slot.cash
+                if slot.position is None:
+                    continue
+                active_positions += 1
+                position = slot.position
+                marked = quote(prices, date, position.instrument, phase)
+                if marked is not None and marked > 0:
+                    position.last_price = marked
+                value = position.shares * position.last_price
+                equity += value
+                gross_position_value += value
+                by_instrument[position.instrument] = by_instrument.get(position.instrument, 0.0) + value
+        concentration = max(by_instrument.values(), default=0.0) / equity if equity > 0 else 0.0
+        return {
+            "datetime": date,
+            "event": event_number,
+            "phase": phase,
+            "equity_mark": equity,
+            "gross_exposure": gross_position_value / equity if equity > 0 else 0.0,
+            "max_name_concentration": concentration,
+            "active_positions": active_positions,
+            "entries": entries,
+        }
+
+    def record_event(event_number: int, entries: int = 0) -> None:
+        previous_entries = event_records.get(event_number, {}).get("entries", 0)
+        event_records[event_number] = snapshot(event_number, previous_entries + entries)
 
     def advance_to(event_number: int) -> None:
         """Advance chronologically; never inspect an event before it occurs."""
@@ -327,20 +479,30 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
             for slot_group in slot_groups:
                 for slot in slot_group:
                     attempt_exit(
-                        slot, event_date, event_phase, prices, limits, calendar_pos,
-                        slippage_bps, rate, minimum, trade_returns, counters,
+                        slot, number, event_date, event_phase, prices, limits,
+                        slippage_bps, rate, minimum, trade_returns, sell_notionals,
+                        fees, counters,
                     )
+            record_event(number)
         last_processed_event = event_number
 
     for signal_number, (signal, group) in enumerate(grouped):
         signal = pd.Timestamp(signal)
+        if signal not in calendar_pos or calendar_pos[signal] + 2 >= len(calendar):
+            raise ValueError(f"Signal has no complete T+2 execution horizon: {signal}")
         i = calendar_pos[signal]
         entry_date, scheduled_exit = calendar[i + 1], calendar[i + 2]
         entry_event_number = 2 * calendar_pos[entry_date] + (0 if entry_phase == "open" else 1)
+        scheduled_exit_event = (
+            2 * calendar_pos[scheduled_exit] + (0 if exit_phase == "open" else 1)
+        )
         advance_to(entry_event_number)
         assigned = slot_groups[signal_number % sleeves]
         ranked = prepare_rule(group, horizon, rule)
-        candidates = list(ranked.head(max(50, topk * 5)).itertuples(index=False))
+        # True fallback traverses the complete ranking.  Capping this list at 50
+        # silently changed "buy the next executable stock" into a cash rule.
+        ranked_candidates = ranked if fallback else ranked.head(topk)
+        candidates = list(ranked_candidates.itertuples(index=False))
         used: set[str] = set()
         cursor = 0
         entries_this_signal = 0
@@ -351,12 +513,14 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
             attempts = candidates[cursor:] if fallback else candidates[rank_slot:rank_slot + 1]
             bought = False
             for candidate in attempts:
-                cursor += 1
+                candidate_rank = cursor
+                if fallback:
+                    cursor += 1
                 if candidate.instrument in used:
                     continue
                 raw_buy = quote(prices, entry_date, candidate.instrument, entry_phase)
                 upper = limit(limits, entry_date, candidate.instrument, "up_limit")
-                if raw_buy is None or upper is None:
+                if raw_buy is None or raw_buy <= 0 or upper is None or upper <= 0:
                     counters["blocked_buy_missing"] += 1
                     if not fallback:
                         break
@@ -366,7 +530,8 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
                     if not fallback:
                         break
                     continue
-                buy_price = raw_buy * (1.0 + slippage_bps / 10000.0)
+                # Preserve the exact exchange limit after applying adverse slippage.
+                buy_price = min(raw_buy * (1.0 + slippage_bps / 10000.0), upper)
                 shares = int((slot.cash / buy_price) // 100) * 100
                 while shares > 0 and shares * buy_price + commission(shares * buy_price, rate, minimum) > slot.cash:
                     shares -= 100
@@ -381,48 +546,89 @@ def simulate(predictions: pd.DataFrame, prices: pd.DataFrame, limits: pd.DataFra
                     instrument=candidate.instrument, shares=shares,
                     cash=slot.cash - buy_value - buy_fee, entry_value=buy_value,
                     buy_fee=buy_fee, entry_date=entry_date, scheduled_exit=scheduled_exit,
+                    scheduled_exit_event=scheduled_exit_event,
                     exit_phase=exit_phase, last_price=raw_buy,
                 )
+                buy_notionals.append(buy_value)
+                fees.append(buy_fee)
+                if fallback and candidate_rank >= topk:
+                    counters["fallback_replacements"] += 1
                 used.add(candidate.instrument)
                 bought = True
                 entries_this_signal += 1
                 break
-            if not bought and not attempts:
+            if not bought:
                 counters["filtered_cash_slots"] += 1
-        total_equity = sum(mark_slot(slot, entry_date, entry_phase, prices)
-                           for slot_group in slot_groups for slot in slot_group)
-        rows.append({
+        record_event(entry_event_number, entries_this_signal)
+        signal_records.append({
             "datetime": signal, "entry_date": entry_date, "scheduled_exit": scheduled_exit,
-            "equity_mark": total_equity,
             "entries": entries_this_signal,
-            "active_positions": sum(slot.position is not None for sg in slot_groups for slot in sg),
         })
 
-    # After the final signal, continue the same chronological state machine
-    # through the available calendar. Positions still blocked at the data end
-    # remain open and are marked, never retrospectively rejected at entry.
+    # Continue only until the account is flat.  A blocked exit is retried at
+    # each later observable phase (open, then close), never scanned in advance.
     if last_processed_event is not None:
-        advance_to(2 * len(calendar) - 1)
+        next_event = last_processed_event + 1
+        while (
+            any(slot.position is not None for group in slot_groups for slot in group)
+            and next_event < 2 * len(calendar)
+        ):
+            advance_to(next_event)
+            next_event += 1
     counters["unresolved_exit"] = sum(
         slot.position is not None for slot_group in slot_groups for slot in slot_group
     )
-    final_date = calendar[-1]
-    final_equity = sum(
-        mark_slot(slot, final_date, "close", prices)
-        for slot_group in slot_groups for slot in slot_group
+    event_frame = pd.DataFrame(event_records.values()).sort_values("event")
+    if event_frame.empty:
+        daily = pd.DataFrame(columns=[
+            "phase", "equity_mark", "gross_exposure", "max_name_concentration",
+            "active_positions", "entries",
+        ])
+        daily.index.name = "datetime"
+        final_equity = capital
+    else:
+        last = event_frame.groupby("datetime", sort=True).tail(1).set_index("datetime")
+        entries_by_day = event_frame.groupby("datetime", sort=True)["entries"].sum()
+        last["entries"] = entries_by_day
+        daily = last[[
+            "phase", "equity_mark", "gross_exposure", "max_name_concentration",
+            "active_positions", "entries",
+        ]]
+        final_equity = float(daily["equity_mark"].iloc[-1])
+    active_signals = int(sum(record["entries"] > 0 for record in signal_records))
+    equity_with_initial = pd.concat(
+        [pd.Series([capital], dtype=float), daily["equity_mark"].reset_index(drop=True)],
+        ignore_index=True,
     )
-    daily = pd.DataFrame(rows).set_index("datetime")
-    if len(daily):
-        daily.iloc[-1, daily.columns.get_loc("equity_mark")] = final_equity
-    active_signals = int((daily["entries"] > 0).sum())
+    average_equity = float(daily["equity_mark"].mean()) if len(daily) else capital
+    total_traded_notional = float(sum(buy_notionals) + sum(sell_notionals))
+    average_daily_turnover = (
+        total_traded_notional / (2.0 * average_equity * len(daily))
+        if len(daily) and average_equity > 0 else 0.0
+    )
     summary = {
         "horizon": horizon, "rule": rule, "topk": topk, "fallback": fallback,
-        "slippage_bps_each_side": slippage_bps, "signal_days": len(daily),
+        "slippage_bps_each_side": slippage_bps, "signal_days": len(grouped),
+        "equity_curve_days": len(daily),
         "active_signal_days": active_signals, "completed_trades": len(trade_returns),
         "net_cumulative": final_equity / capital - 1.0,
         "trade_win_rate": float((np.asarray(trade_returns) > 0).mean()) if trade_returns else np.nan,
         "mean_trade_return": float(np.mean(trade_returns)) if trade_returns else np.nan,
-        "max_drawdown_marked": drawdown(daily["equity_mark"]),
+        "max_drawdown_marked": drawdown(equity_with_initial),
+        "net_sharpe_rf0": annualized_sharpe(daily["equity_mark"], capital),
+        "average_daily_turnover": average_daily_turnover,
+        "annualized_turnover": average_daily_turnover * 252.0,
+        "average_gross_exposure": float(daily["gross_exposure"].mean()) if len(daily) else 0.0,
+        "max_gross_exposure": float(daily["gross_exposure"].max()) if len(daily) else 0.0,
+        "average_max_name_concentration": (
+            float(daily["max_name_concentration"].mean()) if len(daily) else 0.0
+        ),
+        "max_name_concentration": (
+            float(daily["max_name_concentration"].max()) if len(daily) else 0.0
+        ),
+        "buy_notional": float(sum(buy_notionals)),
+        "sell_notional": float(sum(sell_notionals)),
+        "total_commission": float(sum(fees)),
         "final_equity": final_equity, **counters,
     }
     return daily, summary
@@ -452,7 +658,7 @@ def uncertainty_grid(split, predictions, prices, limits, calendar, args):
         for rule in RULES:
             for slippage in args.slippage_bps:
                 _, summary = simulate(
-                    predictions, prices, limits, calendar, horizon, rule, 1, True,
+                    predictions, prices, limits, calendar, horizon, rule, 1, args.fallback,
                     slippage, args.capital, args.commission_rate, args.minimum_commission,
                 )
                 summary["split"] = split
@@ -474,11 +680,15 @@ def select_rules(selection: pd.DataFrame, selection_slippage: float, minimum_act
         ).groupby("horizon", as_index=False).head(1)
     )
     return chosen[["horizon", "rule", "net_cumulative", "active_signal_days",
-                   "trade_win_rate", "max_drawdown_marked"]].rename(columns={
+                   "trade_win_rate", "max_drawdown_marked", "net_sharpe_rf0",
+                   "average_daily_turnover", "max_name_concentration"]].rename(columns={
                        "net_cumulative": "selection_net_cumulative",
                        "active_signal_days": "selection_active_signal_days",
                        "trade_win_rate": "selection_trade_win_rate",
                        "max_drawdown_marked": "selection_max_drawdown",
+                       "net_sharpe_rf0": "selection_sharpe_rf0",
+                       "average_daily_turnover": "selection_average_daily_turnover",
+                       "max_name_concentration": "selection_max_name_concentration",
                    })
 
 
@@ -488,7 +698,7 @@ def evaluate_chosen(chosen, predictions, prices, limits, calendar, args, output,
         for slippage in args.slippage_bps:
             daily, summary = simulate(
                 predictions, prices, limits, calendar, selected.horizon, selected.rule,
-                1, True, slippage, args.capital, args.commission_rate,
+                1, args.fallback, slippage, args.capital, args.commission_rate,
                 args.minimum_commission,
             )
             summary["split"] = "test"
@@ -527,12 +737,83 @@ def select_robust_rules(valid: pd.DataFrame, selection: pd.DataFrame,
     )
 
 
+def validate_prediction_frame(frame: pd.DataFrame, calendar: pd.DatetimeIndex,
+                              split: str) -> pd.DataFrame:
+    required = {"datetime", "instrument"}
+    for horizon in HORIZONS:
+        required.update({
+            f"{horizon}_expected_return",
+            f"{horizon}_return_std",
+            f"{horizon}_probability_positive",
+            f"{horizon}_actual_return",
+        })
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"{split} predictions are missing columns: {missing}")
+    result = frame.copy()
+    result["datetime"] = pd.to_datetime(result["datetime"])
+    if result.duplicated(["datetime", "instrument"]).any():
+        raise ValueError(f"{split} predictions contain duplicate date/instrument keys")
+    calendar_pos = {date: number for number, date in enumerate(calendar)}
+    invalid_dates = [
+        date for date in result["datetime"].drop_duplicates()
+        if date not in calendar_pos or calendar_pos[date] + 2 >= len(calendar)
+    ]
+    if invalid_dates:
+        raise ValueError(f"{split} has dates without a complete T+2 horizon: {invalid_dates[:3]}")
+    for horizon in HORIZONS:
+        numeric = [
+            f"{horizon}_expected_return", f"{horizon}_return_std",
+            f"{horizon}_probability_positive", f"{horizon}_actual_return",
+        ]
+        values = result[numeric].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{split}/{horizon} contains non-finite prediction or label values")
+        if (result[f"{horizon}_return_std"] < 0).any():
+            raise ValueError(f"{split}/{horizon} contains a negative standard deviation")
+        probability = result[f"{horizon}_probability_positive"]
+        if ((probability < 0) | (probability > 1)).any():
+            raise ValueError(f"{split}/{horizon} probability is outside [0, 1]")
+    return result.sort_values(["datetime", "instrument"]).reset_index(drop=True)
+
+
+def filter_board(frame: pd.DataFrame, variant: str) -> pd.DataFrame:
+    if variant == "all":
+        return frame.copy()
+    return frame.loc[frame["instrument"].map(excludes_star_and_chinext)].copy()
+
+
+def validate_ensemble_selection_freeze(path: Path | None, selection_path: Path) -> dict | None:
+    """Authenticate the model-ensemble pre-Test freeze without opening Test."""
+
+    if path is None:
+        return None
+    body = json.loads(path.read_text(encoding="utf-8"))
+    if body.get("selection_split") != "selection_valid":
+        raise ValueError("Ensemble manifest was not selected on selection_valid")
+    if body.get("test_files_read") is not False:
+        raise ValueError("Ensemble manifest is not a pre-Test freeze")
+    expected = body.get("selection_valid_ensemble_predictions_sha256")
+    actual = sha256(selection_path)
+    if expected != actual:
+        raise RuntimeError("Selection predictions differ from the frozen ensemble manifest")
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256(path),
+        "selection_predictions_sha256": actual,
+    }
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, default=DEFAULT_RUN)
     parser.add_argument("--valid-predictions", type=Path)
     parser.add_argument("--selection-predictions", type=Path)
     parser.add_argument("--test-predictions", type=Path)
+    parser.add_argument(
+        "--ensemble-selection-manifest", type=Path,
+        help="Optional authenticated E0-E6 pre-Test model-selection freeze.",
+    )
     parser.add_argument("--daily-ohlc-cache", type=Path, default=DEFAULT_DAILY)
     parser.add_argument("--exact-limits", type=Path, default=DEFAULT_LIMITS)
     parser.add_argument("--index-cache", type=Path, default=DEFAULT_INDEX)
@@ -564,33 +845,69 @@ def main():
     if valid_path is None and (args.run / "valid_predictions.csv").is_file():
         valid_path = args.run / "valid_predictions.csv"
 
-    # Freeze all trading-rule choices before opening the held-out Test file.
-    selection_frame = pd.read_csv(selection_path, parse_dates=["datetime"])
-    if args.board_variant == "mainboard":
-        selection_frame = selection_frame.loc[selection_frame["instrument"].map(mainboard)].copy()
+    # Authenticate and freeze every model/rule choice before opening held-out Test.
+    ensemble_freeze = validate_ensemble_selection_freeze(
+        args.ensemble_selection_manifest, selection_path
+    )
+    selection_frame = validate_prediction_frame(
+        pd.read_csv(selection_path, parse_dates=["datetime"]), calendar, "selection_valid"
+    )
+    selection_frame = filter_board(selection_frame, args.board_variant)
     selection_grid = uncertainty_grid(
         "selection_valid", selection_frame, prices, limits, calendar, args
     )
     selection_grid = attach_benchmarks(selection_grid, selection_frame, index, calendar)
     chosen = select_rules(selection_grid, args.selection_slippage_bps, args.minimum_active_days)
+
+    valid_frame = valid_grid = robust_chosen = None
+    if valid_path is not None:
+        valid_frame = validate_prediction_frame(
+            pd.read_csv(valid_path, parse_dates=["datetime"]), calendar, "valid"
+        )
+        if valid_frame["datetime"].max() >= selection_frame["datetime"].min():
+            raise ValueError("Valid and Selection-valid are not strictly chronological")
+        valid_frame = filter_board(valid_frame, args.board_variant)
+        valid_grid = uncertainty_grid("valid", valid_frame, prices, limits, calendar, args)
+        valid_grid = attach_benchmarks(valid_grid, valid_frame, index, calendar)
+        robust_chosen = select_robust_rules(
+            valid_grid, selection_grid, args.selection_slippage_bps, args.minimum_active_days
+        )
+
     selection_grid.to_csv(output / "selection_valid_uncertainty_grid.csv", index=False)
     chosen.to_csv(output / "selection_valid_chosen_rules.csv", index=False)
+    if valid_grid is not None:
+        valid_grid.to_csv(output / "valid_uncertainty_grid.csv", index=False)
+        robust_chosen.to_csv(output / "valid_selection_robust_chosen_rules.csv", index=False)
     rule_manifest = {
+        "schema_version": 2,
+        "selection_split": "selection_valid",
         "selection_predictions": str(selection_path.resolve()),
         "selection_predictions_sha256": sha256(selection_path),
+        "valid_predictions": str(valid_path.resolve()) if valid_path is not None else None,
+        "valid_predictions_sha256": sha256(valid_path) if valid_path is not None else None,
+        "ensemble_selection_freeze": ensemble_freeze,
         "selection_slippage_bps": args.selection_slippage_bps,
         "minimum_active_days": args.minimum_active_days,
+        "board_variant": args.board_variant,
+        "fallback": args.fallback,
         "chosen": chosen.to_dict(orient="records"),
+        "robust_chosen": (
+            robust_chosen.to_dict(orient="records") if robust_chosen is not None else None
+        ),
         "test_opened": False,
     }
-    (output / "chosen_rule_manifest_pre_test.json").write_text(
+    pretest_manifest = output / "chosen_rule_manifest_pre_test.json"
+    pretest_manifest.write_text(
         json.dumps(rule_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     # Only the frozen chosen rules are now evaluated on Test.
-    test_frame = pd.read_csv(test_path, parse_dates=["datetime"])
-    if args.board_variant == "mainboard":
-        test_frame = test_frame.loc[test_frame["instrument"].map(mainboard)].copy()
+    test_frame = validate_prediction_frame(
+        pd.read_csv(test_path, parse_dates=["datetime"]), calendar, "test"
+    )
+    if selection_frame["datetime"].max() >= test_frame["datetime"].min():
+        raise ValueError("Selection-valid and Test are not strictly chronological")
+    test_frame = filter_board(test_frame, args.board_variant)
     baseline = baseline_matrix("test", test_frame, prices, limits, calendar, args, output)
     baseline = attach_benchmarks(baseline, test_frame, index, calendar)
     chosen_test = evaluate_chosen(
@@ -598,16 +915,8 @@ def main():
     )
     chosen_test = attach_benchmarks(chosen_test, test_frame, index, calendar)
 
-    valid_grid = robust_chosen = robust_test = robust_comparison = None
-    if valid_path is not None:
-        valid_frame = pd.read_csv(valid_path, parse_dates=["datetime"])
-        if args.board_variant == "mainboard":
-            valid_frame = valid_frame.loc[valid_frame["instrument"].map(mainboard)].copy()
-        valid_grid = uncertainty_grid("valid", valid_frame, prices, limits, calendar, args)
-        valid_grid = attach_benchmarks(valid_grid, valid_frame, index, calendar)
-        robust_chosen = select_robust_rules(
-            valid_grid, selection_grid, args.selection_slippage_bps, args.minimum_active_days
-        )
+    robust_test = robust_comparison = None
+    if robust_chosen is not None:
         robust_test = evaluate_chosen(
             robust_chosen, test_frame, prices, limits, calendar, args, output, "robust"
         )
@@ -625,16 +934,26 @@ def main():
     ], ignore_index=True)
     baseline_top1 = baseline.loc[
         baseline["topk"].eq(1) & baseline["slippage_bps_each_side"].eq(args.selection_slippage_bps)
-    ][["horizon", "net_cumulative", "trade_win_rate", "max_drawdown_marked"]].rename(columns={
+    ][["horizon", "net_cumulative", "trade_win_rate", "max_drawdown_marked",
+       "net_sharpe_rf0", "average_daily_turnover", "max_name_concentration"]].rename(columns={
         "net_cumulative": "baseline_test_net", "trade_win_rate": "baseline_test_win_rate",
         "max_drawdown_marked": "baseline_test_max_drawdown",
+        "net_sharpe_rf0": "baseline_test_sharpe_rf0",
+        "average_daily_turnover": "baseline_test_average_daily_turnover",
+        "max_name_concentration": "baseline_test_max_name_concentration",
     })
     selected_slippage = chosen_test.loc[
         chosen_test["slippage_bps_each_side"].eq(args.selection_slippage_bps)
     ][["horizon", "rule", "net_cumulative", "active_signal_days", "trade_win_rate",
-       "max_drawdown_marked", "CSI1000_gross_cumulative", "CSI300_gross_cumulative"]].rename(columns={
+       "max_drawdown_marked", "net_sharpe_rf0", "average_daily_turnover",
+       "max_name_concentration", "CSI1000_gross_cumulative", "CSI300_gross_cumulative",
+       "CSI1000_max_drawdown", "CSI300_max_drawdown", "CSI1000_sharpe_rf0",
+       "CSI300_sharpe_rf0"]].rename(columns={
         "net_cumulative": "selected_test_net", "active_signal_days": "selected_test_active_days",
         "trade_win_rate": "selected_test_win_rate", "max_drawdown_marked": "selected_test_max_drawdown",
+        "net_sharpe_rf0": "selected_test_sharpe_rf0",
+        "average_daily_turnover": "selected_test_average_daily_turnover",
+        "max_name_concentration": "selected_test_max_name_concentration",
     })
     comparison = chosen.merge(baseline_top1, on="horizon").merge(
         selected_slippage, on=["horizon", "rule"]
@@ -644,9 +963,13 @@ def main():
         robust_test_selected = robust_test.loc[
             robust_test["slippage_bps_each_side"].eq(args.selection_slippage_bps)
         ][["horizon", "rule", "net_cumulative", "active_signal_days", "trade_win_rate",
-           "max_drawdown_marked"]].rename(columns={
+           "max_drawdown_marked", "net_sharpe_rf0", "average_daily_turnover",
+           "max_name_concentration"]].rename(columns={
             "net_cumulative": "test_net", "active_signal_days": "test_active_days",
             "trade_win_rate": "test_win_rate", "max_drawdown_marked": "test_max_drawdown",
+            "net_sharpe_rf0": "test_sharpe_rf0",
+            "average_daily_turnover": "test_average_daily_turnover",
+            "max_name_concentration": "test_max_name_concentration",
         })
         robust_comparison = robust_chosen.merge(baseline_top1, on="horizon").merge(
             robust_test_selected, on=["horizon", "rule"]
@@ -661,12 +984,12 @@ def main():
     alignment.to_csv(output / "label_alignment.csv", index=False)
     comparison.to_csv(output / "uncertainty_selection_test_comparison.csv", index=False)
     if valid_grid is not None:
-        valid_grid.to_csv(output / "valid_uncertainty_grid.csv", index=False)
-        robust_chosen.to_csv(output / "valid_selection_robust_chosen_rules.csv", index=False)
         robust_test.to_csv(output / "test_robust_uncertainty_rules.csv", index=False)
         robust_comparison.to_csv(output / "robust_selection_test_comparison.csv", index=False)
     rule_manifest.update({
         "test_opened": True,
+        "pretest_rule_manifest": str(pretest_manifest.resolve()),
+        "pretest_rule_manifest_sha256": sha256(pretest_manifest),
         "test_predictions": str(test_path.resolve()),
         "test_predictions_sha256": sha256(test_path),
     })
@@ -674,15 +997,34 @@ def main():
         json.dumps(rule_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     (output / "method.json").write_text(json.dumps({
-        "selection_policy": "choose highest 5bps net cumulative on Selection-valid, at least 30 active days; Test not used",
-        "robust_policy": "maximize the worse 5bps net cumulative across Valid and Selection-valid, at least 30 active days in each; Test not used",
+        "selection_policy": (
+            f"choose highest {args.selection_slippage_bps:g}bps net cumulative on "
+            f"Selection-valid, at least {args.minimum_active_days} active days; Test not used"
+        ),
+        "robust_policy": (
+            f"maximize the worse {args.selection_slippage_bps:g}bps net cumulative across "
+            f"Valid and Selection-valid, at least {args.minimum_active_days} active days in each; "
+            "frozen before Test is opened"
+        ),
         "rules": RULES, "horizons": HORIZONS,
         "board_variant": args.board_variant,
+        "board_variant_meaning": (
+            "exclude SH68 STAR and SZ30 ChiNext only"
+            if args.board_variant == "mainboard" else "include all prediction instruments"
+        ),
         "capital": args.capital, "commission_rate_each_side": args.commission_rate,
         "minimum_commission": args.minimum_commission, "stamp_tax": "omitted per user preference",
         "fallback": args.fallback, "lot_size": 100,
         "overlap": "open1_close2 uses two independent 50% temporal sleeves",
-        "limit_down_exit": "chronological state machine retries later same-phase events; no future exit scan at entry",
+        "limit_down_exit": (
+            "chronological state machine retries at every later observable open/close event; "
+            "no future exit scan at entry"
+        ),
+        "performance_path": (
+            "daily marked account equity; Sharpe uses daily equity returns at rf=0; "
+            "turnover is two-sided notional divided by 2*mean equity*days; concentration "
+            "aggregates the same instrument across temporal sleeves"
+        ),
         "diagnostic_test_grid_generated": args.diagnostic_test_grid,
         "test_warning": "A full Test rule grid is disabled by default and is never used for rule selection",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
