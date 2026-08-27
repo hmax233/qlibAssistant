@@ -43,7 +43,14 @@ HORIZON_EXECUTION = {
     "open1_open2": ("open", "open", 1),
     "close1_close2": ("close", "close", 1),
 }
-PREDICTION_METRICS = ("rank_ic", "rank_icir", "nll", "mae", "brier")
+CORE_PREDICTION_METRICS = ("rank_ic", "rank_icir", "nll", "mae", "brier")
+CALIBRATION_METRICS = ("direction_accuracy", "coverage_50", "coverage_80", "coverage_95")
+TOPK_METRICS = tuple(
+    f"top{topk}_{metric}"
+    for topk in (1, 3, 5, 10)
+    for metric in ("mean_return", "cumulative", "win_rate", "stock_win_rate")
+)
+PREDICTION_METRICS = (*CORE_PREDICTION_METRICS, *CALIBRATION_METRICS, *TOPK_METRICS)
 SUMMARY_METRICS = ("days", "rows", "components", *PREDICTION_METRICS)
 
 
@@ -156,14 +163,39 @@ def observable_prediction_metrics(frame: pd.DataFrame, horizon: str) -> dict[str
         raise ValueError(f"No finite daily RankIC values for {horizon}")
     daily = np.asarray(daily_ic, dtype=float)
     deviation = float(daily.std(ddof=0))
-    return {
+    result: dict[str, float | int] = {
         "days": int(frame["datetime"].nunique()),
         "rows": int(len(frame)),
         "rank_ic": float(daily.mean()),
         "rank_icir": float(daily.mean() / deviation) if deviation > 0 else math.nan,
         "mae": float(np.mean(np.abs(expected - actual))),
         "brier": float(np.mean((probability - (actual > 0)) ** 2)),
+        "direction_accuracy": float(np.mean((probability >= 0.5) == (actual > 0))),
     }
+    actual_log = np.log1p(actual)
+    log_mean = frame[f"{horizon}_log_mean"].to_numpy(float)
+    log_std = np.sqrt(frame[f"{horizon}_log_variance"].to_numpy(float))
+    for level, z_value in ((50, 0.6744897501960817), (80, 1.2815515655446004),
+                           (95, 1.959963984540054)):
+        result[f"coverage_{level}"] = float(np.mean(
+            (actual_log >= log_mean - z_value * log_std)
+            & (actual_log <= log_mean + z_value * log_std)
+        ))
+    ordered = frame.sort_values(
+        ["datetime", f"{horizon}_expected_return"], ascending=[True, False]
+    )
+    for topk in (1, 3, 5, 10):
+        selected = ordered.groupby("datetime", sort=True).head(topk)
+        daily_portfolio = selected.groupby("datetime", sort=True)[
+            f"{horizon}_actual_return"
+        ].mean()
+        result[f"top{topk}_mean_return"] = float(daily_portfolio.mean())
+        result[f"top{topk}_cumulative"] = float(np.prod(1.0 + daily_portfolio) - 1.0)
+        result[f"top{topk}_win_rate"] = float((daily_portfolio > 0).mean())
+        result[f"top{topk}_stock_win_rate"] = float(
+            (selected[f"{horizon}_actual_return"] > 0).mean()
+        )
+    return result
 
 
 def _assert_close(actual: Any, expected: Any, label: str, tolerance: float = 1e-8) -> None:
@@ -592,7 +624,7 @@ def plot_prediction_metrics(summary: pd.DataFrame, output: Path) -> None:
     figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
     x = np.arange(len(HORIZONS))
     labels = [HORIZON_LABELS[horizon].replace(" → ", "\n→ ") for horizon in HORIZONS]
-    for axis, metric in zip(axes.flat, PREDICTION_METRICS):
+    for axis, metric in zip(axes.flat, CORE_PREDICTION_METRICS):
         width = 0.36
         axis.bar(x - width / 2, summary[f"selection_{metric}"], width, label="Selection-valid")
         axis.bar(x + width / 2, summary[f"test_{metric}"], width, label="Test")
@@ -714,6 +746,31 @@ def write_method_and_findings(
             f"{row.test_rank_ic:.4f} | {row.selection_nll:.4f} | {row.test_nll:.4f} | "
             f"{row.selection_mae:.4f} | {row.test_mae:.4f} | "
             f"{row.selection_brier:.4f} | {row.test_brier:.4f} |"
+        )
+    lines.extend([
+        "",
+        "### Calibration and frictionless ranking diagnostics",
+        "",
+        "These diagnostics use realized labels and therefore never participate in model or rule selection. "
+        "Coverage is exact for a single Gaussian and moment-matched for a Gaussian mixture. "
+        "Top-K cumulative return below is a frictionless daily diagnostic; the strict account table is the executable result.",
+        "",
+        "| Horizon | Test direction acc. | Cov. 50/80/95 | Top1 win/mean/cum | Top3 win/mean/cum | Top5 win/mean/cum | Top10 win/mean/cum |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in summary.itertuples(index=False):
+        lines.append(
+            f"| {row.horizon} | {_percent(row.test_direction_accuracy)} | "
+            f"{_percent(row.test_coverage_50)} / {_percent(row.test_coverage_80)} / "
+            f"{_percent(row.test_coverage_95)} | "
+            f"{_percent(row.test_top1_win_rate)} / {_percent(row.test_top1_mean_return)} / "
+            f"{_percent(row.test_top1_cumulative)} | "
+            f"{_percent(row.test_top3_win_rate)} / {_percent(row.test_top3_mean_return)} / "
+            f"{_percent(row.test_top3_cumulative)} | "
+            f"{_percent(row.test_top5_win_rate)} / {_percent(row.test_top5_mean_return)} / "
+            f"{_percent(row.test_top5_cumulative)} | "
+            f"{_percent(row.test_top10_win_rate)} / {_percent(row.test_top10_mean_return)} / "
+            f"{_percent(row.test_top10_cumulative)} |"
         )
     lines.extend([
         "",

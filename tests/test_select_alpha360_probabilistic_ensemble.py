@@ -248,6 +248,12 @@ def test_selection_never_reads_test_before_manifest(tmp_path: Path) -> None:
     manifest = json.loads(output.read_text())
     assert manifest["test_files_read"] is False
     assert all(value["selected_components"] == ["good"] for value in manifest["selections"].values())
+    metrics = manifest["selections"]["close1_close2"]["selection_valid_metrics"]
+    for name in (
+        "coverage_50", "coverage_80", "coverage_95", "direction_accuracy",
+        "top1_win_rate", "top3_mean_return", "top5_cumulative", "top10_stock_win_rate",
+    ):
+        assert name in metrics
     selection_predictions = pd.read_csv(output.parent / "selection_valid_ensemble_predictions.csv")
     assert all(f"{horizon}_expected_return" in selection_predictions for horizon in HORIZONS)
 

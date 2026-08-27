@@ -572,7 +572,13 @@ def score(frame: pd.DataFrame, component_frame: pd.DataFrame, names: list[str]) 
     mean_rank_ic = float(rank_ics.mean()) if len(rank_ics) else float("nan")
     std_rank_ic = float(rank_ics.std(ddof=0)) if len(rank_ics) else float("nan")
     nll = exact_mixture_nll(component_frame, names)
-    return {
+    actual_return = frame["actual_return"].to_numpy(float)
+    actual_log = np.full_like(actual_return, np.nan)
+    valid_log = np.isfinite(actual_return) & (actual_return > -1.0)
+    actual_log[valid_log] = np.log1p(actual_return[valid_log])
+    mean = frame["log_mean"].to_numpy(float)
+    std = np.sqrt(frame["log_variance"].to_numpy(float))
+    result: dict[str, float | int | None] = {
         "components": len(names),
         "days": int(frame["datetime"].nunique()),
         "rows": int(len(frame)),
@@ -581,7 +587,31 @@ def score(frame: pd.DataFrame, component_frame: pd.DataFrame, names: list[str]) 
         "nll": float(np.nanmean(nll)),
         "mae": float(np.nanmean(np.abs(frame["expected_return"] - frame["actual_return"]))),
         "brier": float(np.nanmean((frame["probability_positive"] - (frame["actual_return"] > 0)) ** 2)),
+        "direction_accuracy": float(np.nanmean(
+            (frame["probability_positive"].to_numpy(float) >= 0.5)
+            == (actual_return > 0)
+        )),
     }
+    # For a single component these are exact central Gaussian intervals.  For
+    # a multi-model Gaussian mixture they are explicitly moment-matched
+    # intervals based on the mixture mean and total variance.
+    for level, z_value in ((50, 0.6744897501960817), (80, 1.2815515655446004),
+                           (95, 1.959963984540054)):
+        covered = valid_log & (actual_log >= mean - z_value * std) & (
+            actual_log <= mean + z_value * std
+        )
+        result[f"coverage_{level}"] = float(covered[valid_log].mean())
+    ordered = frame.sort_values(
+        ["datetime", "expected_return"], ascending=[True, False]
+    )
+    for topk in (1, 3, 5, 10):
+        selected = ordered.groupby("datetime", sort=True).head(topk)
+        daily_portfolio = selected.groupby("datetime", sort=True)["actual_return"].mean()
+        result[f"top{topk}_mean_return"] = float(daily_portfolio.mean())
+        result[f"top{topk}_cumulative"] = float(np.prod(1.0 + daily_portfolio) - 1.0)
+        result[f"top{topk}_win_rate"] = float((daily_portfolio > 0).mean())
+        result[f"top{topk}_stock_win_rate"] = float((selected["actual_return"] > 0).mean())
+    return result
 
 
 def ranked_candidate_names(candidates: dict[str, Path], horizon: str) -> tuple[list[str], dict[str, dict]]:

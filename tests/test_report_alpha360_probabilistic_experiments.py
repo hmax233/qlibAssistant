@@ -57,13 +57,8 @@ def metric_fixture(predictions: pd.DataFrame, horizon: str, nll: float) -> dict:
     metrics = observable_prediction_metrics(predictions, horizon)
     return {
         "components": 1,
-        "days": metrics["days"],
-        "rows": metrics["rows"],
-        "rank_ic": metrics["rank_ic"],
-        "rank_icir": metrics["rank_icir"],
+        **metrics,
         "nll": nll,
-        "mae": metrics["mae"],
-        "brier": metrics["brier"],
     }
 
 
@@ -316,6 +311,12 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert summary.loc[0, "mainboard_selection_rule"] == "frozen_rule_0"
     assert summary.loc[0, "mainboard_selection_rule_test_net_cumulative"] == pytest.approx(0.03)
     assert summary.loc[0, "all_selection_rule_test_net_cumulative"] == pytest.approx(0.033)
+    for column in (
+        "test_coverage_50", "test_coverage_80", "test_coverage_95",
+        "test_top1_win_rate", "test_top3_mean_return", "test_top5_cumulative",
+        "test_top10_stock_win_rate",
+    ):
+        assert column in summary
     model_selection = pd.read_csv(output / "model_selection.csv")
     selected = model_selection.loc[
         model_selection["record_type"].eq("ensemble_alternative")
@@ -332,6 +333,8 @@ def test_generates_report_with_frozen_mappings_and_pngs(complete_fixture: dict[s
     assert "Test is evaluated exactly once" in method
     assert "100" in method
     assert "STAR and ChiNext excluded" in method
+    assert "Calibration and frictionless ranking diagnostics" in method
+    assert "Top1 win/mean/cum" in method
     assert {path: file_hash(path) for path in input_paths} == before
 
 
