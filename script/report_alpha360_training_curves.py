@@ -54,12 +54,34 @@ def load_history(name: str, path: Path, expected_epochs: int) -> pd.DataFrame:
     expected = np.arange(1, expected_epochs + 1)
     if not np.array_equal(epoch.to_numpy(), expected):
         raise ValueError(f"{name} epochs must be contiguous 1..{expected_epochs}")
+    # E6 records one validation log-NLL per independent horizon instead of a
+    # shared ``nll_scaled`` value.  Preserve the four source columns and derive
+    # their unweighted mean solely for the overview curve/summary.
+    horizon_nll_columns = [f"{horizon}_nll_log_return" for horizon in HORIZONS]
+    if not any(candidate in frame for candidate in ("nll_scaled", "nll_scaled_3leg")):
+        missing_horizon_nll = [
+            column for column in horizon_nll_columns if column not in frame
+        ]
+        if missing_horizon_nll:
+            raise ValueError(
+                f"{name} has no validation NLL column and lacks horizon NLLs: "
+                f"{missing_horizon_nll}"
+            )
+        horizon_nll = frame[horizon_nll_columns].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        if not np.isfinite(horizon_nll.to_numpy(float)).all():
+            raise ValueError(f"{name} horizon validation NLL contains non-finite values")
+        frame["mean_horizon_nll_log_return"] = horizon_nll.mean(axis=1)
     numeric_columns = [
         column
         for column in frame.columns
         if column == "learning_rate"
         or column == "epoch_seconds"
-        or column in {"train_nll", "train_nll_scaled", "nll_scaled", "nll_scaled_3leg"}
+        or column in {
+            "train_nll", "train_nll_scaled", "nll_scaled", "nll_scaled_3leg",
+            "mean_horizon_nll_log_return",
+        }
         or column.endswith("_rank_ic")
     ]
     numeric = frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
@@ -71,7 +93,9 @@ def load_history(name: str, path: Path, expected_epochs: int) -> pd.DataFrame:
 
 
 def valid_nll_column(frame: pd.DataFrame) -> str:
-    for candidate in ("nll_scaled", "nll_scaled_3leg"):
+    for candidate in (
+        "nll_scaled", "nll_scaled_3leg", "mean_horizon_nll_log_return",
+    ):
         if candidate in frame:
             return candidate
     raise ValueError(f"{frame.experiment.iloc[0]} has no validation NLL column")
@@ -152,6 +176,7 @@ def render(histories: dict[str, pd.DataFrame], output: Path) -> pd.DataFrame:
         "# Alpha360 E0–E6 training curves",
         "",
         "All curves come from the persisted per-epoch CSV files. Validation metrics are descriptive; held-out Test is not used here.",
+        "E6 has four independent Gaussian heads and therefore uses the unweighted mean of its four persisted per-horizon validation log-NLL columns for the overview. Its NLL scale is not directly comparable with every joint/scaled objective; use each experiment's curve shape and best epoch, not cross-experiment NLL height.",
         "",
         "| Experiment | Epochs | Total min | Mean sec/epoch | Best valid NLL (epoch) | Final LR |",
         "|---|---:|---:|---:|---:|---:|",

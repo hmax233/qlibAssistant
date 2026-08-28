@@ -71,3 +71,23 @@ def test_training_markdown_marks_non_emitted_horizons(tmp_path: Path) -> None:
     markdown = (output / "training_curves.md").read_text(encoding="utf-8")
     assert "| E2 | T+1 open → T+2 close | 0.040000 | 4 |" in markdown
     assert "| E2 | T+1 close → T+2 open | — | — |" in markdown
+
+
+def test_e6_independent_horizon_nll_is_aggregated_for_overview(tmp_path: Path) -> None:
+    e6 = history("E6").drop(columns=["nll_scaled"])
+    expected_columns = []
+    for number, horizon_name in enumerate(HORIZONS):
+        column = f"{horizon_name}_nll_log_return"
+        expected_columns.append(column)
+        e6[column] = np.linspace(-2.0 - number, -2.3 - number, len(e6))
+    path = tmp_path / "e6.csv"
+    e6.to_csv(path, index=False)
+
+    loaded = load_history("E6", path, expected_epochs=4)
+    expected = loaded[expected_columns].mean(axis=1)
+    assert np.allclose(loaded["mean_horizon_nll_log_return"], expected)
+    output = tmp_path / "e6-report"
+    summary = render({"E6": loaded}, output)
+    assert summary.loc[0, "best_valid_nll"] == pytest.approx(expected.min())
+    markdown = (output / "training_curves.md").read_text(encoding="utf-8")
+    assert "not directly comparable" in markdown
