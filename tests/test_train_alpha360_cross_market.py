@@ -17,10 +17,54 @@ from script.train_alpha360_cross_market import (
     Trainer,
     build_learning_rate_scheduler,
     file_hash,
+    merge_prediction_columns,
     pad_cross_market_date_batches,
     parse_args,
     validate_frozen_selection_manifest,
 )
+
+
+def test_merge_prediction_columns_keeps_identical_cross_market_metadata() -> None:
+    first = pd.DataFrame({
+        "datetime": ["2026-01-05", "2026-01-05"],
+        "instrument": ["SH600000", "SZ000001"],
+        "us_asof_date": ["2026-01-02", "2026-01-02"],
+        "open1_close2_expected_return": [0.01, 0.02],
+    })
+    second = pd.DataFrame({
+        "datetime": ["2026-01-05", "2026-01-05"],
+        "instrument": ["SH600000", "SZ000001"],
+        "us_asof_date": ["2026-01-02", "2026-01-02"],
+        "close1_open2_expected_return": [0.03, 0.04],
+    })
+    merged = merge_prediction_columns([first, second])
+    assert merged.columns.tolist().count("us_asof_date") == 1
+    assert merged["us_asof_date"].eq("2026-01-02").all()
+    assert "open1_close2_expected_return" in merged
+    assert "close1_open2_expected_return" in merged
+
+
+def test_merge_prediction_columns_rejects_metadata_or_key_mismatch() -> None:
+    first = pd.DataFrame({
+        "datetime": ["2026-01-05"],
+        "instrument": ["SH600000"],
+        "us_asof_date": ["2026-01-02"],
+        "open1_close2_expected_return": [0.01],
+    })
+    metadata_mismatch = pd.DataFrame({
+        "datetime": ["2026-01-05"],
+        "instrument": ["SH600000"],
+        "us_asof_date": ["2026-01-01"],
+        "close1_open2_expected_return": [0.02],
+    })
+    with pytest.raises(ValueError, match="shared prediction metadata differs"):
+        merge_prediction_columns([first, metadata_mismatch])
+
+    key_mismatch = metadata_mismatch.assign(
+        instrument="SZ000001", us_asof_date="2026-01-02"
+    )
+    with pytest.raises(ValueError, match="do not have identical keys"):
+        merge_prediction_columns([first, key_mismatch])
 
 
 def _write_npy(path: Path, values: np.ndarray) -> str:

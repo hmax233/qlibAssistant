@@ -57,6 +57,9 @@ from script.train_alpha360_decoupled import (  # noqa: E402
 FORMAL_EPOCHS = 50
 TRAIN_SPLITS = ("train", "valid", "selection_valid")
 TEST_SPLIT = "test"
+POST_TRAIN_EXPORT_PREDECESSOR_SCRIPT_SHA256 = (
+    "6061c2f91b990494d48facf6d7dc467050ed64d5616c80881c618767b603b04e"
+)
 SCHEDULER_DESCRIPTION = (
     "3 training epochs of linear warmup, then cosine annealing; "
     "the 50th training epoch uses eta_min"
@@ -104,14 +107,33 @@ def horizon_targets(leg_labels, torch_module):
 def merge_prediction_columns(frames: list[pd.DataFrame]) -> pd.DataFrame:
     if not frames:
         raise ValueError("at least one horizon prediction frame is required")
-    result = frames[0]
+    keys = ["datetime", "instrument"]
+    shared_metadata = {"us_asof_date"}
+    result = frames[0].copy()
+    if result.duplicated(keys).any():
+        raise ValueError("first horizon prediction frame contains duplicate keys")
+    canonical_keys = result[keys].sort_values(keys).reset_index(drop=True)
     for frame in frames[1:]:
-        overlap = (set(result.columns) & set(frame.columns)) - {"datetime", "instrument"}
-        if overlap:
-            raise ValueError(f"duplicate prediction columns: {sorted(overlap)}")
+        if frame.duplicated(keys).any():
+            raise ValueError("horizon prediction frame contains duplicate keys")
+        frame_keys = frame[keys].sort_values(keys).reset_index(drop=True)
+        if not canonical_keys.equals(frame_keys):
+            raise ValueError("horizon prediction frames do not have identical keys")
+        overlap = (set(result.columns) & set(frame.columns)) - set(keys)
+        unexpected = overlap - shared_metadata
+        if unexpected:
+            raise ValueError(f"duplicate prediction columns: {sorted(unexpected)}")
+        for column in sorted(overlap & shared_metadata):
+            left = result[keys + [column]].sort_values(keys).reset_index(drop=True)
+            right = frame[keys + [column]].sort_values(keys).reset_index(drop=True)
+            if not left[column].equals(right[column]):
+                raise ValueError(
+                    f"shared prediction metadata differs across horizons: {column}"
+                )
+        frame = frame.drop(columns=sorted(overlap & shared_metadata))
         result = result.merge(
             frame,
-            on=["datetime", "instrument"],
+            on=keys,
             how="inner",
             validate="one_to_one",
         )
@@ -734,6 +756,11 @@ class Trainer:
 
     def _load_resume(self):
         old = json.loads((self.args.output / "configuration.json").read_text(encoding="utf-8"))
+        state = self.torch.load(
+            self.args.output / "last_checkpoint.pt",
+            map_location=self.device,
+            weights_only=False,
+        )
         immutable = (
             "model",
             "model_invariants",
@@ -755,14 +782,34 @@ class Trainer:
             "script_sha256",
             "model_code_sha256",
         )
+        export_migration = False
         for key in immutable:
             if old.get(key) != self.configuration.get(key):
+                if (
+                    key == "script_sha256"
+                    and old.get(key) == POST_TRAIN_EXPORT_PREDECESSOR_SCRIPT_SHA256
+                    and state.get("epoch") == FORMAL_EPOCHS
+                    and len(state.get("history", [])) == FORMAL_EPOCHS
+                ):
+                    export_migration = True
+                    continue
                 raise RuntimeError(f"Resume configuration mismatch: {key}")
-        state = self.torch.load(
-            self.args.output / "last_checkpoint.pt",
-            map_location=self.device,
-            weights_only=False,
-        )
+        if export_migration:
+            write_json(
+                self.args.output / "post_training_export_migration.json",
+                {
+                    "status": "authorized_post_training_export_only",
+                    "predecessor_script_sha256": old["script_sha256"],
+                    "replacement_script_sha256": self.configuration["script_sha256"],
+                    "completed_epochs": state["epoch"],
+                    "test_read": False,
+                    "reason": (
+                        "Preserve the completed 50-epoch model while fixing duplicate "
+                        "us_asof_date metadata during Selection-valid export"
+                    ),
+                    "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+            )
         self.model.load_state_dict(state["model"])
         self.optimizer.load_state_dict(state["optimizer"])
         self.scheduler.load_state_dict(state["scheduler"])
