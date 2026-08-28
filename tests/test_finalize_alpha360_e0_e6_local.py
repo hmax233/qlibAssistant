@@ -174,6 +174,11 @@ def build_publishable_staging(module, staging: Path) -> None:
             )
             write_csv(directory / "label_alignment.csv", "split,aligned", ["test,1"])
             write_csv(
+                directory / "prediction_label_availability.csv",
+                "split,horizon,rows,finite_labels,missing_labels,missing_label_rate",
+                ["test,close1_close2,1,1,0,0"],
+            )
+            write_csv(
                 directory / "uncertainty_selection_test_comparison.csv",
                 "horizon,value",
                 ["close1_close2,1"],

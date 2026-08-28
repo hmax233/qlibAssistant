@@ -111,6 +111,7 @@ STRICT_BACKTEST_REQUIRED_FILES = (
     "test_baseline_four_horizons.csv",
     "test_selected_uncertainty_rules.csv",
     "label_alignment.csv",
+    "prediction_label_availability.csv",
     "uncertainty_selection_test_comparison.csv",
 )
 

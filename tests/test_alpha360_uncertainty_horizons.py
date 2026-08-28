@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -11,8 +12,10 @@ from evaluate_alpha360_uncertainty_horizons import (
     benchmark_statistics,
     commission,
     excludes_star_and_chinext,
+    label_availability,
     prepare_rule,
     simulate,
+    validate_prediction_frame,
 )
 
 
@@ -227,3 +230,32 @@ def test_mainboard_variant_excludes_only_star_and_chinext():
     assert excludes_star_and_chinext("SH600000")
     assert excludes_star_and_chinext("SZ000001")
     assert excludes_star_and_chinext("BJ430001")
+
+
+def test_prediction_validation_audits_missing_labels_but_rejects_corruption():
+    calendar = pd.DatetimeIndex(pd.to_datetime([
+        "2026-01-05", "2026-01-06", "2026-01-07",
+    ]))
+    row = {"datetime": calendar[0], "instrument": "SH600000"}
+    for horizon in (
+        "open1_close2", "close1_open2", "open1_open2", "close1_close2"
+    ):
+        row[f"{horizon}_expected_return"] = 0.01
+        row[f"{horizon}_return_std"] = 0.02
+        row[f"{horizon}_probability_positive"] = 0.7
+        row[f"{horizon}_actual_return"] = np.nan
+    validated = validate_prediction_frame(
+        pd.DataFrame([row]), calendar, "selection_valid"
+    )
+    availability = label_availability("selection_valid", validated)
+    assert availability["missing_labels"].eq(1).all()
+
+    corrupted = pd.DataFrame([row])
+    corrupted.loc[0, "open1_close2_expected_return"] = np.nan
+    with pytest.raises(ValueError, match="non-finite predictions"):
+        validate_prediction_frame(corrupted, calendar, "selection_valid")
+
+    infinite_label = pd.DataFrame([row])
+    infinite_label.loc[0, "open1_close2_actual_return"] = np.inf
+    with pytest.raises(ValueError, match="infinite labels"):
+        validate_prediction_frame(infinite_label, calendar, "selection_valid")

@@ -836,19 +836,42 @@ def validate_prediction_frame(frame: pd.DataFrame, calendar: pd.DatetimeIndex,
     if invalid_dates:
         raise ValueError(f"{split} has dates without a complete T+2 horizon: {invalid_dates[:3]}")
     for horizon in HORIZONS:
-        numeric = [
+        prediction_columns = [
             f"{horizon}_expected_return", f"{horizon}_return_std",
-            f"{horizon}_probability_positive", f"{horizon}_actual_return",
+            f"{horizon}_probability_positive",
         ]
-        values = result[numeric].to_numpy(dtype=float)
-        if not np.isfinite(values).all():
-            raise ValueError(f"{split}/{horizon} contains non-finite prediction or label values")
+        predictions = result[prediction_columns].to_numpy(dtype=float)
+        if not np.isfinite(predictions).all():
+            raise ValueError(f"{split}/{horizon} contains non-finite predictions")
+        # A small number of suspended/newly listed/delisted names legitimately
+        # have no realized label.  Labels do not drive rule selection or the
+        # execution simulator and their availability is audited separately.
+        # Infinity still indicates a corrupted label and remains fatal.
+        labels = result[f"{horizon}_actual_return"].to_numpy(dtype=float)
+        if np.isinf(labels).any():
+            raise ValueError(f"{split}/{horizon} contains infinite labels")
         if (result[f"{horizon}_return_std"] < 0).any():
             raise ValueError(f"{split}/{horizon} contains a negative standard deviation")
         probability = result[f"{horizon}_probability_positive"]
         if ((probability < 0) | (probability > 1)).any():
             raise ValueError(f"{split}/{horizon} probability is outside [0, 1]")
     return result.sort_values(["datetime", "instrument"]).reset_index(drop=True)
+
+
+def label_availability(split: str, predictions: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for horizon in HORIZONS:
+        labels = predictions[f"{horizon}_actual_return"].to_numpy(dtype=float)
+        finite = np.isfinite(labels)
+        rows.append({
+            "split": split,
+            "horizon": horizon,
+            "rows": int(len(labels)),
+            "finite_labels": int(finite.sum()),
+            "missing_labels": int((~finite).sum()),
+            "missing_label_rate": float((~finite).mean()) if len(labels) else 0.0,
+        })
+    return pd.DataFrame(rows)
 
 
 def filter_board(frame: pd.DataFrame, variant: str) -> pd.DataFrame:
@@ -927,6 +950,9 @@ def main():
         pd.read_csv(selection_path, parse_dates=["datetime"]), calendar, "selection_valid"
     )
     selection_frame = filter_board(selection_frame, args.board_variant)
+    selection_label_availability = label_availability(
+        "selection_valid", selection_frame
+    )
     selection_grid = uncertainty_grid(
         "selection_valid", selection_frame, prices, limits, calendar, args
     )
@@ -980,6 +1006,9 @@ def main():
             ),
         },
         "chosen": chosen.to_dict(orient="records"),
+        "selection_label_availability": selection_label_availability.to_dict(
+            orient="records"
+        ),
         "robust_chosen": (
             robust_chosen.to_dict(orient="records") if robust_chosen is not None else None
         ),
@@ -997,6 +1026,7 @@ def main():
     if selection_frame["datetime"].max() >= test_frame["datetime"].min():
         raise ValueError("Selection-valid and Test are not strictly chronological")
     test_frame = filter_board(test_frame, args.board_variant)
+    test_label_availability = label_availability("test", test_frame)
     baseline = baseline_matrix("test", test_frame, prices, limits, calendar, args, output)
     require_flat_account(baseline, "Test baseline matrix")
     baseline = attach_benchmarks(baseline, test_frame, index, calendar)
@@ -1025,6 +1055,9 @@ def main():
         label_alignment(split, frame, prices, calendar)
         for split, frame in alignment_frames.items()
     ], ignore_index=True)
+    label_availability_frame = pd.concat(
+        [selection_label_availability, test_label_availability], ignore_index=True
+    )
     baseline_top1 = baseline.loc[
         baseline["topk"].eq(1) & baseline["slippage_bps_each_side"].eq(args.selection_slippage_bps)
     ][["horizon", "net_cumulative", "trade_win_rate", "max_drawdown_marked",
@@ -1075,6 +1108,9 @@ def main():
     if test_grid is not None:
         test_grid.to_csv(output / "test_uncertainty_grid_diagnostic_only.csv", index=False)
     alignment.to_csv(output / "label_alignment.csv", index=False)
+    label_availability_frame.to_csv(
+        output / "prediction_label_availability.csv", index=False
+    )
     comparison.to_csv(output / "uncertainty_selection_test_comparison.csv", index=False)
     if valid_grid is not None:
         robust_test.to_csv(output / "test_robust_uncertainty_rules.csv", index=False)
@@ -1085,6 +1121,7 @@ def main():
         "pretest_rule_manifest_sha256": sha256(pretest_manifest),
         "test_predictions": str(test_path.resolve()),
         "test_predictions_sha256": sha256(test_path),
+        "test_label_availability": test_label_availability.to_dict(orient="records"),
     })
     (output / "evaluated_rule_manifest.json").write_text(
         json.dumps(rule_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
