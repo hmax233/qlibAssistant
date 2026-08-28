@@ -75,6 +75,12 @@ def test_e6_worker_waits_for_selection_and_freezes_before_test() -> None:
     assert "'--minimum-learning-rate', '0.000001'" in source
     assert "--gradient-clipping" not in source
     assert "--gradient-accumulation" not in source
+    validation = source[
+        source.index("function Test-PythonValidation"):
+        source.index("function Move-DirectoryToArchive")
+    ]
+    assert "$ErrorActionPreference = 'Continue'" in validation
+    assert "$ErrorActionPreference = $PreviousErrorActionPreference" in validation
 
 
 def test_e6_trainer_publishes_standard_selection_and_test_audits() -> None:

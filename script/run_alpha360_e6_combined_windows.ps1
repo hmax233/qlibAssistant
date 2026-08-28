@@ -43,8 +43,18 @@ function Invoke-CheckedPython([object[]]$Arguments, [string]$Stage) {
 
 function Test-PythonValidation([object[]]$Arguments, [string]$Stage) {
     Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Validate: $Stage"
-    & $Python @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
-    $Code = $LASTEXITCODE
+    # A non-zero validator exit means "not valid yet" to the caller.  Under
+    # the script-wide Stop preference, native stderr would otherwise become a
+    # terminating PowerShell error before the exit code can be inspected.
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $Python @Arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        $Code = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+    }
     return ($Code -eq 0)
 }
 
