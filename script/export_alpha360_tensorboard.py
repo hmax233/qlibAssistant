@@ -70,14 +70,15 @@ def export_epoch_run(csv_path: Path, output_root: Path) -> None:
                 # Keep complete metric names such as rank_ic, coverage50 and nll_log_return.
                 for suffix in (
                     "rank_icir", "rank_ic", "nll_log_return", "coverage50",
-                    "coverage80", "coverage95", "mae", "brier",
+                    "coverage80", "coverage95", "brier",
                 ):
                     marker = f"_{suffix}"
                     if column.endswith(marker):
                         horizon = column[: -len(marker)]
                         metric = suffix
                         break
-                writer.add_scalar(f"validation/{horizon}/{metric}", finite, step)
+                if metric != "mae":
+                    writer.add_scalar(f"validation/{horizon}/{metric}", finite, step)
             else:
                 writer.add_scalar(f"epoch_metrics/{column}", finite, step)
 
