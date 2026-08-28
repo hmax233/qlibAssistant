@@ -23,6 +23,13 @@ def load_finalizer_module():
     return module
 
 
+def test_e6_epoch_history_uses_the_actual_cross_market_run_directory() -> None:
+    module = load_finalizer_module()
+    assert module.REMOTE_EPOCH_METRICS["E6_a_us_four_head"] == (
+        f"{module.REMOTE_ROOT}/run/epoch_metrics.csv"
+    )
+
+
 def write_png(path: Path, width: int = 2, height: int = 3) -> None:
     """Write a tiny standards-compliant RGB PNG without third-party helpers."""
 
