@@ -246,15 +246,17 @@ def _test_split_not_accessed(store: CrossMarketDateStore) -> bool:
     )
 
 
-def test_protocol_defaults_are_fixed_and_not_cli_overridable(tmp_path: Path) -> None:
+def test_protocol_defaults_use_benchmarked_batch_and_lower_cosine_floor(
+    tmp_path: Path,
+) -> None:
     args = parse_args(
         ["train", "--data", str(tmp_path / "data"), "--output", str(tmp_path / "run")]
     )
     assert FORMAL_EPOCHS == 50
     assert args.learning_rate == pytest.approx(3e-4)
-    assert args.minimum_learning_rate == pytest.approx(1e-6)
+    assert args.minimum_learning_rate == pytest.approx(1e-7)
     assert args.warmup_epochs == 3
-    assert args.date_batch_size == 4
+    assert args.date_batch_size == 12
     with pytest.raises(SystemExit):
         parse_args(
             [
@@ -297,8 +299,8 @@ def test_schedule_uses_three_warmup_epochs_and_eta_min_during_epoch_50(
         if epoch + 1 < FORMAL_EPOCHS:
             scheduler.step()
     assert used[:4] == pytest.approx([1e-4, 2e-4, 3e-4, 3e-4])
-    assert used[-1] == pytest.approx(1e-6)
-    assert min(used) == pytest.approx(1e-6)
+    assert used[-1] == pytest.approx(1e-7)
+    assert min(used) == pytest.approx(1e-7)
 
 
 def test_training_source_has_one_update_per_batch_and_no_forbidden_operations() -> None:
@@ -504,12 +506,12 @@ def test_cpu_benchmark_smoke_records_protocol_and_never_accesses_test(
     configuration = json.loads((output / "configuration.json").read_text(encoding="utf-8"))
     assert configuration["epochs"] == 50
     assert configuration["early_stopping"] is False
-    assert configuration["date_batch_size"] == 4
+    assert configuration["date_batch_size"] == 12
     assert configuration["gradient_accumulation"] is False
     assert configuration["gradient_clipping"] is False
     assert configuration["optimizer"] == "AdamW"
     assert configuration["learning_rate"] == pytest.approx(3e-4)
-    assert configuration["minimum_learning_rate"] == pytest.approx(1e-6)
+    assert configuration["minimum_learning_rate"] == pytest.approx(1e-7)
     assert configuration["warmup_epochs"] == 3
     assert configuration["model_invariants"]["independent_a_us_temporal_encoders"] is True
     assert configuration["model_invariants"]["decoupled_gaussian_heads"] == list(HORIZON_NAMES)

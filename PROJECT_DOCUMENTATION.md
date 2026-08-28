@@ -2115,8 +2115,9 @@ Qlib现有RL示例主要用于把一张大订单拆分到多个分钟执行，�
 2. 运行Mainboard20、XGBoost-240、Fixed Ensemble三路个股排名；
 3. 运行全A市场宽度Top2/4/6/8/20；
 4. 合并三路Top10票数；
-5. 对XGBoost/Fixed应用市场宽度Top2不低于40%的候选门槛；
-6. 将`event_guard`标记为“待买入日尾盘确认”，不使用前一晚不存在的行情。
+5. 将三路个股名次标准化后，汇总Tushare基础行业的板块广度与龙头强度；
+6. 对XGBoost/Fixed应用市场宽度Top2不低于40%的候选门槛；
+7. 将`event_guard`标记为“待买入日尾盘确认”，不使用前一晚不存在的行情。
 
 ### 18.1 一键入口
 
@@ -2162,17 +2163,33 @@ $PY script/run_daily_decision_pipeline.py \
 ├── DECISION_SUMMARY.md
 ├── source_actions.csv
 ├── consensus_top100.csv
+├── sector_scores.csv
+├── sector_stock_rankings.csv
+├── SECTOR_SUMMARY.md
+├── sector_scoring_config.json
 ├── decision_config.json
 └── 各步骤.log
 ```
 
 - `source_actions.csv`：三路Top1、市场门槛和初步动作；
 - `consensus_top100.csv`：三路名次、Top10/Top20票数；
+- `sector_scores.csv`：行业板块分数、板块排名和板块龙头；
+- `sector_stock_rankings.csv`：个股行业、三路名次及0～100排名强度；
+- `SECTOR_SUMMARY.md`：可直接阅读的行业Top15；
+- `sector_scoring_config.json`：行业来源、评分公式和最小股票数；
 - `DECISION_SUMMARY.md`：每天最优先阅读的清单；
 - `decision_config.json`：信号日、预计买卖日、阈值和原始预测目录。
 
-三路共识尚未单独回测；Mainboard20也尚未测试40%市场门槛。不得把这两个观察
+三路Top1完全一致已有探索性回测，但可成交样本胜率约50.7%，三路Top10票数和
+行业板块分数尚未独立回测；Mainboard20也尚未测试40%市场门槛。不得把这些观察
 字段描述为已经验证的硬规则。
+
+行业评分先在每个预测源内部计算
+`100 × (候选数 - 名次) / (候选数 - 1)`，再对同一股票的三路强度取平均。
+`sector_score`是行业内全部股票的平均强度，反映板块广度；
+`leader_top3_score`是行业前三只股票的平均强度。约50代表在当前候选池中居中，
+不是行业上涨概率或预计收益率。行业分类来自Tushare `stock_basic.industry`，
+少于3只有效股票的行业不编号。
 
 ### 18.3 event_guard不能在前一晚完成
 
@@ -2205,3 +2222,367 @@ $PY script/run_daily_decision_pipeline.py \
 时间泄漏，但存在较强的数据窥探、模型选择和多重比较偏差”。解决方式是在当前
 时点冻结组件、权重和交易规则，此后只看全新的前向日期，不能继续根据同一批
 Test结果修改后再引用原收益。
+
+---
+
+## 19. 港股+A股+美股预训练与A股主板继续训练
+
+2026-07-31 新增了不影响原有 `roll/` 和 MLflow recorder 的独立实验管线：
+
+```text
+script/cross_market/
+├── download_yahoo_daily.py       # 美股/港股日线，按股票断点续跑
+├── export_a_mainboard_daily.py   # 从现有CN Qlib导出A股主板
+├── build_factor_store.py         # 生成统一Alpha158字段
+├── train_global_then_a.py        # 全球预训练、A股继续训练及A-only对照
+├── download_a_moneyflow.py       # Tushare主力资金流补充数据
+├── download_a_stk_limit.py       # 精确涨跌停价、历史ST与执行约束
+├── predict_global_model_date.py  # 保存模型的单日三路研究排名
+└── run_pipeline.py               # 完整调度、日志和状态文件
+```
+
+### 19.1 数据和产物位置
+
+市场数据归 `investment_data` 管理：
+
+```text
+/Users/hmax/investment_data/cross_market_daily/
+├── raw/{a,hk,us}/
+├── factors/{a,hk,us}/
+└── universes/
+```
+
+模型与实验报告归本项目管理：
+
+```text
+.qlibAssistant/cross_market/
+├── logs/
+├── models/
+└── reports/
+```
+
+详细数据口径见
+`/Users/hmax/investment_data/CROSS_MARKET_DATA_DOC.md`，学习、数据价格和高频行情
+调研见 `daily_learning/2026-07-31_跨市场预训练与高频数据调研.md`。
+
+### 19.2 一键运行
+
+```bash
+conda activate qlibAssistant
+cd /Users/hmax/qlibAssistant
+
+python script/cross_market/run_pipeline.py \
+  --run-tag global_to_a_full_YYMMDD
+```
+
+小样本测试：
+
+```bash
+python script/cross_market/run_pipeline.py \
+  --pilot \
+  --run-tag global_to_a_pilot_YYMMDD
+```
+
+失败后从指定阶段续跑：
+
+```bash
+python script/cross_market/run_pipeline.py \
+  --run-tag global_to_a_full_YYMMDD \
+  --start-at factors
+```
+
+实时查看：
+
+```bash
+cat .qlibAssistant/cross_market/logs/<run_tag>_state.json
+tail -f .qlibAssistant/cross_market/logs/<run_tag>.log
+```
+
+### 19.3 训练逻辑
+
+默认使用 158 个同名 Alpha158 因子和 3 个市场标识。三个市场先共同训练 XGBoost，
+再通过 `xgb_model=<global booster>` 只用 A 股主板继续增加树；同时训练完全相同
+时间窗口的 A-only control。valid 只用于早停，selection-valid 选择 global、
+fine-tuned、A-only 或 global/fine-tuned 混合权重，约一年的 test 不参与选择。
+
+默认时间段：
+
+| 数据段 | 起点 | 终点 |
+|---|---:|---:|
+| 全球预训练 | 2004-01-01 | 2024-07-26 |
+| A股继续训练 | 2014-07-31 | 2024-07-26 |
+| valid | 2024-07-31 | 2025-01-28 |
+| selection-valid | 2025-01-31 | 2025-07-28 |
+| test | 2025-07-31 | 2026-07-28 |
+
+标签仍为 `close(T+2)/close(T+1)-1`。学习时按市场和日期做截面标准化，交易评估使用
+未标准化绝对收益。测试报告同时给出 IC、Rank IC、Top1/3/5/10 胜率、毛累计、
+按买卖各 0.0235% 扣佣金后的累计收益和最大回撤。
+
+严格口径还要求：
+
+- 上市至少120个交易日；
+- 绝对标签不超过20%；
+- 用Tushare每日精确涨停幅度剔除历史ST；
+- Top-K先确定，T+1收盘封涨停的名额留现金，不顺延用下一名替补；
+- T+2封跌停的仓位按市值变化并单列无法按计划退出。
+
+2026-07-31 有效全量实验 `global_to_a_exactlimits_lowmem_260731` 的一年盲测中，
+selection-valid选择A-only。Global、Global→A、A-only的test Rank IC分别为
+0.0310、0.0406、0.0437，但严格Top10扣佣金累计分别为-37.93%、-30.64%、
+-39.44%，同期CSI300为+12.20%、CSI1000为+3.45%。因此跨市场方案当前没有通过
+实盘门槛；正Rank IC不能替代Top-K可执行收益与回撤检查。
+
+可读报告：
+
+```text
+.qlibAssistant/cross_market/reports/global_to_a_exactlimits_lowmem_260731/REPORT.md
+```
+
+### 19.4 资金流
+
+当前15000积分代理已经实测可调用Tushare `moneyflow`，但它是供应商按Level-2
+主动买卖和成交金额区间推导的统计，不代表真实识别机构账户。下载最近一年：
+
+```bash
+python script/cross_market/download_a_moneyflow.py \
+  --start 2025-07-31 \
+  --end 2026-07-30
+```
+
+文件保存在：
+
+```text
+/Users/hmax/investment_data/supplemental/moneyflow/YYYYMMDD.parquet
+```
+
+在完成“数据实际发布时间”审计前，moneyflow不能直接并入训练，避免把收盘后数据
+错误当成盘中已知数据。
+
+---
+
+## 20. Tushare补充因子与CPU TRA实验（2026-08-18）
+
+升级后的 Tushare 权限已实测可批量下载 `daily_basic`、`moneyflow`、`cyq_perf`、
+`stk_factor_pro` 和历史分钟线。本轮在固定 300 只 CSI1000 主板样本上生成 234 个
+日频资金流/筹码/专业因子，并使用固定 A/B/C 时间切分比较 XGBoost、LightGBM 与
+CPU TRA。
+
+CPU TRA 使用 40 个在 A/B 开发折稳定的日频补充因子、60 日序列、3 个潜在状态和
+3 个随机种子。冻结 Fold C test 的三 seed 集成达到 `Rank IC=0.0443`、
+`Rank ICIR=0.2511`；但与 XGB240、Fixed Ensemble 在共同 99 日、共同股票样本上的
+严格回测中，TRA Top1/3/10 净累计仍为 `-29.45%/-12.35%/-15.44%`。因此本轮只证明
+排序信息有所提高，没有通过实盘替换门槛。
+
+完整数据规模、因子定义、时间切分、命令、三 seed 稳定性、严格对比表和下一轮方案：
+
+```text
+daily_learning/2026-08-18_Tushare资金流专业因子与CPU_TRA实验.md
+```
+
+主要脚本：
+
+```text
+script/download_tushare_daily_supplement.py
+script/build_tushare_daily_factors.py
+script/run_intraday_factor_experiment.py
+script/run_cpu_tra_supplement.py
+script/summarize_cpu_tra_supplement.py
+script/export_existing_baselines_for_strict.py
+script/evaluate_intraday_factor_strict.py
+script/plot_strict_model_comparison.py
+```
+
+---
+
+## 21. Tushare全量分钟与日频Fixed V2实验（2026-08-18）
+
+### 21.1 新数据与因子
+
+升级后的Tushare权限已完成 CSI1000 主板历史成分并集1,489只股票的全量下载：
+
+- 2019-01-01～2026-08-13的15分钟历史，共6,777个股票年度分区；
+- 新下载19,226,898根15分钟K线，失败0；
+- `daily_basic`、`moneyflow`、`cyq_perf`、`stk_factor_pro`合计约1,047万行；
+- 构造145个分钟日频因子、185个Tushare日频原始因子；
+- 只在Train/Valid的300只开发样本中筛选100个稳定候选，其中分钟36个、日频64个；
+- 正式模型为Alpha158+100个新因子的截面排名，共258维。
+
+相关脚本：
+
+```text
+script/download_tushare_minutes.py
+script/download_tushare_daily_supplement.py
+script/build_intraday_daily_factors.py
+script/build_tushare_daily_factors.py
+script/run_multisource_fixed_v2.py
+script/calibrate_execution_aware_ensemble.py
+script/evaluate_intraday_factor_strict.py
+```
+
+### 21.2 固定切分和模型矩阵
+
+```text
+Train最长窗口：2019-08-13～2024-08-13
+Valid：         2024-08-14～2025-02-13
+Selection-valid:2025-02-14～2025-08-13
+Frozen test：   2025-08-14～2026-08-11（236个交易日）
+```
+
+训练 XGBoost、LightGBM、CatBoost × 24/36/60个月共9个候选。Valid只负责早停；
+selection-valid选择模型家族最佳、Top4、Top6和所有正Rank ICIR集成；test不参与
+模型选择。最终原始收益集成为三个60个月模型，selection/test Rank ICIR分别为
+0.5168/0.2610。
+
+### 21.3 严格结果和结论
+
+Tushare指数缓存补齐后，test同期CSI1000为+15.14%、CSI300为+13.36%。新因子
+Family集成的严格Top1/3净累计为-68.72%/-35.06%；它大量选择T+1涨停、实际买不到
+的股票。独立不可买分类器的test ROC-AUC达到0.8090，证明新因子有风险识别信息，
+但风险惩罚、顺延下一只和只用历史可买样本训练均未在冻结test获得正收益。
+
+同口径Alpha158-only消融中，LightGBM-60m严格Top1为+14.55%，接近CSI1000，
+相对CSI1000为-0.52%，最大回撤-41.88%；Alpha158三模型集成Top1为-22.18%。
+
+因此当前结论是：分钟、资金流和筹码因子可用于独立可买概率/风险模型，但一次性拼入
+一日收益排序明显损害顶部可交易表现。本轮所有新模型都不得替换生产Fixed。旧Fixed
+Fold3的+59.28%基线和+90.68% event_guard仍是不同区间的历史记录，并带有事后
+选型偏差，不能与本轮直接拼接比较。
+
+完整实验设计、所有表格、失败尝试、产物路径和后续原则见：
+
+```text
+daily_learning/2026-08-18_Tushare全量分钟日频FixedV2实验.md
+```
+
+---
+
+## 22. Alpha360 概率 Transformer 与 A+美股跨市场盲测（2026-08-28）
+
+本轮固定 Fixed Fold3 的 Train/Valid/Selection-valid/Test 日期，训练 E0 三段联合
+高斯、E1 四头共享模型、E2～E5 四个独立单 horizon 模型，以及 E6 A+美股跨市场
+四头模型。V1 实际设置为50 epoch、AdamW、3轮 warmup、cosine 到 `1e-6`、64维
+可学习股票 embedding、真实 padded date batch=4；不早停、不做梯度累积、不做
+梯度裁剪。E6 使用独立 A/US 时间编码器与标准化器，501只美股按中国信号时点之前
+最近一次美股收盘严格 as-of 对齐，但当前 S&P 500 近似池存在幸存者偏差。
+
+### 22.1 数据切分和锁箱
+
+| 数据段 | 日期 | 用途 |
+|---|---|---|
+| Train | 2015-04-17～2025-04-16 | 拟合参数 |
+| Valid | 2025-04-17～2025-09-16 | 每个 horizon 选择最佳 epoch |
+| Selection-valid | 2025-09-17～2026-02-16 | 选择 ensemble 和交易门槛 |
+| Test | 2026-02-17～2026-07-17 | 冻结后一次性评估，99个信号日 |
+
+Test 在联合 Selection manifest 冻结前不允许读取。最终入选组件：
+
+| Horizon | 组件 | Selection Rank IC / ICIR | Test Rank IC / ICIR |
+|---|---|---:|---:|
+| T+1开盘→T+2收盘 | E0+E2 | 0.0531 / 0.3908 | 0.0101 / 0.0632 |
+| T+1收盘→T+2开盘 | E1+E3 | 0.1083 / 0.5099 | 0.0789 / 0.3699 |
+| T+1开盘→T+2开盘 | E1 | 0.0510 / 0.2818 | 0.0039 / 0.0184 |
+| T+1收盘→T+2收盘 | E5 | 0.0529 / 0.2386 | 0.0218 / 0.0973 |
+
+E4 和 E6 都未进入最终 ensemble。
+
+### 22.2 严格账户结论
+
+回测固定使用 Tushare OHLC、精确涨跌停和停牌状态、100股整数手、10万元、买卖各
+万2.35且最低5元、单边5bp滑点；跌停卖不出会按时间顺序继续持有并重试，最终
+`unresolved_exit` 必须为0。主板口径排除 SH68 科创板和 SZ30 创业板；另行报告
+包含双创的 CSI1000 对照。印花税按用户当前要求未计入。
+
+主板、fallback、Top1、5bp：
+
+| Horizon | 净累计 | 胜率 | 最大回撤 | CSI300 | CSI1000 |
+|---|---:|---:|---:|---:|---:|
+| T+1开盘→T+2收盘 | -42.19% | 32.99% | -44.16% | +2.07% | -11.46% |
+| T+1收盘→T+2开盘 | -6.84% | 33.33% | -10.12% | -5.40% | -7.28% |
+| T+1开盘→T+2开盘 | -50.42% | 38.14% | -51.25% | -1.75% | -16.16% |
+| T+1收盘→T+2收盘 | -45.99% | 37.37% | -46.54% | +0.07% | -13.84% |
+
+摩擦前 `close1_open2` Top1 为 +9.75%、上涨胜率51.52%，但严格账户加入最低5元
+佣金、滑点、100股整数手和每日高换手后变成 -6.84%。这说明正 Rank IC 和摩擦前
+收益不能替代可执行账户回测。四路选择性规则 Test 也全部亏损，因此 E0～E6 不得
+替换当前生产 Fixed。
+
+旧 Fixed 外部参考只有97个信号日，本轮有99日。最终报告同时展示两者，但因为日期
+不完全相同而不计算伪精确差值。
+
+### 22.3 最终目录和读法
+
+完整网络、损失、逐轮训练、导出迁移、锁箱审计、结果和限制见：
+
+```text
+daily_learning/2026-08-28_Alpha360概率多任务与跨市场盲测实验.md
+```
+
+正式产物：
+
+```text
+.qlibAssistant/analysis/alpha360_e0_e6_260828/
+├── selection_manifest.json
+├── selection_valid_ensemble_predictions.csv
+├── test_predictions.csv
+├── test_summary.csv
+├── epoch_metrics/                         # E0～E6 各50轮
+├── training_curves/                       # CSV/Markdown/PNG
+├── evidence/                              # 配置、checkpoint、manifest及哈希
+├── strict_backtest_mainboard_fallback/
+├── strict_backtest_mainboard_leave_cash/
+├── strict_backtest_all_fallback/
+├── strict_backtest_all_leave_cash/
+├── report_fallback/
+├── report_leave_cash/
+├── local_lockbox_validation.json
+├── local_prepublish_validation.json
+├── local_completion.json
+└── artifact_index.json                    # 332个文件，122个核心产物
+```
+
+优先查看：
+
+```text
+report_fallback/concise_summary.csv
+report_fallback/strict_execution_summary.csv
+report_fallback/method_and_findings.md
+report_fallback/prediction_metrics_comparison.png
+report_fallback/strategy_equity_curves.png
+training_curves/training_curves.md
+training_curves/training_curves.png
+```
+
+真正只读的状态检查：
+
+```bash
+python script/finalize_alpha360_e0_e6_local.py --status-only --no-watchdog
+```
+
+普通完成命令：
+
+```bash
+python script/finalize_alpha360_e0_e6_local.py --no-watchdog
+```
+
+最终器不是常驻轮询进程；远端未完成时退出码为3。`--status-only` 若没有同时传
+`--no-watchdog`，仍可能写审计并在严格条件满足时重启本任务，不能称为完全只读。
+
+### 22.4 后续训练默认优化参数
+
+V1 结果必须保留其真实 batch4/`eta_min=1e-6`。额外在 RTX 3060 上使用同一 E6
+数据和64个真实交易日做了 true padded-date batch 基准：batch4/8/12/16 的峰值显存
+约2.27/4.49/6.73/8.95GB，估计训练时间为84.74/75.25/73.77/107.29秒每轮。
+因此后续默认改为：
+
+- A股单市场 E0～E5：date batch 16；
+- A+美股 E6：date batch 12；
+- cosine `eta_min=1e-7`；
+- 仍然不使用梯度累积和梯度裁剪。
+
+变长股票数量使用 `[B,N_max,360]` padding 与 mask；这是一次真实 batch forward/
+backward/update，不是逐日梯度累积。基准原始文件：
+
+```text
+.qlibAssistant/analysis/alpha360_batch_benchmark_260828/
+```

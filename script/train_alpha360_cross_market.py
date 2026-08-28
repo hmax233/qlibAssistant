@@ -1101,11 +1101,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--minimum-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--minimum-learning-rate", type=float, default=1e-7)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--warmup-start-factor", type=float, default=1 / 3)
-    parser.add_argument("--date-batch-size", type=int, default=4)
+    parser.add_argument("--date-batch-size", type=int, default=12)
     parser.add_argument("--target-scale", type=float, default=100.0)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--benchmark-only", action="store_true")
@@ -1126,8 +1126,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("E6 formal protocol fixes warmup at exactly 3 epochs")
     if args.date_batch_size < 1 or args.benchmark_days < 1 or args.threads < 1:
         parser.error("batch size, benchmark days, and threads must be positive")
-    if args.learning_rate != 3e-4 or args.minimum_learning_rate != 1e-6:
-        parser.error("E6 formal protocol fixes lr=3e-4 and cosine eta_min=1e-6")
+    if args.learning_rate != 3e-4:
+        parser.error("E6 protocol fixes the base learning rate at 3e-4")
+    if not 0 < args.minimum_learning_rate <= args.learning_rate:
+        parser.error("minimum learning rate must be in (0, learning rate]")
     return args
 
 

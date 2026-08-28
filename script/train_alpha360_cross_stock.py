@@ -700,7 +700,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--seed", type=int, default=20260827)
     parser.add_argument("--learning-rate", type=float, default=0.0003)
-    parser.add_argument("--min-learning-rate", type=float, default=0.000001)
+    parser.add_argument("--min-learning-rate", type=float, default=0.0000001)
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--warmup-start-factor", type=float, default=1.0 / 3.0)
     parser.add_argument(
@@ -708,7 +708,7 @@ def main():
         choices=["nll_scaled_3leg", *[h + "_rank_ic" for h in HORIZON_NAMES_FOR_CLI]],
         default="close1_close2_rank_ic",
     )
-    parser.add_argument("--date-batch-size", type=int, default=4)
+    parser.add_argument("--date-batch-size", type=int, default=16)
     parser.add_argument("--stock-embedding-width", type=int, default=64, help="0 disables identity for ablation")
     parser.add_argument("--benchmark-only", action="store_true")
     parser.add_argument("--benchmark-days", type=int, default=12)
