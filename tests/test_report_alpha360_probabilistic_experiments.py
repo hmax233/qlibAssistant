@@ -13,6 +13,7 @@ from script.report_alpha360_probabilistic_experiments import (
     HORIZONS,
     benchmark_equity_curve,
     generate_report,
+    load_predictions,
     observable_prediction_metrics,
 )
 
@@ -508,6 +509,39 @@ def test_missing_prediction_column_fails_atomically(complete_fixture: dict[str, 
     assert not complete_fixture["output"].exists()
 
 
+def test_missing_realized_label_is_audited_not_treated_as_prediction_failure(
+    tmp_path: Path,
+) -> None:
+    predictions = prediction_fixture(1.0)
+    predictions.loc[0, "open1_close2_actual_return"] = np.nan
+    path = tmp_path / "predictions.csv"
+    predictions.to_csv(path, index=False)
+
+    loaded = load_predictions(path, "fixture")
+    assert pd.isna(loaded.loc[0, "open1_close2_actual_return"])
+    metrics = observable_prediction_metrics(loaded, "open1_close2")
+    assert np.isfinite(metrics["mae"])
+    assert np.isfinite(metrics["coverage_95"])
+
+
+def test_nonfinite_prediction_and_infinite_realized_label_fail_closed(
+    tmp_path: Path,
+) -> None:
+    predictions = prediction_fixture(1.0)
+    prediction_path = tmp_path / "bad_prediction.csv"
+    predictions.loc[0, "open1_close2_expected_return"] = np.nan
+    predictions.to_csv(prediction_path, index=False)
+    with pytest.raises(ValueError, match="non-finite prediction values"):
+        load_predictions(prediction_path, "fixture")
+
+    labels = prediction_fixture(1.0)
+    label_path = tmp_path / "bad_label.csv"
+    labels.loc[0, "open1_close2_actual_return"] = np.inf
+    labels.to_csv(label_path, index=False)
+    with pytest.raises(ValueError, match="invalid realized labels"):
+        load_predictions(label_path, "fixture")
+
+
 def test_rejects_rule_changed_after_test(complete_fixture: dict[str, Path]) -> None:
     path = complete_fixture["all"] / "evaluated_rule_manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -601,16 +635,21 @@ def test_wrong_fixed_reference_row_fails_atomically(
     assert not complete_fixture["output"].exists()
 
 
-def test_fixed_reference_signal_day_mismatch_fails_atomically(
+def test_fixed_reference_signal_day_mismatch_is_reported_without_false_delta(
     complete_fixture: dict[str, Path],
 ) -> None:
     path = complete_fixture["fixed_reference"]
     frame = pd.read_csv(path)
     frame["signal_days"] = frame["signal_days"] + 1
     frame.to_csv(path, index=False)
-    with pytest.raises(ValueError, match="signal-day counts differ"):
-        run_report(complete_fixture)
-    assert not complete_fixture["output"].exists()
+    output = run_report(complete_fixture)
+    comparison = pd.read_csv(output / "fixed_reference_comparison.csv")
+    assert not bool(comparison.loc[0, "same_signal_days"])
+    assert comparison.loc[0, "alpha360_signal_days"] == 4
+    assert comparison.loc[0, "fixed_reference_signal_days"] == 5
+    assert pd.isna(comparison.loc[0, "delta_alpha360_minus_fixed_net_cumulative"])
+    method = (output / "method_and_findings.md").read_text(encoding="utf-8")
+    assert "deltas are deliberately omitted" in method
 
 
 def test_leave_cash_uses_exact_matching_reference_and_strongest_label(

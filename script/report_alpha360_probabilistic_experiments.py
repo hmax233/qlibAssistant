@@ -335,16 +335,33 @@ def load_predictions(path: Path, label: str) -> pd.DataFrame:
     if frame.duplicated(["datetime", "instrument"]).any():
         raise ValueError(f"{label} contains duplicate datetime/instrument rows: {path}")
     for horizon in HORIZONS:
-        columns = prediction_columns(horizon) - {"datetime", "instrument"}
-        numeric = frame[list(columns)].apply(pd.to_numeric, errors="coerce")
-        if not np.isfinite(numeric.to_numpy(float)).all():
+        actual_column = f"{horizon}_actual_return"
+        prediction_fields = prediction_columns(horizon) - {
+            "datetime", "instrument", actual_column,
+        }
+        predictions = frame[list(prediction_fields)].apply(
+            pd.to_numeric, errors="coerce"
+        )
+        if not np.isfinite(predictions.to_numpy(float)).all():
             raise ValueError(f"{label}/{horizon} contains non-finite prediction values")
-        if (numeric[f"{horizon}_log_variance"] <= 0).any():
+        if (predictions[f"{horizon}_log_variance"] <= 0).any():
             raise ValueError(f"{label}/{horizon} contains non-positive variance")
-        probabilities = numeric[f"{horizon}_probability_positive"]
+        probabilities = predictions[f"{horizon}_probability_positive"]
         if ((probabilities < 0) | (probabilities > 1)).any():
             raise ValueError(f"{label}/{horizon} probability must be in [0, 1]")
-        frame[list(columns)] = numeric
+        # A feature row can legitimately lack a realized label when its future
+        # open/close is unavailable.  Preserve that row and its prediction for
+        # ranking/execution, but fail closed on malformed text or +/- infinity.
+        raw_actual = frame[actual_column]
+        actual = pd.to_numeric(raw_actual, errors="coerce")
+        malformed = raw_actual.notna() & actual.isna()
+        if malformed.any() or np.isinf(actual.to_numpy(float)).any():
+            raise ValueError(f"{label}/{horizon} contains invalid realized labels")
+        finite_actual = actual[np.isfinite(actual)]
+        if (finite_actual <= -1.0).any():
+            raise ValueError(f"{label}/{horizon} realized return must exceed -1")
+        frame[list(prediction_fields)] = predictions
+        frame[actual_column] = actual
     return frame.sort_values(["datetime", "instrument"]).reset_index(drop=True)
 
 
@@ -370,19 +387,29 @@ def observable_prediction_metrics(frame: pd.DataFrame, horizon: str) -> dict[str
         "rows": int(len(frame)),
         "rank_ic": float(daily.mean()),
         "rank_icir": float(daily.mean() / deviation) if deviation > 0 else math.nan,
-        "mae": float(np.mean(np.abs(expected - actual))),
-        "brier": float(np.mean((probability - (actual > 0)) ** 2)),
-        "direction_accuracy": float(np.mean((probability >= 0.5) == (actual > 0))),
+        # These definitions intentionally reproduce the already-frozen
+        # Selection/Test scorer.  Missing labels are ignored by MAE and daily
+        # portfolio means; the frozen scorer's boolean diagnostics map a
+        # missing realized value to ``False``.  Strict account backtests use
+        # audited OHLC execution data and do not depend on these labels.
+        "mae": float(np.nanmean(np.abs(expected - actual))),
+        "brier": float(np.nanmean((probability - (actual > 0)) ** 2)),
+        "direction_accuracy": float(np.nanmean(
+            (probability >= 0.5) == (actual > 0)
+        )),
     }
     actual_log = np.log1p(actual)
     log_mean = frame[f"{horizon}_log_mean"].to_numpy(float)
     log_std = np.sqrt(frame[f"{horizon}_log_variance"].to_numpy(float))
     for level, z_value in ((50, 0.6744897501960817), (80, 1.2815515655446004),
                            (95, 1.959963984540054)):
-        result[f"coverage_{level}"] = float(np.mean(
-            (actual_log >= log_mean - z_value * log_std)
-            & (actual_log <= log_mean + z_value * log_std)
-        ))
+        valid_log = np.isfinite(actual_log)
+        covered = valid_log & (
+            actual_log >= log_mean - z_value * log_std
+        ) & (
+            actual_log <= log_mean + z_value * log_std
+        )
+        result[f"coverage_{level}"] = float(covered[valid_log].mean())
     ordered = frame.sort_values(
         ["datetime", f"{horizon}_expected_return"], ascending=[True, False]
     )
@@ -758,11 +785,7 @@ def build_fixed_reference_comparison(
     reference_signal_days = int(
         _require_finite(reference["signal_days"], "fixed/signal_days")
     )
-    if current_signal_days != reference_signal_days:
-        raise ValueError(
-            "Alpha360 and Fixed reference signal-day counts differ: "
-            f"{current_signal_days} != {reference_signal_days}"
-        )
+    same_signal_days = current_signal_days == reference_signal_days
     metrics = {
         "net_cumulative": ("net_cumulative", "net_cumulative"),
         "max_drawdown": ("max_drawdown_marked", "max_drawdown"),
@@ -777,17 +800,26 @@ def build_fixed_reference_comparison(
         "exit_time": "15:00",
         "slippage_bps_each_side": 5.0,
         "execution_policy": fixed_reference["execution_policy"],
-        "comparability": fixed_reference["comparability"],
+        "comparability": (
+            fixed_reference["comparability"]
+            if same_signal_days
+            else fixed_reference["comparability"] + "_different_signal_days"
+        ),
         "selection_role": "external_reference_only_not_used_for_selection",
         "fixed_reference_sha256": fixed_reference["sha256"],
         "signal_days": current_signal_days,
+        "alpha360_signal_days": current_signal_days,
+        "fixed_reference_signal_days": reference_signal_days,
+        "same_signal_days": same_signal_days,
     }
     for metric, (current_column, reference_column) in metrics.items():
         current_value = _require_finite(current[current_column], f"current/{metric}")
         reference_value = _require_finite(reference[reference_column], f"fixed/{metric}")
         row[f"alpha360_{metric}"] = current_value
         row[f"fixed_reference_{metric}"] = reference_value
-        row[f"delta_alpha360_minus_fixed_{metric}"] = current_value - reference_value
+        row[f"delta_alpha360_minus_fixed_{metric}"] = (
+            current_value - reference_value if same_signal_days else math.nan
+        )
     return pd.DataFrame([row])
 
 
@@ -1015,15 +1047,12 @@ def plot_equity_curves(
                     daily["datetime"], daily["equity_mark"] / data["capital"],
                     label=label, color=color, linewidth=1.6,
                 )
-            variant_signal_dates = list(
-                data["daily"][horizon]["selected"]["datetime"]
-            )
-            if variant_signal_dates != signal_dates:
-                # A board filter can theoretically leave a date with no eligible
-                # stocks.  Use the exact dates evaluated by that strict account.
-                benchmark_dates = variant_signal_dates
-            else:
-                benchmark_dates = signal_dates
+            # Strict-account daily curves can extend beyond the final signal
+            # date while an untradeable exit is retried.  Those mark-to-market
+            # dates are not additional benchmark entry signals.  The benchmark
+            # must use the immutable prediction signal calendar in every board
+            # variant, including dates where the strategy leaves cash.
+            benchmark_dates = signal_dates
             for benchmark, color in (("CSI300", "#f59e0b"), ("CSI1000", "#16a34a")):
                 curve = benchmark_equity_curve(
                     index, calendar, benchmark_dates, horizon, benchmark
@@ -1252,24 +1281,34 @@ def write_method_and_findings(
             if fixed_reference["execution_policy"] == "leave_cash"
             else "- `fallback` is approximate: the old Fixed implementation searched at most through rank 20, while the new strict implementation traverses the complete ranking."
         ),
-        "- Positive deltas below mean the current Alpha360 result is numerically larger than the Fixed reference; for drawdown, a positive delta means a shallower (better) drawdown.",
+        (
+            "- Positive deltas below mean the current Alpha360 result is numerically larger than the Fixed reference; for drawdown, a positive delta means a shallower (better) drawdown."
+            if bool(fixed_comparison.iloc[0].same_signal_days)
+            else "- The signal-day counts differ, so the two standalone historical results are shown but their deltas are deliberately omitted; this is not an identical-window comparison."
+        ),
         "",
         "| Policy | Comparability | Metric | Alpha360 | Fixed reference | Delta (Alpha360 − Fixed) |",
         "|---|---|---|---:|---:|---:|",
     ])
     comparison = fixed_comparison.iloc[0]
     for metric in ("net_cumulative", "max_drawdown", "trade_win_rate"):
+        delta = comparison[f"delta_alpha360_minus_fixed_{metric}"]
         lines.append(
             f"| {comparison.execution_policy} | {comparison.comparability} | {metric} | "
             f"{_percent(comparison[f'alpha360_{metric}'])} | "
             f"{_percent(comparison[f'fixed_reference_{metric}'])} | "
-            f"{_percent(comparison[f'delta_alpha360_minus_fixed_{metric}'])} |"
+            f"{_percent(delta) if pd.notna(delta) else 'N/A'} |"
         )
+    completed_delta = comparison.delta_alpha360_minus_fixed_completed_trades
     lines.append(
         f"| {comparison.execution_policy} | {comparison.comparability} | completed_trades | "
         f"{int(comparison.alpha360_completed_trades)} | "
         f"{int(comparison.fixed_reference_completed_trades)} | "
-        f"{int(comparison.delta_alpha360_minus_fixed_completed_trades)} |"
+        f"{int(completed_delta) if pd.notna(completed_delta) else 'N/A'} |"
+    )
+    lines.append(
+        f"\nSignal days: Alpha360={int(comparison.alpha360_signal_days)}, "
+        f"Fixed reference={int(comparison.fixed_reference_signal_days)}."
     )
     lines.extend([
         "",
